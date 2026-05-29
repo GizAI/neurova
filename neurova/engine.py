@@ -1479,11 +1479,11 @@ class QueryPlanner:
                     break
 
         route_map = {
-            "WHERE_IS": self._answer_where,
-            "WHO_IS": self._answer_who,
+            "WHERE_IS": lambda: self._answer_where(target_norm, entity),
+            "WHO_IS": lambda: self._answer_who(target_norm, entity, pw),
             "IS_IT": lambda: self._answer_is(question, q, pw, entity, target_norm),
             "WHAT_IS": lambda: self._answer_what(q, pw, entity, target_norm, question),
-            "HOW": self._answer_how,
+            "HOW": lambda: self._answer_how(target_norm, entity),
             "WHAT_BORDERS": lambda: self._answer_what_borders(q, entity, target_norm),
             "WHAT_IS_DIRECTION": lambda: self._answer_what(q, pw, entity, target_norm, question),
             "WHAT_SEPARATED_FROM": lambda: self._answer_what(q, pw, entity, target_norm, question),
@@ -1525,7 +1525,7 @@ class QueryPlanner:
             return "WHO_IS", target
 
         # IS/ARE
-        if q.startswith(("is ", "are ", "was ", "were ", "does ", "do ")):
+        if q.startswith(("is ", "are ", "was ", "were ", "does ", "do ", "am ")):
             return "IS_IT", ""
 
         # WHAT
@@ -1651,7 +1651,7 @@ class QueryPlanner:
 
         if not entity:
             return "I don't know anything about that yet."
-        desc = _desc(entity)
+        desc = _desc(entity, self.model)
         if desc:
             return f"I recall: it {desc}."
         return "I don't know anything about that yet."
@@ -1704,7 +1704,7 @@ class QueryPlanner:
 
     def _answer_fallback(self, q, pw, entity, target_norm):
         if entity:
-            desc = _desc(entity)
+            desc = _desc(entity, self.model)
             if desc:
                 return desc
         return "I don't know."
@@ -1713,33 +1713,62 @@ class QueryPlanner:
 class Brain:
 
     def __init__(s):
-
         s.model=WorldModel(); s.coref=Coref()
-
-        s.cmem=ConstructionMemory(); s.epmem=EpisodeMemory(); s.dc=0
+        s.cmem=ConstructionMemory(); s.epmem=EpisodeMemory()
+        s.qplanner=QueryPlanner(s.model, s.coref); s.dc=0
 
     def hear(s,text:str)->str:
-
         s.dc+=1
-
         is_q=text.strip().endswith("?") or any(
-
             text.strip().lower().startswith(w)
-
-            for w in ("what","where","who","when","why","how","which","is","are","does","do","can","could"))
-
-        if is_q: return answer(text,s.model,s.coref)
-
+            for w in ("what","where","who","when","why","how","which","is","are","does","do","can","could","am"))
+        if is_q:
+            a = s.qplanner.answer(text)
+            s.epmem.record(text, "", None, "", True)
+            return a
         n=compile_text(text,s.model,s.coref,s.cmem,s.epmem)
-
         if n>0: return "Got it. I've stored that information."
-
         return "I heard you."
 
-    def reset(s): s.model=WorldModel(); s.coref.reset(); s.qplanner=QueryPlanner(s.model, s.coref)
+    def feedback(s, question: str, correct_answer: str):
+        """Learn from a wrong answer. Core learning loop."""
+        wrong = s.qplanner.answer(question)
+        old_entity_count = len(s.model.entities)
+        n = compile_text(correct_answer, s.model, s.coref, s.cmem, s.epmem)
+        if n == 0:
+            if _NLP:
+                doc = _NLP(correct_answer)
+                for tok in doc:
+                    if tok.dep_ == "ROOT":
+                        root_lemma = tok.lemma_.lower()
+                        has_construction = any(
+                            root_lemma in c.trigger_lemmas 
+                            for c in s.cmem.constructions.values()
+                        )
+                        if not has_construction:
+                            cid = f"learned_{root_lemma}"
+                            new_c = Construction(
+                                id=cid, event_type="STATEMENT",
+                                trigger_lemmas=[root_lemma],
+                                trigger_deps=["ROOT"],
+                                role_mapping={"nsubj": "entity", "dobj": "target"},
+                                prep_signals={"in": "location", "on": "location", "at": "location"},
+                                confidence=0.3
+                            )
+                            s.cmem.constructions[cid] = new_c
+                            n2 = compile_text(correct_answer, s.model, s.coref, s.cmem, s.epmem)
+                            break
+        s.epmem.record(question, "", None, "", n > 0)
+        new_entities = len(s.model.entities) - old_entity_count
+        if n > 0:
+            return f"Learned: {correct_answer} ({new_entities} new facts)"
+        return f"Noted: {correct_answer}"
+
+    def reset(s):
+        s.model=WorldModel(); s.coref.reset()
+        s.qplanner=QueryPlanner(s.model, s.coref)
 
     def learn(s,inp,cid,exp,act,corr):
-
         s.cmem.learn(inp,cid,exp,act,corr)
 
 
