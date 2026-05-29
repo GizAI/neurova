@@ -1,646 +1,389 @@
-"""
-Neurova TTT-Qwen Engine — Qwen3.5-4B + TTT (Test-Time Training)
+"""Neurova TTT-Qwen v2 — REAL LoRA TTT, vLLM streaming, thinking filter."""
 
-Full stack:
-  - Qwen3.5-4B-Instruct via vLLM (OpenAI-compatible API)
-  - Episodic correction memory (zero forgetting)
-  - Ephemeral LoRA TTT adapter training
-  - Tool-integrated self-verification
-  - Request-owned state serving
-  - Session management
-
-Architecture:
-                                   ┌──────────────────┐
-                                   │   vLLM Server     │
-                                   │ Qwen3.5-4B-Instruct│
-                                   │  (ml-dmc8:8081)   │
-                                   └────────┬─────────┘
-                                            │ OpenAI-compatible API
-                                   ┌────────▼─────────┐
-                                   │   TTTQwenEngine   │
-                                   │  - Chat           │
-                                   │  - Correct (/learn)│
-                                   │  - Think/verify    │
-                                   └───┬───┬───┬───────┘
-                                       │   │   │
-                              ┌────────┘   │   └──────────┐
-                              ▼            ▼              ▼
-                     ┌────────────┐ ┌──────────┐ ┌──────────────┐
-                     │ Correction │ │ Tool     │ │ Evid/RAG     │
-                     │ Memory     │ │ Verifier │ │ Memory       │
-                     └────────────┘ └──────────┘ └──────────────┘
-"""
 from __future__ import annotations
-
-from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, List, Optional, Tuple, Callable
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
-import json, os, re, time, uuid, hashlib
-
+import json, os, re, time, uuid, threading
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://ml-dmc8:8081")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "unsloth/Qwen3.5-4B")
+MAX_TOKENS = 4096
+MAX_HISTORY = 10
 
 
-def _uid():
-    return uuid.uuid4().hex[:8]
+def _uid(): return uuid.uuid4().hex[:8]
+def _norm(s): return re.sub(r"\s+", " ", (s or "").strip())
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+# ── Thinking filter ──────────────────────────────────────────────
+_THINKING_HEADER = "Thinking Process:"
+_THINKING_STEP = re.compile(r"^\d+\.\s*\*{1,2}")
+
+def _extract_answer(content: str) -> str:
+    """Extract final answer from Qwen3.5 thinking output."""
+    if not content:
+        return ""
+    # <think> tags
+    if "<think>" in content:
+        parts = content.split("</think>", 1)
+        return parts[-1].strip() if len(parts) > 1 else content.strip()
+    # No thinking → return as-is
+    if _THINKING_HEADER not in content:
+        return content.strip()
+    # Filter mode: keep lines that are NOT thinking structure
+    lines = content.split("\n")
+    kept = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if s == _THINKING_HEADER:
+            continue
+        if _THINKING_STEP.match(s):
+            continue
+        # Skip indented bullet lines (thinking detail)
+        if line.startswith(" ") and (s.startswith("*") or s.startswith("-")):
+            continue
+        kept.append(s)
+    # Return last substantive line
+    return kept[-1] if kept else content.strip()
 
 
-# ── OpenAI-compatible vLLM client ──
+# ═══════════════════════════════════════════════════════════════
+# 1. vLLM Client
+# ═══════════════════════════════════════════════════════════════
 
 class QwenClient:
-    """Client for Qwen3.5-4B via vLLM OpenAI-compatible API."""
-
-    def __init__(self, base_url: str = VLLM_URL, model: str = VLLM_MODEL,
-                 timeout: float = 60.0):
+    def __init__(self, base_url=VLLM_URL, model=VLLM_MODEL, timeout=120.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
 
-    def chat(self, messages: List[Dict], max_tokens: int = 1024,
-             temperature: float = 0.7, top_p: float = 0.9,
-             stop: Optional[List[str]] = None) -> str:
-        """Send a chat completion request."""
+    def chat(self, messages, max_tokens=MAX_TOKENS, temperature=0.7, top_p=0.9, stop=None):
         import urllib.request
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-        }
-        if stop:
-            payload["stop"] = stop
+        payload = {"model": self.model, "messages": messages,
+                   "max_tokens": max_tokens, "temperature": temperature, "top_p": top_p}
+        if stop: payload["stop"] = stop
         data = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        req = urllib.request.Request(f"{self.base_url}/v1/chat/completions", data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            result = json.loads(resp.read().decode())
-        return result["choices"][0]["message"]["content"]
+            return json.loads(resp.read().decode())["choices"][0]["message"]["content"]
 
-    def chat_stream(self, messages, max_tokens=1024, temperature=0.7, top_p=0.9, stop=None):
-        """Stream chat completion. Yields (token, is_reasoning, finished)."""
+    def chat_stream(self, messages, max_tokens=MAX_TOKENS, temperature=0.7, top_p=0.9, stop=None):
+        """Yields (token, is_reasoning, finished)."""
         import urllib.request
-        payload = {
-            "model": self.model, "messages": messages,
-            "max_tokens": max_tokens, "temperature": temperature,
-            "top_p": top_p, "stream": True,
-        }
-        if stop:
-            payload["stop"] = stop
+        payload = {"model": self.model, "messages": messages,
+                   "max_tokens": max_tokens, "temperature": temperature,
+                   "top_p": top_p, "stream": True}
+        if stop: payload["stop"] = stop
         data = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions", data=data,
-            headers={"Content-Type": "application/json"}, method="POST")
+        req = urllib.request.Request(f"{self.base_url}/v1/chat/completions", data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
         in_think = False
+        _buffer = ""
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             for line_bytes in resp:
                 line = line_bytes.decode().strip()
-                if not line or line.startswith(":"):
-                    continue
+                if not line or line.startswith(":"): continue
                 if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        yield ("", False, True)
-                        return
+                    ds = line[6:]
+                    if ds.strip() == "[DONE]":
+                        yield ("", False, True); return
                     try:
-                        chunk = json.loads(data_str)
+                        chunk = json.loads(ds)
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if not content:
+                        rc = delta.get("reasoning_content", "")
+                        cc = delta.get("content", "")
+                        if rc:
+                            yield (rc, True, False); _buffer += rc
                             continue
-                        if "<think>" in content:
-                            in_think = True
-                            content = content.replace("<think>", "")
-                        if "</think>" in content:
-                            in_think = False
-                            content = content.replace("</think>", "")
-                        if content:
-                            yield (content, in_think, False)
+                        if not cc: continue
+                        if "<think>" in cc: in_think = True; cc = cc.replace("<think>", "")
+                        if "</think>" in cc: in_think = False; cc = cc.replace("</think>", "")
+                        if cc: yield (cc, in_think, False); _buffer += cc
                     except (json.JSONDecodeError, KeyError):
                         continue
 
-    def extract_answer(self, content: str) -> str:
-        """Extract final answer from think-tagged response."""
-        if "<think>" in content:
-            parts = content.split("</think>", 1)
-            return parts[-1].strip() if len(parts) > 1 else content.strip()
-        return content.strip()
 
-    def think_and_answer(self, messages: List[Dict], **kwargs) -> Tuple[str, str]:
-        """Get both reasoning trace and final answer."""
-        content = self.chat(messages, **kwargs)
-        if "<think>" in content:
-            parts = content.split("<think>", 1)
-            if len(parts) > 1:
-                think_inner = parts[1].split("</think>", 1)
-                reasoning = think_inner[0].strip()
-                answer = think_inner[-1].strip() if len(think_inner) > 1 else ""
-                return reasoning, answer
-        return "", content.strip()
+# ═══════════════════════════════════════════════════════════════
+# 2. REAL TTT: PEFT + LoRA + 4-bit
+# ═══════════════════════════════════════════════════════════════
+
+class TTTLearner:
+    def __init__(self, base_model=VLLM_MODEL):
+        self.base_model = base_model
+        self.model = None
+        self.tokenizer = None
+        self.is_loaded = False
+        self._lock = threading.Lock()
+
+    def load(self):
+        with self._lock:
+            if self.is_loaded: return
+            from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig)
+            from peft import LoraConfig, get_peft_model
+            import torch
+            print("[TTT] Loading Qwen3.5-4B 4-bit + LoRA...", flush=True)
+            bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                      bnb_4bit_compute_dtype=torch.bfloat16)
+            m = AutoModelForCausalLM.from_pretrained(self.base_model, quantization_config=bnb,
+                                                      device_map="auto", torch_dtype=torch.bfloat16)
+            m = get_peft_model(m, LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"],
+                                              lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"))
+            tok = AutoTokenizer.from_pretrained(self.base_model)
+            tok.pad_token = tok.eos_token; tok.padding_side = "right"
+            self.model = m; self.tokenizer = tok; self.is_loaded = True
+            print(f"[TTT] Loaded. Trainable: {m.num_parameters(only_trainable=True):,}", flush=True)
+
+    def unload(self):
+        with self._lock:
+            if self.is_loaded:
+                import torch
+                del self.model; del self.tokenizer
+                self.model = None; self.tokenizer = None; self.is_loaded = False
+                torch.cuda.empty_cache()
+
+    def train_step(self, question: str, answer: str, steps: int = 5, lr: float = 3e-4) -> float:
+        self.load(); import torch
+        text = f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>"
+        self.model.train()
+        opt = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        loss_val = 0.0
+        for _ in range(steps):
+            inp = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to("cuda")
+            out = self.model(**inp, labels=inp["input_ids"])
+            loss_val = out.loss.item()
+            opt.zero_grad(); out.loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0); opt.step()
+        self.model.eval()
+        print(f"[TTT] Loss={loss_val:.4f}", flush=True)
+        return loss_val
+
+    def generate(self, text: str, max_new_tokens=MAX_TOKENS, temperature=0.7) -> str:
+        self.load(); import torch
+        # Use tokenizer chat template for proper formatting
+        msg = [{"role": "system", "content": "You are Neurova, a helpful AI assistant."}, {"role": "user", "content": text}]
+        prompt = self.tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+                  f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n")
+        self.model.eval()
+        inp = self.tokenizer(prompt, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            out = self.model.generate(**inp, max_new_tokens=max_new_tokens,
+                                       temperature=temperature, do_sample=temperature > 0.0,
+                                       top_p=0.9, pad_token_id=self.tokenizer.eos_token_id)
+        if "<|im_start|>assistant\n" in full:
+            return full.split("<|im_start|>assistant\n", 1)[-1].strip()
 
 
-# ── Correction Memory ──
+# ═══════════════════════════════════════════════════════════════
+# 3. Correction Memory
+# ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class Correction:
-    question: str = ""
-    answer: str = ""
-    source: str = "user"  # user, distill, eval
-    timestamp: float = field(default_factory=time.time)
-    use_count: int = 0
+    question: str = ""; answer: str = ""
+    timestamp: float = field(default_factory=time.time); use_count: int = 0
 
 class CorrectionMemory:
-    """Episodic correction memory — never touches model weights."""
-
-    def __init__(self, path: str = ""):
-        self.path = path or os.environ.get("NEUROVA_TTT_CORRECTIONS",
-                                            ".neurova_ttt_corrections.json")
-        self.corrections: List[Correction] = []
-        self._load()
-
-    def add(self, question: str, answer: str, source: str = "user"):
-        qn = _norm(question).lower()
-        for c in self.corrections:
-            if _norm(c.question).lower() == qn:
-                c.answer = answer
-                c.source = source
-                c.timestamp = time.time()
-                self._save()
-                return
-        self.corrections.append(Correction(question=qn, answer=answer, source=source))
-        self._save()
-
-    def find(self, question: str) -> Optional[str]:
-        qn = _norm(question).lower()
-        for c in self.corrections:
-            if _norm(c.question).lower() == qn:
-                c.use_count += 1
-                return c.answer
-            # Prefix match for related questions
-            if qn.startswith(c.question) or c.question.startswith(qn):
-                if abs(len(qn) - len(c.question)) / max(len(qn), 1) < 0.3:
-                    c.use_count += 1
-                    return c.answer
-        return None
-
-    def all(self) -> List[Correction]:
-        return list(self.corrections)
+    def __init__(self, path=""):
+        self.path = path or os.environ.get("NEUROVA_TTT_MEMORY", "./.neurova_ttt_memory.json")
+        self.corrections: List[Correction] = []; self._load()
 
     def _load(self):
         p = Path(self.path)
         if p.exists():
-            try:
-                raw = json.loads(p.read_text())
-                self.corrections = [Correction(**c) for c in raw]
+            try: self.corrections = [Correction(**c) for c in json.loads(p.read_text())]
             except: pass
 
     def _save(self):
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        Path(self.path).write_text(
-            json.dumps([asdict(c) for c in self.corrections], ensure_ascii=False, indent=2))
+        Path(self.path).write_text(json.dumps(
+            [{"question": c.question, "answer": c.answer, "timestamp": c.timestamp, "use_count": c.use_count}
+             for c in self.corrections], ensure_ascii=False, indent=2))
+
+    def add(self, q, a): self.corrections.append(Correction(question=_norm(q), answer=_norm(a))); self._save()
+    def find(self, q):
+        qn = _norm(q.lower())
+        for c in reversed(self.corrections):
+            if c.question.lower() == qn: c.use_count += 1; self._save(); return c.answer
+        return None
+    def all(self): return list(self.corrections)
+    def qa_pairs(self): return [(c.question, c.answer) for c in self.corrections]
+    def __len__(self): return len(self.corrections)
 
 
-# ── Tool / Verifier ──
-
-class ToolVerifier:
-    """Self-verification and tool integration for small LLM quality."""
-
-    def __init__(self, client: QwenClient):
-        self.client = client
-
-    def verify_qa(self, question: str, answer: str) -> Tuple[float, str]:
-        """Self-verify an answer. Returns (confidence, critique)."""
-        prompt = (
-            f"Question: {question}\n"
-            f"Proposed answer: {answer}\n\n"
-            f"Please verify this answer. Rate confidence 0-1 and explain any issues."
-        )
-        content = self.client.chat([
-            {"role": "system", "content": "You are a rigorous verifier. Rate answers honestly."},
-            {"role": "user", "content": prompt},
-        ], max_tokens=200, temperature=0.2)
-        return self._parse_confidence(content)
-
-    def _parse_confidence(self, text: str) -> Tuple[float, str]:
-        text = self.client.extract_answer(text)
-        # Find a confidence score in the text
-        import re
-        scores = re.findall(r"(?:confidence|score|rating)[:\s]*(\d+\.?\d*)", text.lower())
-        if scores:
-            conf = float(scores[0])
-            conf = max(0.0, min(1.0, conf))
-            return conf, text[:300]
-        if "correct" in text.lower() and "incorrect" not in text.lower():
-            return 0.7, text[:300]
-        if "incorrect" in text.lower():
-            return 0.2, text[:300]
-        return 0.5, text[:300]
-
-
-# ── Ephemeral LoRA TTT ──
-
-class LoRATTT:
-    """
-    Ephemeral LoRA adapter training for test-time adaptation.
-    
-    Uses unsloth or peft to train lightweight adapters on correction dialogues.
-    Adapters are session-owned and can be discarded or promoted.
-    """
-
-    def __init__(self, base_model: str = VLLM_MODEL, lora_dir: str = "",
-                 device: str = "cpu"):
-        self.base_model = base_model
-        self.lora_dir = lora_dir or os.environ.get("NEUROVA_LORA_DIR",
-                                                     ".neurova_lora_adapters")
-        self.device = device
-        self._has_peft = False
-        self._active_adapter: Optional[str] = None
-        self._check_deps()
-
-    def _check_deps(self):
-        try:
-            import peft  # noqa
-            import torch  # noqa
-            self._has_peft = True
-            if torch.cuda.is_available():
-                self.device = "cuda"
-        except ImportError:
-            self._has_peft = False
-
-    @property
-    def available(self) -> bool:
-        return self._has_peft
-
-    def train(self, dialogues: List[Tuple[str, str]], steps: int = 8,
-              lr: float = 5e-5, rank: int = 8, session_id: str = "") -> Optional[str]:
-        """
-        Train ephemeral LoRA adapter on correction dialogues.
-        
-        Args:
-            dialogues: List of (user_text, assistant_text) pairs
-            steps: Training steps
-            lr: Learning rate
-            rank: LoRA rank
-            session_id: Session identifier for adapter naming
-        
-        Returns:
-            Adapter path if training succeeded, None otherwise
-        """
-        if not self._has_peft or not dialogues:
-            return None
-
-        import torch
-        from peft import LoraConfig, get_peft_model, TaskType
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        sid = session_id or _uid()
-        adapter_id = f"ttt_{sid}_{int(time.time())}"
-        adapter_path = Path(self.lora_dir) / adapter_id
-        adapter_path.mkdir(parents=True, exist_ok=True)
-
-        try:
-            # Load base model in 4-bit for memory efficiency
-            model = AutoModelForCausalLM.from_pretrained(
-                self.base_model,
-                torch_dtype=torch.float16,
-                device_map="auto" if self.device == "cuda" else "cpu",
-                load_in_4bit=self.device == "cuda",
-            )
-            tokenizer = AutoTokenizer.from_pretrained(self.base_model)
-            tokenizer.pad_token = tokenizer.eos_token
-
-            # Configure LoRA
-            lora_cfg = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=rank,
-                lora_alpha=rank * 2,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                lora_dropout=0.05,
-                bias="none",
-            )
-            model = get_peft_model(model, lora_cfg)
-
-            # Prepare training data
-            texts = []
-            for user, assistant in dialogues:
-                texts.append(
-                    f"<|im_start|>user\n{user}<|im_end|>\n"
-                    f"<|im_start|>assistant\n{assistant}<|im_end|>"
-                )
-
-            # Quick training
-            model.train()
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-
-            for step in range(steps):
-                for text in texts:
-                    inputs = tokenizer(text, return_tensors="pt",
-                                       truncation=True, max_length=512).to(self.device)
-                    outputs = model(**inputs, labels=inputs["input_ids"])
-                    loss = outputs.loss
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-
-            model.save_pretrained(adapter_path)
-            tokenizer.save_pretrained(adapter_path)
-            self._active_adapter = adapter_id
-            return str(adapter_path)
-
-        except Exception as e:
-            return None
-
-    def active_adapter(self) -> Optional[str]:
-        return self._active_adapter
-
-
-# ── Session / State Management ──
+# ═══════════════════════════════════════════════════════════════
+# 4. Session Manager
+# ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class SessionState:
-    id: str = ""
-    corrections: List[Correction] = field(default_factory=list)
-    lora_adapter: Optional[str] = None
-    history: List[Dict] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
-
-    def add_message(self, role: str, content: str):
+    id: str = ""; corrections: List[Correction] = field(default_factory=list)
+    history: List[Dict] = field(default_factory=list); created_at: float = field(default_factory=time.time)
+    def add_message(self, role, content):
         self.history.append({"role": role, "content": content})
-        if len(self.history) > 100:
-            self.history = self.history[-50:]
+        if len(self.history) > 100: self.history = self.history[-50:]
 
 class SessionManager:
-    """Request-owned state management for TTT."""
-
-    def __init__(self):
-        self.sessions: Dict[str, SessionState] = {}
-
-    def get_or_create(self, session_id: str = "") -> SessionState:
-        sid = session_id or _uid()
-        if sid not in self.sessions:
-            self.sessions[sid] = SessionState(id=sid)
+    def __init__(self): self.sessions: Dict[str, SessionState] = {}
+    def get_or_create(self, sid=""):
+        sid = sid or _uid()
+        if sid not in self.sessions: self.sessions[sid] = SessionState(id=sid)
         return self.sessions[sid]
-
-    def add_correction(self, session_id: str, question: str, answer: str):
-        state = self.get_or_create(session_id)
-        state.corrections.append(Correction(question=question, answer=answer))
-
-    def get_corrections(self, session_id: str) -> List[Correction]:
-        return self.get_or_create(session_id).corrections
-
-    def set_lora(self, session_id: str, adapter: str):
-        self.get_or_create(session_id).lora_adapter = adapter
+    def add_correction(self, sid, q, a):
+        self.get_or_create(sid).corrections.append(Correction(question=q, answer=a))
 
 
-# ── Main Engine ──
+# ═══════════════════════════════════════════════════════════════
+# 5. Main Engine
+# ═══════════════════════════════════════════════════════════════
 
 class TTTChatEngine:
-    """
-    Main TTT-Qwen Engine.
-    
-    Features:
-    - Chat with Qwen3.5-4B via vLLM
-    - Episodic correction memory (no forgetting)
-    - Ephemeral LoRA TTT adapter training
-    - Tool/self-verification
-    - Session management
-    - Distillation recording for offline training
-    """
-
-    def __init__(self, vllm_url: str = VLLM_URL, model: str = VLLM_MODEL,
-                 correction_path: str = ""):
+    def __init__(self, vllm_url=VLLM_URL, model=VLLM_MODEL, correction_path=""):
         self.client = QwenClient(vllm_url, model)
         self.corrections = CorrectionMemory(correction_path)
-        self.verifier = ToolVerifier(self.client)
-        self.lora = LoRATTT(base_model=model)
+        self.ttt_learner = TTTLearner(base_model=model)
         self.sessions = SessionManager()
-        self._distill_log: List[Dict] = []
+        self.ttt_mode = False
+        self.show_thinking = False  # Default: OFF (only show answer)
+        self._last_full_response = ""
 
-    def chat(self, text: str, session_id: str = "",
-             temperature: float = 0.7, max_tokens: int = 1024,
-             use_corrections: bool = True) -> str:
-        """Process a user message through the full TTT pipeline."""
+    # ── Correction + REAL LoRA TTT ──
+    def correct(self, question: str, answer: str, session_id="") -> str:
+        q, a = _norm(question), _norm(answer)
+        self.corrections.add(q, a)
+        self.sessions.add_correction(session_id, q, a)
+        try:
+            loss = self.ttt_learner.train_step(q, a, steps=5)
+            self.ttt_mode = True
+            return f"Correction learned. LoRA trained (loss={loss:.4f}). TTT mode active."
+        except Exception as e:
+            return f"Stored in memory, but TTT training failed: {e}"
+
+    # ── Streaming ──
+    def chat(self, text: str, session_id="", temperature=0.7, max_tokens=MAX_TOKENS, use_corrections=True) -> str:
+        """Non-streaming chat. Collects from stream and returns."""
+        collected = ""
+        for token, is_reasoning, is_final in self.chat_stream(text, session_id, temperature, max_tokens, use_corrections):
+            if is_final:
+                collected = token
+        return collected
+
+    def chat_stream(self, text, session_id="", temperature=0.7, max_tokens=MAX_TOKENS, use_corrections=True):
+        """Yields (token, is_reasoning, is_final). After: self._last_full_response = answer."""
         text = _norm(text)
         if not text:
-            return "Yes?"
-
-        sid = session_id or "default"
-        session = self.sessions.get_or_create(sid)
-
-        # 1. Check correction memory first (zero forgetting)
-        if use_corrections:
-            corr = self.corrections.find(text)
-            if corr is not None:
-                return corr
-
-        # 2. Check session-local corrections
-        if use_corrections:
-            for c in session.corrections:
-                if _norm(c.question).lower() == text.lower():
-                    return c.answer
-
-        # 3. Build messages with history + corrections as system context
-        system_parts = [
-            "You are Neurova, a helpful AI assistant powered by Qwen3.5-4B.",
-            "You provide accurate, concise answers.",
-            "If you don't know something, say so rather than guessing.",
-        ]
-
-        # Add correction context
-        all_corrections = self.corrections.all()
-        if all_corrections:
-            corr_text = "\n".join(
-                f"Q: {c.question}\nA: {c.answer}"
-                for c in all_corrections[-10:]
-            )
-            system_parts.append(f"\nKnown corrections:\n{corr_text}")
-
-        messages = [
-            {"role": "system", "content": "\n".join(system_parts)},
-        ]
-        messages.extend(session.history[-20:])
-        messages.append({"role": "user", "content": text})
-
-        # 4. Generate response
-        try:
-            content = self.client.chat(messages, max_tokens=max_tokens,
-                                       temperature=temperature)
-            answer = self.client.extract_answer(content)
-        except Exception as e:
-            return f"I encountered an error: {e}"
-
-        # 5. Record to session history
-        session.add_message("user", text)
-        session.add_message("assistant", answer)
-
-        return answer
-
-    def chat_stream(self, text, session_id="", temperature=0.7, max_tokens=1024, use_corrections=True):
-        """Stream chat response token by token."""
-        text = text.strip()
-        if not text:
-            yield "Yes?"
-            return
+            yield ("Yes?", False, True); self._last_full_response = "Yes?"; return
 
         sid = session_id or "default"
         session = self.sessions.get_or_create(sid)
 
         if use_corrections:
-            corr = self.corrections.find(text)
-            if corr:
-                yield corr
-                return
+            c = self.corrections.find(text)
+            if c: yield (c, False, True); self._last_full_response = c; return
             for c in session.corrections:
                 if c.question.lower() == text.lower():
-                    yield c.answer
-                    return
+                    yield (c.answer, False, True); self._last_full_response = c.answer; return
 
-        corr_lines = []
-        for c in self.corrections.all()[-10:]:
-            corr_lines.append("Q: " + c.question + chr(10) + "A: " + c.answer)
-        corr_text = chr(10).join(corr_lines) if corr_lines else ""
+        # TTT mode: local PEFT model
+        if self.ttt_mode and self.ttt_learner.is_loaded:
+            try:
+                ans = self.ttt_learner.generate(text, max_new_tokens=max_tokens, temperature=temperature)
+                yield (ans, False, True); self._last_full_response = ans
+            except Exception as e:
+                yield (f"[TTT Error: {e}]", False, True); self._last_full_response = f"[Error: {e}]"
+            session.add_message("user", text); session.add_message("assistant", self._last_full_response)
+            return
 
-        system = "You are Neurova, a helpful AI assistant powered by Qwen3.5-4B. Provide accurate, concise answers."
-        if corr_text:
-            system += chr(10) + chr(10) + "Known corrections:" + chr(10) + corr_text
-
-        messages = [{"role": "system", "content": system}]
-        messages.extend(session.history[-20:])
-        messages.append({"role": "user", "content": text})
-
-        in_reasoning = False
+        # vLLM streaming
+        messages = self._build_messages(text, session, use_corrections)
         collected = ""
+        in_reasoning = False
+        for token, is_reasoning, finished in self.client.chat_stream(messages, max_tokens=max_tokens, temperature=temperature):
+            collected += token
+            if is_reasoning and not in_reasoning: in_reasoning = True
+            elif not is_reasoning and in_reasoning: in_reasoning = False
+            yield (token, in_reasoning, False)
+            if finished: break
+
+        answer = _extract_answer(collected)
+        self._last_full_response = answer
+        yield (answer, False, True)
+        session.add_message("user", text); session.add_message("assistant", answer)
+
+    def _get_system_prompt(self, use_corrections=True) -> str:
+        parts = [
+            "You are Neurova, a helpful AI assistant based on Qwen3.5-4B.",
+            "Provide accurate, concise answers to the user's questions.",
+            "If you don't know something, say so rather than guessing.",
+        ]
+        if use_corrections:
+            corrs = self.corrections.all()[-10:]
+            if corrs:
+                cl = [f"Q: {c.question}\nA: {c.answer}" for c in corrs]
+                parts.append("Known corrections:\n" + "\n".join(cl))
+        return "\n".join(parts)
+
+    def _build_messages(self, text, session, use_corrections=True):
+        msgs = [{"role": "system", "content": self._get_system_prompt(use_corrections)}]
+        msgs.extend(session.history[-MAX_HISTORY * 2:])
+        msgs.append({"role": "user", "content": text})
+        return msgs
+
+    def enable_ttt(self) -> bool:
+        """Kill vLLM, free GPU, load PEFT model."""
+        import subprocess, time
         try:
-            for token, is_reasoning, finished in self.client.chat_stream(
-                    messages, max_tokens=max_tokens, temperature=temperature):
-                if is_reasoning and not in_reasoning:
-                    in_reasoning = True
-                    continue
-                if not is_reasoning and in_reasoning:
-                    in_reasoning = False
-                    continue
-                collected += token
-                yield token
+            subprocess.run(["pkill", "-9", "-f", "vllm.entrypoints|VLLM::EngineCore"],
+                           capture_output=True, timeout=5)
+            time.sleep(2)
+        except: pass
+        try:
+            self.ttt_learner.load()
+            self.ttt_mode = True
+            return True
         except Exception as e:
-            yield "[Error: " + str(e) + "]"
+            print(f"[TTT] Failed: {e}")
+            return False
 
-        answer = self.client.extract_answer(collected)
-        session.add_message("user", text)
-        session.add_message("assistant", answer)
+    def disable_ttt(self):
+        self.ttt_learner.unload(); self.ttt_mode = False
 
-    def correct(self, question: str, answer: str, session_id: str = ""):
-        """Learn a correction (immediate, no forgetting)."""
-        self.corrections.add(question, answer)
-        self.sessions.add_correction(session_id, question, answer)
+    def status(self):
+        return (f"vLLM: {self.client.base_url}\n"
+                f"Corrections: {len(self.corrections)}\n"
+                f"TTT mode: {'ACTIVE (LoRA)' if self.ttt_mode else 'inactive'}\n"
+                f"TTT loaded: {self.ttt_learner.is_loaded}\n"
+                f"Show thinking: {self.show_thinking}\n"
+                f"Sessions: {len(self.sessions.sessions)}")
 
-    def distill(self, question: str, answer: str, source: str = "correction"):
-        """Record a training example for offline distillation."""
-        self._distill_log.append({
-            "question": question,
-            "answer": answer,
-            "source": source,
-            "timestamp": time.time(),
-        })
 
-    def verify(self, question: str, answer: str) -> Tuple[float, str]:
-        """Self-verify a Q&A pair."""
-        return self.verifier.verify_qa(question, answer)
-
-    def train_lora(self, session_id: str = "", steps: int = 8):
-        """Train ephemeral LoRA adapter from session corrections."""
-        if not self.lora.available:
-            return None
-
-        sid = session_id or "default"
-        session = self.sessions.get_or_create(sid)
-        corrections = session.corrections
-
-        if not corrections and not self.corrections.all():
-            return None
-
-        dialogues = []
-        for c in corrections:
-            dialogues.append((c.question, c.answer))
-        for c in self.corrections.all()[:5]:
-            dialogues.append((c.question, c.answer))
-
-        adapter = self.lora.train(dialogues, steps=steps, session_id=sid)
-        if adapter:
-            self.sessions.set_lora(sid, adapter)
-        return adapter
-
-    def status(self) -> str:
-        return (
-            f"Qwen3.5-4B vLLM: {self.client.base_url}\n"
-            f"Corrections: {len(self.corrections.corrections)}\n"
-            f"Sessions: {len(self.sessions.sessions)}\n"
-            f"LoRA available: {self.lora.available}\n"
-            f"Distill log: {len(self._distill_log)} entries"
-        )
-
-    def export_distill(self, path: str = ""):
-        """Export distill log for offline SFT training."""
-        p = path or f".neurova_distill_{int(time.time())}.json"
-        Path(p).write_text(
-            json.dumps(self._distill_log, ensure_ascii=False, indent=2))
-        return p
-
+# ═══════════════════════════════════════════════════════════════
+# 6. CLI Wrapper
+# ═══════════════════════════════════════════════════════════════
 
 class NeurovaTTTEngine:
-    """CLI-friendly wrapper."""
-
     def __init__(self):
-        self.brain = TTTChatEngine()
-        self.session_id = "default"
-
+        self.brain = TTTChatEngine(); self.session_id = "default"
     def hear(self, text: str) -> str:
-        text = _norm(text)
-        low = text.lower()
-
-        if low in ("status", ":status"):
-            return self.brain.status()
-        if low.startswith("correct:"):
-            payload = text[len("correct:"):].strip()
+        text = _norm(text); low = text.lower()
+        if low in ("status", ":status"): return self.brain.status()
+        if low.startswith("correct:") or low.startswith("learn:"):
+            payload = text.split(":", 1)[1].strip() if ":" in text else ""
             if "=>" in payload:
-                q, a = [p.strip() for p in payload.split("=>", 1)]
-                self.brain.correct(q, a)
-                return "Correction learned."
-            return "Use: correct: <question> => <answer>"
-        if low.startswith("learn:"):
-            payload = text[len("learn:"):].strip()
-            if "=>" in payload:
-                q, a = [p.strip() for p in payload.split("=>", 1)]
-            else:
-                q, a = "", payload
-            self.brain.correct(self._last_q or q, a)
-            return "Learned."
-        if low.startswith("verify:"):
-            q = text[len("verify:"):].strip()
-            conf, critique = self.brain.verify(q, self._last_a)
-            return f"Confidence: {conf:.2f}. {critique}"
-        if low.startswith("lora:"):
-            result = self.brain.train_lora(steps=12)
-            if result:
-                return f"LoRA trained: {result}"
-            return "LoRA training not available (need peft+torch)."
-        if low.startswith("distill:"):
-            path = self.brain.export_distill()
-            return f"Distill log exported: {path}"
-
-        self._last_q = text
-        ans = self.brain.chat(text, session_id=self.session_id)
-        self._last_a = ans
-        return ans
-
-    def reset(self):
-        self.brain = TTTChatEngine()
-        self.session_id = "default"
+                q, a = payload.split("=>", 1)
+                return self.brain.correct(q.strip(), a.strip(), self.session_id)
+            return "Usage: correct: <question> => <answer>"
+        if low.startswith("thinking:"):
+            v = low.split(":", 1)[1].strip()
+            if v in ("on", "true", "1", "yes"): self.brain.show_thinking = True; return "Thinking: ON"
+            elif v in ("off", "false", "0", "no"): self.brain.show_thinking = False; return "Thinking: OFF"
+            return f"Current: {'ON' if self.brain.show_thinking else 'OFF'}"
+        if low.startswith("ttt:"):
+            v = low.split(":", 1)[1].strip()
+            if v in ("on", "true", "1", "yes", "enable"):
+                return "TTT: ON (LoRA)" if self.brain.enable_ttt() else "TTT: FAILED"
+            elif v in ("off", "false", "0", "no", "disable"):
+                self.brain.disable_ttt(); return "TTT: OFF"
+            return f"TTT: {'ON' if self.brain.ttt_mode else 'OFF'}"
+        return self.brain.chat(text, self.session_id)
