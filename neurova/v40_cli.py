@@ -1,8 +1,20 @@
+#!/usr/bin/env python3
+"""
+Neurova V40 CLI — Construction Learner Architecture (v9).
+
+Multi-sentence learning, coreference, GPU embeddings.
+Up/Down arrows for history.
+"""
+
 import os
 import sys
 import readline
 import atexit
-from neurova.architecture.v40_engine_clean import V40CleanEngine
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from neurova.engine import NeurovaEngine
+
 
 def main():
     histfile = os.path.join(os.path.expanduser("~"), ".neurova_v40_history")
@@ -13,14 +25,15 @@ def main():
     readline.set_history_length(1000)
     atexit.register(readline.write_history_file, histfile)
 
-    print("=" * 55)
-    print(" Neurova V40 Clean Engine CLI")
-    print(" Up/down arrows for history. 'exit' to quit.")
-    print("=" * 55)
+    print("=" * 58)
+    print("  Neurova V40 — Cognitive Engine (v9 Construction Learner)")
+    print("  Multi-sentence / Coreference / Self-Learning")
+    print("  Up/Down arrows for history. 'exit' to quit.")
+    print("=" * 58)
     print()
 
-    engine = V40CleanEngine()
-    print("[ready]")
+    engine = NeurovaEngine()
+    print("[System] Ready.")
 
     while True:
         try:
@@ -31,6 +44,18 @@ def main():
             continue
         if inp.lower() in ("exit", "quit"):
             break
+        if inp.lower() == "sleep":
+            report = engine.sleep_cycle()
+            print(f"[Sleep] Consolidation: {report}\n")
+            continue
+        if inp.lower() == "status":
+            s = engine.get_status()
+            print(f"[Status] {s}\n")
+            continue
+        if inp.lower() == "reset":
+            engine.reset()
+            print("[System] Reset complete.\n")
+            continue
 
         response = engine.hear(inp)
         print(f"[V40] {response}\n")
