@@ -195,11 +195,27 @@ class TextDataset:
         self.block_size = block_size
 
     def sample_batch(self, batch_size: int, device: str):
-        max_start = max(0, len(self.data) - self.block_size - 1)
-        starts = torch.randint(0, max_start + 1, (batch_size,)) if max_start > 0 else torch.zeros(batch_size, dtype=torch.long)
-        x = torch.stack([self.data[s:s+self.block_size] for s in starts])
-        y = torch.stack([self.data[s+1:s+self.block_size+1] for s in starts])
-        return x.to(device), y.to(device)
+        """Sample a batch of block_size sequences, padding short ones with PAD."""
+        n = len(self.data)
+        bs = self.block_size
+        pad_id = PAD
+        xs, ys = [], []
+        for _ in range(batch_size):
+            if n > bs + 1:
+                start = random.randint(0, n - bs - 1)
+            else:
+                start = 0
+            x_seq = self.data[start:start + bs].tolist()
+            y_seq = self.data[start + 1:start + bs + 1].tolist()
+            if len(x_seq) < bs:
+                x_seq += [pad_id] * (bs - len(x_seq))
+            if len(y_seq) < bs:
+                y_seq += [pad_id] * (bs - len(y_seq))
+            xs.append(x_seq)
+            ys.append(y_seq)
+        x = torch.tensor(xs, dtype=torch.long, device=device)
+        y = torch.tensor(ys, dtype=torch.long, device=device)
+        return x, y
 
 
 def build_bootstrap_corpus(extra_texts: Optional[List[str]] = None) -> List[str]:
