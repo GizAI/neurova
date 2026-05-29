@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Neurova V40 CLI — Construction Learner Architecture (v9).
+Neurova V40 CLI — Language Acquisition Engine (Clean v12).
 
-Multi-sentence learning, coreference, GPU embeddings.
-Up/Down arrows for history.
+Multi-sentence learning, coreference, self-learning from feedback.
+Up/Down arrows for history. Type 'exit' to quit.
+Prefix with 'learn: ' to teach the system from a wrong answer.
 """
 
-import os
-import sys
-import readline
-import atexit
-
+import os, sys, readline, atexit
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from neurova.engine import NeurovaEngine
-
 
 def main():
     histfile = os.path.join(os.path.expanduser("~"), ".neurova_v40_history")
@@ -26,14 +21,14 @@ def main():
     atexit.register(readline.write_history_file, histfile)
 
     print("=" * 58)
-    print("  Neurova V40 — Cognitive Engine (v9 Construction Learner)")
-    print("  Multi-sentence / Coreference / Self-Learning")
-    print("  Up/Down arrows for history. 'exit' to quit.")
+    print("  Neurova V12 — Language Acquisition Engine")
+    print("  No hardcoded grammar rules. Learns from interaction.")
+    print("  Up/Down arrows. 'exit' to quit. 'learn: <fact>' to teach.")
     print("=" * 58)
     print()
 
     engine = NeurovaEngine()
-    print("[System] Ready.")
+    print("[System] Ready.\n")
 
     while True:
         try:
@@ -45,16 +40,23 @@ def main():
         if inp.lower() in ("exit", "quit"):
             break
         if inp.lower() == "sleep":
-            report = engine.sleep_cycle()
-            print(f"[Sleep] Consolidation: {report}\n")
+            report = engine.brain.sleep_cycle()
+            print(f"[Sleep] {report}\n")
             continue
         if inp.lower() == "status":
-            s = engine.get_status()
+            s = engine.brain.get_status()
             print(f"[Status] {s}\n")
             continue
         if inp.lower() == "reset":
             engine.reset()
             print("[System] Reset complete.\n")
+            continue
+
+        # Feedback mode: user teaches the system
+        if inp.lower().startswith("learn: "):
+            correction = inp[7:].strip()
+            response = engine.brain.feedback("(training)", correction)
+            print(f"[Learn] {response}\n")
             continue
 
         response = engine.hear(inp)
