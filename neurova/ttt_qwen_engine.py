@@ -85,6 +85,59 @@ class QwenClient:
             result = json.loads(resp.read().decode())
         return result["choices"][0]["message"]["content"]
 
+    def chat_stream(self, messages: List[Dict], max_tokens: int = 1024,
+                    temperature: float = 0.7, top_p: float = 0.9,
+                    stop: Optional[List[str]] = None):
+        """Stream chat completion. Yields (token, is_reasoning, finished)."""
+        import urllib.request
+        import json as _json
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": True,
+        }
+        if stop:
+            payload["stop"] = stop
+        data = _json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        in_think = False
+        buffer = ""
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            for line_bytes in resp:
+                line = line_bytes.decode().strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        yield ("", False, True)
+                        return
+                    try:
+                        chunk = _json.loads(data_str)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if not content:
+                            continue
+                        # Detect think tags
+                        if "<think>" in content:
+                            in_think = True
+                            content = content.replace("<think>", "")
+                        if "</think>" in content:
+                            in_think = False
+                            content = content.replace("</think>", "")
+                        if content:
+                            yield (content, in_think, False)
+                    except (_json.JSONDecodeError, KeyError):
+                        continue
+
     def extract_answer(self, content: str) -> str:
         """Extract final answer from think-tagged response."""
         if "<think>" in content:
@@ -228,8 +281,15 @@ class LoRATTT:
             import peft  # noqa
             import torch  # noqa
             self._has_peft = True
+            # Use CUDA only if bitsandbytes loads cleanly for 4-bit
             if torch.cuda.is_available():
-                self.device = "cuda"
+                try:
+                    import bitsandbytes  # noqa
+                    self.device = "cuda"
+                except Exception:
+                    self.device = "cpu"
+            else:
+                self.device = "cpu"
         except ImportError:
             self._has_peft = False
 
@@ -265,13 +325,24 @@ class LoRATTT:
         adapter_path.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Load base model in 4-bit for memory efficiency
-            model = AutoModelForCausalLM.from_pretrained(
-                self.base_model,
-                torch_dtype=torch.float16,
-                device_map="auto" if self.device == "cuda" else "cpu",
-                load_in_4bit=self.device == "cuda",
-            )
+            # Load base model (CPU in fp32 if CUDA/bitsandbytes unavailable)
+            load_kwargs = {
+                "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
+                "device_map": "auto" if self.device == "cuda" else "cpu",
+            }
+            if self.device == "cuda":
+                try:
+                    load_kwargs["load_in_4bit"] = True
+                    model = AutoModelForCausalLM.from_pretrained(
+                        self.base_model, **load_kwargs)
+                except Exception:
+                    # Fallback to CPU
+                    load_kwargs = {"torch_dtype": torch.float32, "device_map": "cpu"}
+                    model = AutoModelForCausalLM.from_pretrained(
+                        self.base_model, **load_kwargs)
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.base_model, **load_kwargs)
             tokenizer = AutoTokenizer.from_pretrained(self.base_model)
             tokenizer.pad_token = tokenizer.eos_token
 
