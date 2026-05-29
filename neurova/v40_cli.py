@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Neurova V40 CLI — Language Acquisition Engine (Clean v12).
-
-Multi-sentence learning, coreference, self-learning from feedback.
+Neurova V40 CLI — Language Acquisition Engine (Clean).
+Zero hardcoded grammar rules. Learns from interaction.
 Up/Down arrows for history. Type 'exit' to quit.
 Prefix with 'learn: ' to teach the system from a wrong answer.
 """
 
 import os, sys, readline, atexit
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from neurova.engine import NeurovaEngine
+
+# Try the new engine first, fall back to existing
+try:
+    from neurova.v40_language_acquisition import NeurovaEngine
+except ImportError:
+    from neurova.engine import NeurovaEngine
+
 
 def main():
     histfile = os.path.join(os.path.expanduser("~"), ".neurova_v40_history")
@@ -21,7 +26,7 @@ def main():
     atexit.register(readline.write_history_file, histfile)
 
     print("=" * 58)
-    print("  Neurova V12 — Language Acquisition Engine")
+    print("  Neurova V40 — Language Acquisition Engine")
     print("  No hardcoded grammar rules. Learns from interaction.")
     print("  Up/Down arrows. 'exit' to quit. 'learn: <fact>' to teach.")
     print("=" * 58)
@@ -44,7 +49,7 @@ def main():
             print(f"[Sleep] {report}\n")
             continue
         if inp.lower() == "status":
-            s = engine.brain.get_status()
+            s = engine.get_status()
             print(f"[Status] {s}\n")
             continue
         if inp.lower() == "reset":
