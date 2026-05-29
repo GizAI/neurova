@@ -85,31 +85,21 @@ class QwenClient:
             result = json.loads(resp.read().decode())
         return result["choices"][0]["message"]["content"]
 
-    def chat_stream(self, messages: List[Dict], max_tokens: int = 1024,
-                    temperature: float = 0.7, top_p: float = 0.9,
-                    stop: Optional[List[str]] = None):
+    def chat_stream(self, messages, max_tokens=1024, temperature=0.7, top_p=0.9, stop=None):
         """Stream chat completion. Yields (token, is_reasoning, finished)."""
         import urllib.request
-        import json as _json
         payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": True,
+            "model": self.model, "messages": messages,
+            "max_tokens": max_tokens, "temperature": temperature,
+            "top_p": top_p, "stream": True,
         }
         if stop:
             payload["stop"] = stop
-        data = _json.dumps(payload).encode()
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+            f"{self.base_url}/v1/chat/completions", data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
         in_think = False
-        buffer = ""
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             for line_bytes in resp:
                 line = line_bytes.decode().strip()
@@ -121,12 +111,11 @@ class QwenClient:
                         yield ("", False, True)
                         return
                     try:
-                        chunk = _json.loads(data_str)
+                        chunk = json.loads(data_str)
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
                         if not content:
                             continue
-                        # Detect think tags
                         if "<think>" in content:
                             in_think = True
                             content = content.replace("<think>", "")
@@ -135,7 +124,7 @@ class QwenClient:
                             content = content.replace("</think>", "")
                         if content:
                             yield (content, in_think, False)
-                    except (_json.JSONDecodeError, KeyError):
+                    except (json.JSONDecodeError, KeyError):
                         continue
 
     def extract_answer(self, content: str) -> str:
@@ -281,15 +270,8 @@ class LoRATTT:
             import peft  # noqa
             import torch  # noqa
             self._has_peft = True
-            # Use CUDA only if bitsandbytes loads cleanly for 4-bit
             if torch.cuda.is_available():
-                try:
-                    import bitsandbytes  # noqa
-                    self.device = "cuda"
-                except Exception:
-                    self.device = "cpu"
-            else:
-                self.device = "cpu"
+                self.device = "cuda"
         except ImportError:
             self._has_peft = False
 
@@ -325,24 +307,13 @@ class LoRATTT:
         adapter_path.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Load base model (CPU in fp32 if CUDA/bitsandbytes unavailable)
-            load_kwargs = {
-                "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
-                "device_map": "auto" if self.device == "cuda" else "cpu",
-            }
-            if self.device == "cuda":
-                try:
-                    load_kwargs["load_in_4bit"] = True
-                    model = AutoModelForCausalLM.from_pretrained(
-                        self.base_model, **load_kwargs)
-                except Exception:
-                    # Fallback to CPU
-                    load_kwargs = {"torch_dtype": torch.float32, "device_map": "cpu"}
-                    model = AutoModelForCausalLM.from_pretrained(
-                        self.base_model, **load_kwargs)
-            else:
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.base_model, **load_kwargs)
+            # Load base model in 4-bit for memory efficiency
+            model = AutoModelForCausalLM.from_pretrained(
+                self.base_model,
+                torch_dtype=torch.float16,
+                device_map="auto" if self.device == "cuda" else "cpu",
+                load_in_4bit=self.device == "cuda",
+            )
             tokenizer = AutoTokenizer.from_pretrained(self.base_model)
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -512,52 +483,40 @@ class TTTChatEngine:
         session.add_message("assistant", answer)
 
         return answer
-    def chat_stream(self, text: str, session_id: str = "",
-                    temperature: float = 0.7, max_tokens: int = 1024,
-                    use_corrections: bool = True):
+
+    def chat_stream(self, text, session_id="", temperature=0.7, max_tokens=1024, use_corrections=True):
         """Stream chat response token by token."""
-        text = _norm(text)
+        text = text.strip()
         if not text:
             yield "Yes?"
             return
-        
+
         sid = session_id or "default"
         session = self.sessions.get_or_create(sid)
-        
+
         if use_corrections:
             corr = self.corrections.find(text)
-            if corr is not None:
+            if corr:
                 yield corr
                 return
             for c in session.corrections:
-                if _norm(c.question).lower() == text.lower():
+                if c.question.lower() == text.lower():
                     yield c.answer
                     return
-        
-        system_parts = [
-            "You are Neurova, a helpful AI assistant powered by Qwen3.5-4B.",
-            "You provide accurate, concise answers.",
-            "If you don't know something, say so rather than guessing.",
-        ]
-        all_corrections = self.corrections.all()
-        if all_corrections:
-            corr_text = "
-".join(
-                f"Q: {c.question}
-A: {c.answer}"
-                for c in all_corrections[-10:]
-            )
-            system_parts.append(f"
-Known corrections:
-{corr_text}")
-        
-        messages = [
-            {"role": "system", "content": "
-".join(system_parts)},
-        ]
+
+        corr_lines = []
+        for c in self.corrections.all()[-10:]:
+            corr_lines.append("Q: " + c.question + chr(10) + "A: " + c.answer)
+        corr_text = chr(10).join(corr_lines) if corr_lines else ""
+
+        system = "You are Neurova, a helpful AI assistant powered by Qwen3.5-4B. Provide accurate, concise answers."
+        if corr_text:
+            system += chr(10) + chr(10) + "Known corrections:" + chr(10) + corr_text
+
+        messages = [{"role": "system", "content": system}]
         messages.extend(session.history[-20:])
         messages.append({"role": "user", "content": text})
-        
+
         in_reasoning = False
         collected = ""
         try:
@@ -572,8 +531,8 @@ Known corrections:
                 collected += token
                 yield token
         except Exception as e:
-            yield f"[Error: {e}]"
-        
+            yield "[Error: " + str(e) + "]"
+
         answer = self.client.extract_answer(collected)
         session.add_message("user", text)
         session.add_message("assistant", answer)
