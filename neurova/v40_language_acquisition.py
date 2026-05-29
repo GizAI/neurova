@@ -638,9 +638,13 @@ class SemanticParser:
                         info = {'signal': tokens_list[j], 'signal_idx': j, 
                                 'role': srole, 'position': sposition}
                         return stype, info
-                # Also check for 'called', 'named', 'known as', 'referred to as' 
-                for j in range(i + 1, min(i + 3, len(tokens_list))):
-                    if tokens_list[j] in ('called', 'named', 'known'):
+                # Also check for 'called', 'named', 'known as', 'headquartered'
+                for j in range(i + 1, min(i + 4, len(tokens_list))):
+                    if tokens_list[j] in ('called', 'named', 'known', 'headquartered'):
+                        if tokens_list[j] == 'headquartered':
+                            info = {'signal': tokens_list[j], 'signal_idx': j, 
+                                    'role': 'entity', 'position': 'after_prep'}
+                            return 'LOCATION', info
                         info = {'signal': tokens_list[j], 'signal_idx': j, 
                                 'role': 'entity', 'position': 'after'}
                         return 'CLASSIFICATION', info
@@ -680,8 +684,20 @@ class SemanticParser:
 
     def _extract_classification(self, text_lower: str, tokens_list: List[str],
                                  ef: EventFrame, sig_idx: int, sig_word: str):
-        """Extract classification: 'X is [attribute]' or 'X is_a Y'
+        """Extract classification: 'X is [attribute]' or 'X is called Y'
         Works with: 'X is a Y', 'X is known as Y', 'X is called Y'"""
+        # Handle 'known as' pattern: attribute is a nickname, not the classification
+        if sig_word == 'known' and sig_idx + 2 < len(tokens_list) and tokens_list[sig_idx + 1] == 'as':
+            nickname = tokens_list[sig_idx + 2].rstrip(',')
+            ef.attributes['also_known_as'] = nickname
+            # Continue processing after 'known as' for the main classification
+            # The main entity's classification comes after the copula
+        # Handle 'called' pattern: attribute is the term used
+        if sig_word in ('called', 'named'):
+            if sig_idx + 1 < len(tokens_list):
+                name = tokens_list[sig_idx + 1].rstrip(',')
+                ef.attributes['called'] = name
+            # Don't return - continue to extract more attributes after the copula
         # Things after the signal word are attributes
         if sig_idx >= 0 and sig_idx < len(tokens_list) - 1:
             after = tokens_list[sig_idx + 1:]
@@ -1149,17 +1165,19 @@ class LanguageAcquisitionEngine:
         self.dialogue_count = 0
 
     def hear(self, text: str) -> str:
-        """Process an utterance. Returns response."""
+        """Process an utterance. Returns response.
+        Handles multi-sentence input by splitting and processing each sentence."""
         self.dialogue_count += 1
 
         if not text.strip():
             return "Yes?"
 
         text = text.strip()
+        text_lower = text.lower()
 
         # Detect if this is a question
         is_question = text.endswith("?") or any(
-            text.lower().startswith(w)
+            text_lower.startswith(w)
             for w in ('what ', 'where ', 'who ', 'when ', 'why ', 'how ',
                       'which ', 'is ', 'are ', 'was ', 'were ', 'am ',
                       'do ', 'does ', 'did ', 'can ', 'could ')
@@ -1169,8 +1187,19 @@ class LanguageAcquisitionEngine:
         if is_question:
             return self._answer(text)
 
-        # Process as statement
-        return self._learn_from_statement(text)
+        # Process multi-sentence statements
+        sents = sent_split(text)
+        stored_count = 0
+        for sent in sents:
+            result = self._learn_from_statement(sent)
+            if result.startswith("Got it"):
+                stored_count += 1
+
+        if stored_count > 0 and stored_count == len(sents):
+            return "Got it. I've stored that information."
+        elif stored_count > 0:
+            return f"Got it. Stored {stored_count} facts."
+        return "I heard you."
 
     def _learn_from_statement(self, text: str) -> str:
         """Process a declarative statement and learn from it."""
