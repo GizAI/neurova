@@ -239,27 +239,85 @@ def build_bootstrap_corpus(extra_texts: Optional[List[str]] = None) -> List[str]
 
 
 class TinyLLMRuntime:
+    """Byte-level GPT runtime with EWC-based test-time training.
+
+    EWC (Elastic Weight Consolidation) prevents catastrophic forgetting during
+    TTT by penalizing changes to parameters important for old knowledge.
+    """
+
     def __init__(self, model_dir: str, device: Optional[str] = None, cfg: Optional[TinyGPTConfig] = None):
         _require_torch()
         self.model_dir = Path(model_dir)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.tok = ByteTokenizer()
+        self._ewc_base = None
+        self._ewc_fisher = None
         if (self.model_dir / "config.json").exists() and (self.model_dir / "model.pt").exists():
             meta = json.loads((self.model_dir / "config.json").read_text())
             self.cfg = TinyGPTConfig(**meta["config"])
             self.model = TinyGPT(self.cfg).to(self.device)
             self.model.load_state_dict(torch.load(self.model_dir / "model.pt", map_location=self.device))
+            self._load_ewc()
         else:
             self.cfg = cfg or TinyGPTConfig()
             self.model = TinyGPT(self.cfg).to(self.device)
         self.model.eval()
 
+    def save_ewc_base(self, texts, num_samples=20):
+        """Compute Fisher diagonal on training texts and save EWC base."""
+        self._compute_fisher(texts, num_samples)
+        self._ewc_base = {n: p.detach().cpu().clone() for n, p in self.model.named_parameters()}
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self._ewc_base, self.model_dir / "ewc_base.pt")
+        torch.save(self._ewc_fisher, self.model_dir / "ewc_fisher.pt")
+
+    def _compute_fisher(self, texts, num_samples=20):
+        """Compute diagonal Fisher Information on training data."""
+        self.model.train()
+        fisher = {}
+        for name, param in self.model.named_parameters():
+            fisher[name] = torch.zeros_like(param, device=self.device)
+        ds = TextDataset(texts, self.tok, self.cfg.block_size)
+        for _ in range(num_samples):
+            x, y = ds.sample_batch(1, self.device)
+            _, loss = self.model(x, y)
+            loss.backward()
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    fisher[name] += param.grad.detach() ** 2
+            self.model.zero_grad()
+        n = max(num_samples, 1)
+        for name in fisher:
+            fisher[name] /= n
+        self.model.eval()
+        self._ewc_fisher = fisher
+
+    def _load_ewc(self):
+        base = self.model_dir / "ewc_base.pt"
+        fish = self.model_dir / "ewc_fisher.pt"
+        if base.exists() and fish.exists():
+            self._ewc_base = torch.load(base, map_location=self.device)
+            self._ewc_fisher = torch.load(fish, map_location=self.device)
+            return True
+        return False
+
+    def _ewc_penalty(self, ewc_lambda=500.0):
+        if self._ewc_base is None or self._ewc_fisher is None or ewc_lambda <= 0:
+            return torch.tensor(0.0, device=self.device)
+        penalty = torch.tensor(0.0, device=self.device)
+        for name, param in self.model.named_parameters():
+            if name in self._ewc_base and name in self._ewc_fisher:
+                diff = param - self._ewc_base[name].to(self.device)
+                penalty += (self._ewc_fisher[name].to(self.device) * diff ** 2).sum()
+        return ewc_lambda * penalty
+
     def save(self):
         self.model_dir.mkdir(parents=True, exist_ok=True)
         torch.save(self.model.state_dict(), self.model_dir / "model.pt")
-        (self.model_dir / "config.json").write_text(json.dumps({"config": asdict(self.cfg), "saved_at": time.time()}, indent=2))
+        (self.model_dir / "config.json").write_text(
+            json.dumps({"config": asdict(self.cfg), "saved_at": time.time()}, indent=2))
 
-    def train_texts(self, texts: List[str], steps: int = 500, batch_size: int = 16, lr: float = 3e-4, log_every: int = 50):
+    def train_texts(self, texts, steps=500, batch_size=16, lr=3e-4, log_every=50, ewc_lambda=0.0):
         ds = TextDataset(texts, self.tok, self.cfg.block_size)
         opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.01)
         self.model.train()
@@ -267,8 +325,10 @@ class TinyLLMRuntime:
         for step in range(1, steps + 1):
             x, y = ds.sample_batch(batch_size, self.device)
             _, loss = self.model(x, y)
+            penalty = self._ewc_penalty(ewc_lambda)
+            total_loss = loss + penalty
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             opt.step()
             last_loss = float(loss.item())
@@ -277,12 +337,13 @@ class TinyLLMRuntime:
         self.model.eval()
         return last_loss
 
-    def ttt_update_dialogue(self, user: str, assistant: str, steps: int = 20, lr: float = 1e-4):
-        """Test-time training from one correction/example."""
-        return self.train_texts([format_dialogue(user, assistant)], steps=steps, batch_size=1, lr=lr, log_every=0)
+    def ttt_update_dialogue(self, user, assistant, steps=8, lr=5e-5, ewc_lambda=500.0):
+        """EWC-protected TTT: adapts to new dialogue without forgetting old knowledge."""
+        return self.train_texts([format_dialogue(user, assistant)],
+                                steps=steps, batch_size=1, lr=lr, ewc_lambda=ewc_lambda, log_every=0)
 
     @torch.no_grad()
-    def complete(self, prompt: str, max_new_tokens: int = 200, temperature: float = 0.8, top_k: int = 80) -> str:
+    def complete(self, prompt, max_new_tokens=200, temperature=0.8, top_k=80):
         self.model.eval()
         ids = self.tok.encode(prompt, add_bos=True)
         idx = torch.tensor([ids], dtype=torch.long, device=self.device)
@@ -290,18 +351,16 @@ class TinyLLMRuntime:
         gen = self.tok.decode(out[0].tolist()[len(ids):])
         return gen
 
-    def chat(self, user_text: str, context: str = "", max_new_tokens: int = 160, temperature: float = 0.8) -> str:
-        prompt = ""
+    def chat(self, user_text, context='', max_new_tokens=160, temperature=0.8):
+        prompt = ''
         if context.strip():
-            prompt += f"<context> {context.strip()}\n"
-        prompt += f"<user> {user_text.strip()}\n<assistant>"
+            prompt += '<context> ' + context.strip() + chr(10)
+        prompt += '<user> ' + user_text.strip() + chr(10) + '<assistant>'
         gen = self.complete(prompt, max_new_tokens=max_new_tokens, temperature=temperature)
-        # Stop at next user/context marker to keep turns clean.
-        for stop in ["<user>", "<context>", "\n<user", "\n<context"]:
+        for stop in ['<user>', '<context>', chr(10)+'<user', chr(10)+'<context']:
             if stop in gen:
                 gen = gen.split(stop, 1)[0]
-        return gen.strip() or "..."
-
+        return gen.strip() or '...'
 
 def load_text_files(paths: List[str]) -> List[str]:
     out = []
@@ -352,6 +411,7 @@ def main(argv: Optional[List[str]] = None):
         rt = TinyLLMRuntime(args.model_dir, cfg=cfg)
         texts = build_bootstrap_corpus(load_text_files(args.data))
         loss = rt.train_texts(texts, steps=args.steps, batch_size=args.batch_size, lr=args.lr)
+        rt.save_ewc_base(texts, num_samples=20)
         rt.save()
         print(f"saved {args.model_dir}; final_loss={loss}")
     elif args.cmd == "chat":
