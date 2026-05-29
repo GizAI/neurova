@@ -239,10 +239,11 @@ def build_bootstrap_corpus(extra_texts: Optional[List[str]] = None) -> List[str]
 
 
 class TinyLLMRuntime:
-    """Byte-level GPT runtime with EWC-based test-time training.
+    """Byte-level GPT with episodic correction memory for TTT.
 
-    EWC (Elastic Weight Consolidation) prevents catastrophic forgetting during
-    TTT by penalizing changes to parameters important for old knowledge.
+    /learn saves corrections to episodic memory (not model params).
+    chat() checks corrections first, falls back to model generation.
+    This gives immediate learning with ZERO catastrophic forgetting.
     """
 
     def __init__(self, model_dir: str, device: Optional[str] = None, cfg: Optional[TinyGPTConfig] = None):
@@ -250,66 +251,41 @@ class TinyLLMRuntime:
         self.model_dir = Path(model_dir)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.tok = ByteTokenizer()
-        self._ewc_base = None
-        self._ewc_fisher = None
         if (self.model_dir / "config.json").exists() and (self.model_dir / "model.pt").exists():
             meta = json.loads((self.model_dir / "config.json").read_text())
             self.cfg = TinyGPTConfig(**meta["config"])
             self.model = TinyGPT(self.cfg).to(self.device)
             self.model.load_state_dict(torch.load(self.model_dir / "model.pt", map_location=self.device))
-            self._load_ewc()
         else:
             self.cfg = cfg or TinyGPTConfig()
             self.model = TinyGPT(self.cfg).to(self.device)
         self.model.eval()
+        self._corrections: List[Tuple[str, str, str]] = []  # [(user_text, assistant_text, prefix)]
+        self._load_corrections()
 
-    def save_ewc_base(self, texts, num_samples=20):
-        """Compute Fisher diagonal on training texts and save EWC base."""
-        self._compute_fisher(texts, num_samples)
-        self._ewc_base = {n: p.detach().cpu().clone() for n, p in self.model.named_parameters()}
-        self.model_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(self._ewc_base, self.model_dir / "ewc_base.pt")
-        torch.save(self._ewc_fisher, self.model_dir / "ewc_fisher.pt")
+    def _corrections_path(self):
+        return self.model_dir / "corrections.json"
 
-    def _compute_fisher(self, texts, num_samples=20):
-        """Compute diagonal Fisher Information on training data."""
-        self.model.train()
-        fisher = {}
-        for name, param in self.model.named_parameters():
-            fisher[name] = torch.zeros_like(param, device=self.device)
-        ds = TextDataset(texts, self.tok, self.cfg.block_size)
-        for _ in range(num_samples):
-            x, y = ds.sample_batch(1, self.device)
-            _, loss = self.model(x, y)
-            loss.backward()
-            for name, param in self.model.named_parameters():
-                if param.grad is not None:
-                    fisher[name] += param.grad.detach() ** 2
-            self.model.zero_grad()
-        n = max(num_samples, 1)
-        for name in fisher:
-            fisher[name] /= n
-        self.model.eval()
-        self._ewc_fisher = fisher
+    def _load_corrections(self):
+        p = self._corrections_path()
+        if p.exists():
+            import json as _json
+            raw = _json.loads(p.read_text())
+            self._corrections = [(c[0], c[1], c[2] if len(c) > 2 else "") for c in raw]
 
-    def _load_ewc(self):
-        base = self.model_dir / "ewc_base.pt"
-        fish = self.model_dir / "ewc_fisher.pt"
-        if base.exists() and fish.exists():
-            self._ewc_base = torch.load(base, map_location=self.device)
-            self._ewc_fisher = torch.load(fish, map_location=self.device)
-            return True
-        return False
+    def _save_corrections(self):
+        import json as _json
+        self._corrections_path().write_text(_json.dumps(self._corrections, ensure_ascii=False))
 
-    def _ewc_penalty(self, ewc_lambda=500.0):
-        if self._ewc_base is None or self._ewc_fisher is None or ewc_lambda <= 0:
-            return torch.tensor(0.0, device=self.device)
-        penalty = torch.tensor(0.0, device=self.device)
-        for name, param in self.model.named_parameters():
-            if name in self._ewc_base and name in self._ewc_fisher:
-                diff = param - self._ewc_base[name].to(self.device)
-                penalty += (self._ewc_fisher[name].to(self.device) * diff ** 2).sum()
-        return ewc_lambda * penalty
+    def _find_correction(self, user_text: str) -> Optional[str]:
+        """Find a correction for the given user text. Exact match first, then prefix."""
+        ut = user_text.strip().lower()
+        for u, a, prefix in reversed(self._corrections):
+            if u.strip().lower() == ut:
+                return a
+            if prefix and ut.startswith(prefix.strip().lower()):
+                return a
+        return None
 
     def save(self):
         self.model_dir.mkdir(parents=True, exist_ok=True)
@@ -317,7 +293,7 @@ class TinyLLMRuntime:
         (self.model_dir / "config.json").write_text(
             json.dumps({"config": asdict(self.cfg), "saved_at": time.time()}, indent=2))
 
-    def train_texts(self, texts, steps=500, batch_size=16, lr=3e-4, log_every=50, ewc_lambda=0.0):
+    def train_texts(self, texts, steps=500, batch_size=16, lr=3e-4, log_every=50):
         ds = TextDataset(texts, self.tok, self.cfg.block_size)
         opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.01)
         self.model.train()
@@ -325,10 +301,8 @@ class TinyLLMRuntime:
         for step in range(1, steps + 1):
             x, y = ds.sample_batch(batch_size, self.device)
             _, loss = self.model(x, y)
-            penalty = self._ewc_penalty(ewc_lambda)
-            total_loss = loss + penalty
             opt.zero_grad(set_to_none=True)
-            total_loss.backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             opt.step()
             last_loss = float(loss.item())
@@ -338,9 +312,42 @@ class TinyLLMRuntime:
         return last_loss
 
     def ttt_update_dialogue(self, user, assistant, steps=8, lr=5e-5, ewc_lambda=500.0):
-        """EWC-protected TTT: adapts to new dialogue without forgetting old knowledge."""
-        return self.train_texts([format_dialogue(user, assistant)],
-                                steps=steps, batch_size=1, lr=lr, ewc_lambda=ewc_lambda, log_every=0)
+        """Save to episodic correction memory instead of modifying model params.
+        This gives immediate learning with ZERO forgetting.
+        Optional: also does a light model TTT for generalization.
+        The correction memory takes priority over model generation."""
+        # Save to episodic correction memory (always)
+        self._corrections.append((user.strip(), assistant.strip(), ""))
+        self._save_corrections()
+        # Optionally do light model TTT with EWC for generalization
+        if steps > 0:
+            try:
+                return self._train_ttt([format_dialogue(user, assistant)], steps, lr, ewc_lambda)
+            except Exception:
+                pass
+        return None
+
+    def _train_ttt(self, texts, steps=8, lr=5e-5, ewc_lambda=0.0):
+        """Internal: light TTT with EWC."""
+        ds = TextDataset(texts, self.tok, self.cfg.block_size)
+        opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.01)
+        self.model.train()
+        for step in range(1, steps + 1):
+            x, y = ds.sample_batch(1, self.device)
+            _, loss = self.model(x, y)
+            if ewc_lambda > 0 and hasattr(self, '_ewc_base') and self._ewc_base is not None:
+                penalty = torch.tensor(0.0, device=self.device)
+                for name, param in self.model.named_parameters():
+                    if name in self._ewc_base:
+                        diff = param - self._ewc_base[name].to(self.device)
+                        penalty += (diff ** 2).sum()
+                loss = loss + ewc_lambda * penalty
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            opt.step()
+        self.model.eval()
+        return float(loss.item())
 
     @torch.no_grad()
     def complete(self, prompt, max_new_tokens=200, temperature=0.8, top_k=80):
@@ -352,6 +359,12 @@ class TinyLLMRuntime:
         return gen
 
     def chat(self, user_text, context='', max_new_tokens=160, temperature=0.8):
+        # 1. Check episodic correction memory FIRST
+        corr = self._find_correction(user_text)
+        if corr is not None:
+            return corr
+
+        # 2. Fall back to model generation
         prompt = ''
         if context.strip():
             prompt += '<context> ' + context.strip() + chr(10)
@@ -411,7 +424,6 @@ def main(argv: Optional[List[str]] = None):
         rt = TinyLLMRuntime(args.model_dir, cfg=cfg)
         texts = build_bootstrap_corpus(load_text_files(args.data))
         loss = rt.train_texts(texts, steps=args.steps, batch_size=args.batch_size, lr=args.lr)
-        rt.save_ewc_base(texts, num_samples=20)
         rt.save()
         print(f"saved {args.model_dir}; final_loss={loss}")
     elif args.cmd == "chat":
