@@ -1,0 +1,500 @@
+{"text": "alice is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "charlie"}}
+{"text": "alice is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "luna"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "on 2025 bob is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "bird", "time_expr": "2025"}}
+{"text": "bob is mammal", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "mammal"}}
+{"text": "charlie is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "luna"}}
+{"text": "on 2025 bob is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "robot", "time_expr": "2025"}}
+{"text": "press switch causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "wet ground"}}
+{"text": "kibo is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "bob is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "alice is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "kibo"}}
+{"text": "alice is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "charlie"}}
+{"text": "heat causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "light on"}}
+{"text": "rain causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "light on"}}
+{"text": "kibo is rover", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "rover"}}
+{"text": "영희 is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "orion is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "charlie"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "영희 is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "alice is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "kibo is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "bob"}}
+{"text": "철수 is rover", "ir_type": "ClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "rover"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "charlie is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "on 2025 luna is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "machine", "time_expr": "2025"}}
+{"text": "철수 is robot", "ir_type": "ClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "robot"}}
+{"text": "kibo is ceo", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "ceo"}}
+{"text": "bob is not bird", "ir_type": "NegatedClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "bird", "polarity": "negative"}}
+{"text": "kibo is not bird", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "bird", "polarity": "negative"}}
+{"text": "heat causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "wet ground"}}
+{"text": "orion is mammal", "ir_type": "ClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "mammal"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "kibo is bird", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "bird"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "market shock causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "wet ground"}}
+{"text": "luna is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "on 2024 luna is mammal", "ir_type": "TemporalClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "mammal", "time_expr": "2024"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "철수 is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "heat causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "volatility"}}
+{"text": "charlie is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "철수 is not bird", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "bird", "polarity": "negative"}}
+{"text": "on 2027 철수 is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "robot", "time_expr": "2027"}}
+{"text": "bob is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "orion"}}
+{"text": "luna is mammal", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "mammal"}}
+{"text": "on 2028 영희 is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "bird", "time_expr": "2028"}}
+{"text": "on 2028 영희 is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "bird", "time_expr": "2028"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "on 2024 luna is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "rover", "time_expr": "2024"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "on 2028 kibo is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "rover", "time_expr": "2028"}}
+{"text": "luna is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "alice is bird", "ir_type": "ClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "bird"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "on 2026 kibo is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "bird", "time_expr": "2026"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "bob is robot", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "robot"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "민수 is not bird", "ir_type": "NegatedClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "bird", "polarity": "negative"}}
+{"text": "민수 is not mammal", "ir_type": "NegatedClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "mammal", "polarity": "negative"}}
+{"text": "rain causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "steam"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "luna is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "alice"}}
+{"text": "on 2025 orion is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "machine", "time_expr": "2025"}}
+{"text": "luna is rover", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "rover"}}
+{"text": "on 2025 bob is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "machine", "time_expr": "2025"}}
+{"text": "orion is machine", "ir_type": "ClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "machine"}}
+{"text": "on 2025 alice is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "rover", "time_expr": "2025"}}
+{"text": "market shock causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "wet ground"}}
+{"text": "luna is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "kibo is animal", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "animal"}}
+{"text": "orion is not bird", "ir_type": "NegatedClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "bird", "polarity": "negative"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "철수 is ceo", "ir_type": "ClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "ceo"}}
+{"text": "kibo is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "bob"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "charlie is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "alice"}}
+{"text": "alice is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "kibo"}}
+{"text": "luna is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "kibo"}}
+{"text": "철수 is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "alice is ceo", "ir_type": "ClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "ceo"}}
+{"text": "on 2024 민수 is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "rover", "time_expr": "2024"}}
+{"text": "market shock causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "light on"}}
+{"text": "orion is ceo", "ir_type": "ClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "ceo"}}
+{"text": "charlie is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "철수 is active", "ir_type": "ClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "active"}}
+{"text": "on 2024 kibo is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "animal", "time_expr": "2024"}}
+{"text": "alice is not mammal", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "mammal", "polarity": "negative"}}
+{"text": "market shock causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "wet ground"}}
+{"text": "luna is robot", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "robot"}}
+{"text": "charlie is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "press switch causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "volatility"}}
+{"text": "철수 is not mammal", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "mammal", "polarity": "negative"}}
+{"text": "market shock causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "wet ground"}}
+{"text": "on 2026 orion is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "robot", "time_expr": "2026"}}
+{"text": "orion is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "alice"}}
+{"text": "on 2026 charlie is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "machine", "time_expr": "2026"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "luna is machine", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "machine"}}
+{"text": "alice is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "orion"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "kibo is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "alice"}}
+{"text": "on 2024 kibo is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "bird", "time_expr": "2024"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "alice is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "bob"}}
+{"text": "bob is robot", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "robot"}}
+{"text": "luna is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "orion"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "luna is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "charlie"}}
+{"text": "on 2028 alice is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "robot", "time_expr": "2028"}}
+{"text": "bob is robot", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "robot"}}
+{"text": "on 2026 kibo is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "machine", "time_expr": "2026"}}
+{"text": "luna is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "kibo is machine", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "machine"}}
+{"text": "on 2024 bob is ceo", "ir_type": "TemporalClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "ceo", "time_expr": "2024"}}
+{"text": "alice is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "bob"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "heat causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "light on"}}
+{"text": "alice is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "철수 is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "orion is robot", "ir_type": "ClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "robot"}}
+{"text": "on 2027 alice is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "animal", "time_expr": "2027"}}
+{"text": "bob is mammal", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "mammal"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "영희 is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "rain causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "light on"}}
+{"text": "영희 is ceo", "ir_type": "ClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "ceo"}}
+{"text": "market shock causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "wet ground"}}
+{"text": "heat causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "steam"}}
+{"text": "heat causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "wet ground"}}
+{"text": "kibo is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "luna is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "orion"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "alice is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "on 2026 charlie is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "bird", "time_expr": "2026"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "on 2024 철수 is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "animal", "time_expr": "2024"}}
+{"text": "orion is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "rain causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "steam"}}
+{"text": "heat causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "volatility"}}
+{"text": "kibo is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "alice"}}
+{"text": "charlie is mammal", "ir_type": "ClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "mammal"}}
+{"text": "charlie is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "orion"}}
+{"text": "alice is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "press switch causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "steam"}}
+{"text": "on 2026 bob is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "rover", "time_expr": "2026"}}
+{"text": "alice is machine", "ir_type": "ClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "machine"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "on 2027 alice is mammal", "ir_type": "TemporalClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "mammal", "time_expr": "2027"}}
+{"text": "heat causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "light on"}}
+{"text": "rain causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "light on"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "kibo is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "orion"}}
+{"text": "orion is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "alice"}}
+{"text": "press switch causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "steam"}}
+{"text": "rain causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "steam"}}
+{"text": "rain causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "steam"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "on 2025 민수 is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "animal", "time_expr": "2025"}}
+{"text": "heat causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "steam"}}
+{"text": "on 2025 영희 is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "bird", "time_expr": "2025"}}
+{"text": "철수 is not mammal", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "mammal", "polarity": "negative"}}
+{"text": "luna is bird", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "bird"}}
+{"text": "on 2025 charlie is mammal", "ir_type": "TemporalClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "mammal", "time_expr": "2025"}}
+{"text": "on 2024 kibo is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "machine", "time_expr": "2024"}}
+{"text": "luna is animal", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "animal"}}
+{"text": "kibo is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "민수 is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "charlie is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "on 2028 철수 is ceo", "ir_type": "TemporalClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "ceo", "time_expr": "2028"}}
+{"text": "민수 is not mammal", "ir_type": "NegatedClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "mammal", "polarity": "negative"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "charlie is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "kibo"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "luna is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "alice"}}
+{"text": "철수 is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "heat causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "steam"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "market shock causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "volatility"}}
+{"text": "kibo is bird", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "bird"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "alice is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "kibo"}}
+{"text": "heat causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "light on"}}
+{"text": "luna is rover", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "rover"}}
+{"text": "bob is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "charlie"}}
+{"text": "bob is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "kibo"}}
+{"text": "철수 is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "alice is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "luna"}}
+{"text": "on 2024 민수 is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "rover", "time_expr": "2024"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "press switch causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "light on"}}
+{"text": "bob is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "orion"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "charlie is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "luna is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "bob is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "orion"}}
+{"text": "charlie is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "orion is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "charlie is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "bob"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "charlie is mammal", "ir_type": "ClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "mammal"}}
+{"text": "press switch causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "steam"}}
+{"text": "bob is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "orion"}}
+{"text": "on 2027 bob is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "animal", "time_expr": "2027"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "charlie is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "bob"}}
+{"text": "orion is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "alice"}}
+{"text": "alice is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "orion"}}
+{"text": "press switch causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "light on"}}
+{"text": "press switch causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "wet ground"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "press switch causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "volatility"}}
+{"text": "kibo is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "alice is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "kibo"}}
+{"text": "kibo is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "alice"}}
+{"text": "on 2027 영희 is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "rover", "time_expr": "2027"}}
+{"text": "bob is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "alice is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "orion"}}
+{"text": "on 2025 charlie is mammal", "ir_type": "TemporalClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "mammal", "time_expr": "2025"}}
+{"text": "alice is rover", "ir_type": "ClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "rover"}}
+{"text": "luna is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "kibo"}}
+{"text": "rain causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "volatility"}}
+{"text": "charlie is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "alice"}}
+{"text": "orion is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "luna"}}
+{"text": "철수 is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "alice is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "luna"}}
+{"text": "on 2026 영희 is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot", "time_expr": "2026"}}
+{"text": "on 2027 민수 is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "bird", "time_expr": "2027"}}
+{"text": "민수 is ceo", "ir_type": "ClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "ceo"}}
+{"text": "on 2028 kibo is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "machine", "time_expr": "2028"}}
+{"text": "kibo is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "luna"}}
+{"text": "철수 is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "kibo is machine", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "machine"}}
+{"text": "bob is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "orion"}}
+{"text": "charlie is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "kibo"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "철수 is not bird", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "bird", "polarity": "negative"}}
+{"text": "영희 is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "bob is robot", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "robot"}}
+{"text": "kibo is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "rain causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "steam"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "kibo is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "bob"}}
+{"text": "heat causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "wet ground"}}
+{"text": "luna is robot", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "robot"}}
+{"text": "rain causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "wet ground"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "민수 is bird", "ir_type": "ClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "bird"}}
+{"text": "철수 is mammal", "ir_type": "ClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "mammal"}}
+{"text": "orion is robot", "ir_type": "ClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "robot"}}
+{"text": "press switch causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "light on"}}
+{"text": "charlie is robot", "ir_type": "ClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "robot"}}
+{"text": "민수 is robot", "ir_type": "ClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "robot"}}
+{"text": "heat causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "steam"}}
+{"text": "alice is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "bob is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "kibo"}}
+{"text": "alice is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "on 2027 bob is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "animal", "time_expr": "2027"}}
+{"text": "rain causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "wet ground"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "charlie is not bird", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "bird", "polarity": "negative"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "charlie is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "orion"}}
+{"text": "영희 is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "bob is rover", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "rover"}}
+{"text": "heat causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "volatility"}}
+{"text": "alice is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "charlie"}}
+{"text": "alice is robot", "ir_type": "ClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "robot"}}
+{"text": "orion is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "charlie"}}
+{"text": "영희 is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "press switch causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "wet ground"}}
+{"text": "market shock causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "light on"}}
+{"text": "bob is not bird", "ir_type": "NegatedClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "bird", "polarity": "negative"}}
+{"text": "민수 is bird", "ir_type": "ClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "bird"}}
+{"text": "영희 is active", "ir_type": "ClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "active"}}
+{"text": "charlie is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "luna is not mammal", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "mammal", "polarity": "negative"}}
+{"text": "영희 is mammal", "ir_type": "ClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "mammal"}}
+{"text": "charlie is active", "ir_type": "ClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "active"}}
+{"text": "press switch causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "steam"}}
+{"text": "charlie is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "luna is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "kibo"}}
+{"text": "on 2024 alice is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "bird", "time_expr": "2024"}}
+{"text": "on 2026 민수 is ceo", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "ceo", "time_expr": "2026"}}
+{"text": "heat causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "steam"}}
+{"text": "heat causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "light on"}}
+{"text": "press switch causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "volatility"}}
+{"text": "alice is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "heat causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "steam"}}
+{"text": "charlie is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "orion"}}
+{"text": "alice is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "market shock causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "light on"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "heat causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "volatility"}}
+{"text": "영희 is active", "ir_type": "ClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "active"}}
+{"text": "on 2025 luna is mammal", "ir_type": "TemporalClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "mammal", "time_expr": "2025"}}
+{"text": "민수 is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "charlie is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "luna"}}
+{"text": "영희 is robot", "ir_type": "ClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot"}}
+{"text": "alice is robot", "ir_type": "ClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "robot"}}
+{"text": "bob is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "alice"}}
+{"text": "on 2027 orion is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "robot", "time_expr": "2027"}}
+{"text": "rain causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "wet ground"}}
+{"text": "alice is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "bob"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "heat causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "light on"}}
+{"text": "bob is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "kibo is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "bob"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "luna is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "alice"}}
+{"text": "bob is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "alice"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "on 2025 철수 is ceo", "ir_type": "TemporalClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "ceo", "time_expr": "2025"}}
+{"text": "bob is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "luna"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "bob is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "alice is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "charlie"}}
+{"text": "on 2025 luna is ceo", "ir_type": "TemporalClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "ceo", "time_expr": "2025"}}
+{"text": "orion is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "bob"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "on 2028 영희 is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot", "time_expr": "2028"}}
+{"text": "alice is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "charlie"}}
+{"text": "market shock causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "wet ground"}}
+{"text": "on 2028 민수 is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "animal", "time_expr": "2028"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "luna is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "bob"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "rain causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "steam"}}
+{"text": "on 2027 orion is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "animal", "time_expr": "2027"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "luna is machine", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "machine"}}
+{"text": "luna is robot", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "robot"}}
+{"text": "charlie is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "luna"}}
+{"text": "on 2025 luna is active", "ir_type": "TemporalClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "active", "time_expr": "2025"}}
+{"text": "on 2026 영희 is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "animal", "time_expr": "2026"}}
+{"text": "kibo is robot", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "robot"}}
+{"text": "market shock causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "light on"}}
+{"text": "orion is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "charlie"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "bob is robot", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "robot"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "on 2027 영희 is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot", "time_expr": "2027"}}
+{"text": "on 2024 영희 is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "machine", "time_expr": "2024"}}
+{"text": "orion is robot", "ir_type": "ClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "robot"}}
+{"text": "market shock causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "wet ground"}}
+{"text": "luna is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "charlie is mammal", "ir_type": "ClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "mammal"}}
+{"text": "kibo is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "heat causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "wet ground"}}
+{"text": "alice is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "bob"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "kibo is machine", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "machine"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "on 2026 민수 is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "robot", "time_expr": "2026"}}
+{"text": "on 2024 alice is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "robot", "time_expr": "2024"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "charlie is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "luna is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "alice"}}
+{"text": "on 2028 민수 is ceo", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "ceo", "time_expr": "2028"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "rain causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "wet ground"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "민수 is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "민수 is machine", "ir_type": "ClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "machine"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "alice is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "luna is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "orion"}}
+{"text": "orion is animal", "ir_type": "ClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "animal"}}
+{"text": "heat causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "wet ground"}}
+{"text": "orion is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "charlie"}}
+{"text": "alice is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "market shock causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "light on"}}
+{"text": "bob is active", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "active"}}
+{"text": "press switch causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "volatility"}}
+{"text": "민수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "영희"}}
+{"text": "on 2028 orion is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "rover", "time_expr": "2028"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "영희 is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "rain causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "volatility"}}
+{"text": "bob is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "orion"}}
+{"text": "on 2027 orion is animal", "ir_type": "TemporalClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "animal", "time_expr": "2027"}}
+{"text": "alice is animal", "ir_type": "ClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "animal"}}
+{"text": "alice is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "alice", "comparator": "greater_than", "right": "luna"}}
+{"text": "on 2026 철수 is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "robot", "time_expr": "2026"}}
+{"text": "luna is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "영희 is robot", "ir_type": "ClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot"}}
+{"text": "orion is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "luna"}}
+{"text": "heat causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "volatility"}}
+{"text": "영희 is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "heat causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "volatility"}}
+{"text": "on 2025 영희 is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "machine", "time_expr": "2025"}}
+{"text": "철수는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "민수"}}
+{"text": "bob is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "alice"}}
+{"text": "charlie is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "alice"}}
+{"text": "luna is not rover", "ir_type": "NegatedClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "rover", "polarity": "negative"}}
+{"text": "bob is bird", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "bird"}}
+{"text": "market shock causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "steam"}}
+{"text": "rain causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "light on"}}
+{"text": "on 2025 kibo is mammal", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "mammal", "time_expr": "2025"}}
+{"text": "영희 is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "charlie is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "alice"}}
+{"text": "orion is not animal", "ir_type": "NegatedClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "animal", "polarity": "negative"}}
+{"text": "rain causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "volatility"}}
+{"text": "market shock causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "steam"}}
+{"text": "kibo is not machine", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "machine", "polarity": "negative"}}
+{"text": "heat causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "light on"}}
+{"text": "영희 is not mammal", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "mammal", "polarity": "negative"}}
+{"text": "on 2026 alice is ceo", "ir_type": "TemporalClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "ceo", "time_expr": "2026"}}
+{"text": "bob is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "luna"}}
+{"text": "charlie is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "alice"}}
+{"text": "press switch causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "wet ground"}}
+{"text": "bob is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "luna"}}
+{"text": "heat causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "steam"}}
+{"text": "charlie is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "kibo"}}
+{"text": "on 2025 철수 is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "robot", "time_expr": "2025"}}
+{"text": "charlie is animal", "ir_type": "ClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "animal"}}
+{"text": "luna is robot", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "robot"}}
+{"text": "철수 is robot", "ir_type": "ClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "robot"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "bob is taller than luna", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "luna"}}
+{"text": "on 2025 charlie is mammal", "ir_type": "TemporalClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "mammal", "time_expr": "2025"}}
+{"text": "kibo is bird", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "bird"}}
+{"text": "luna is taller than kibo", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "kibo"}}
+{"text": "on 2026 charlie is active", "ir_type": "TemporalClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "active", "time_expr": "2026"}}
+{"text": "luna is rover", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "rover"}}
+{"text": "영희 is rover", "ir_type": "ClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "rover"}}
+{"text": "on 2027 영희 is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "robot", "time_expr": "2027"}}
+{"text": "bob is taller than orion", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "orion"}}
+{"text": "heat causes wet ground", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "wet ground"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "on 2027 민수 is ceo", "ir_type": "TemporalClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "ceo", "time_expr": "2027"}}
+{"text": "on 2024 charlie is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "robot", "time_expr": "2024"}}
+{"text": "on 2026 kibo is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "rover", "time_expr": "2026"}}
+{"text": "orion is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "bob"}}
+{"text": "luna is mammal", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "mammal"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "luna is active", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "active"}}
+{"text": "영희 is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "영희", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "철수는 영희보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "철수", "comparator": "greater_than", "right": "영희"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "영희는 민수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "민수"}}
+{"text": "on 2027 charlie is machine", "ir_type": "TemporalClaimIR", "slots": {"subject": "charlie", "relation": "is", "object": "machine", "time_expr": "2027"}}
+{"text": "철수 is rover", "ir_type": "ClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "rover"}}
+{"text": "orion is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "orion", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "luna is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "luna", "comparator": "greater_than", "right": "alice"}}
+{"text": "on 2026 bob is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "bird", "time_expr": "2026"}}
+{"text": "on 2026 luna is robot", "ir_type": "TemporalClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "robot", "time_expr": "2026"}}
+{"text": "on 2026 kibo is active", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "active", "time_expr": "2026"}}
+{"text": "heat causes volatility", "ir_type": "CausalClaimIR", "slots": {"cause": "heat", "effect": "volatility"}}
+{"text": "bob is not active", "ir_type": "NegatedClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "active", "polarity": "negative"}}
+{"text": "press switch causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "light on"}}
+{"text": "영희는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "영희", "comparator": "greater_than", "right": "철수"}}
+{"text": "철수 is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "kibo is not robot", "ir_type": "NegatedClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "robot", "polarity": "negative"}}
+{"text": "on 2026 kibo is rover", "ir_type": "TemporalClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "rover", "time_expr": "2026"}}
+{"text": "kibo is ceo", "ir_type": "ClaimIR", "slots": {"subject": "kibo", "relation": "is", "object": "ceo"}}
+{"text": "press switch causes light on", "ir_type": "CausalClaimIR", "slots": {"cause": "press switch", "effect": "light on"}}
+{"text": "market shock causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "market shock", "effect": "steam"}}
+{"text": "bob is taller than alice", "ir_type": "ComparisonIR", "slots": {"left": "bob", "comparator": "greater_than", "right": "alice"}}
+{"text": "on 2026 alice is bird", "ir_type": "TemporalClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "bird", "time_expr": "2026"}}
+{"text": "민수 is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "민수", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}
+{"text": "charlie is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "charlie", "comparator": "greater_than", "right": "bob"}}
+{"text": "alice is not ceo", "ir_type": "NegatedClaimIR", "slots": {"subject": "alice", "relation": "is", "object": "ceo", "polarity": "negative"}}
+{"text": "orion is taller than bob", "ir_type": "ComparisonIR", "slots": {"left": "orion", "comparator": "greater_than", "right": "bob"}}
+{"text": "철수 is rover", "ir_type": "ClaimIR", "slots": {"subject": "철수", "relation": "is", "object": "rover"}}
+{"text": "luna is bird", "ir_type": "ClaimIR", "slots": {"subject": "luna", "relation": "is", "object": "bird"}}
+{"text": "bob is machine", "ir_type": "ClaimIR", "slots": {"subject": "bob", "relation": "is", "object": "machine"}}
+{"text": "kibo is taller than charlie", "ir_type": "ComparisonIR", "slots": {"left": "kibo", "comparator": "greater_than", "right": "charlie"}}
+{"text": "rain causes steam", "ir_type": "CausalClaimIR", "slots": {"cause": "rain", "effect": "steam"}}
+{"text": "민수는 철수보다 크다", "ir_type": "ComparisonIR", "slots": {"left": "민수", "comparator": "greater_than", "right": "철수"}}

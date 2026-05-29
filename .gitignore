@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+neurova.egg-info/
+neurova_state/
+neurova_test_state/
+test_db_2/

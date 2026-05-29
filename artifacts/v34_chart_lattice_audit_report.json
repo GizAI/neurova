@@ -1,0 +1,137 @@
+{
+  "before_passed": 9,
+  "after_passed": 9,
+  "total": 9,
+  "lattice_nodes": 12,
+  "lattice_edges": 11,
+  "candidate_count": 6,
+  "passed": true,
+  "details": [
+    {
+      "phase": "before",
+      "category": "wrapper_question",
+      "prompt": "Would you say Luma tharnes Naro?",
+      "ok": true,
+      "response": "yes. i can prove: luma greater_than naro\n1. luma greater_than naro because known; rule=comparison_memory; verifier=verified\n[active_memory] comparison_graph_search -> path_len=1 -> verifier=verified"
+    },
+    {
+      "phase": "before",
+      "category": "did_question",
+      "prompt": "Did Luma tharne Naro?",
+      "ok": true,
+      "response": "yes. i can prove: luma greater_than naro\n1. luma greater_than naro because known; rule=comparison_memory; verifier=verified\n[active_memory] comparison_graph_search -> path_len=1 -> verifier=verified"
+    },
+    {
+      "phase": "before",
+      "category": "passive",
+      "prompt": "Naro was tharned by Luma.",
+      "ok": true,
+      "response": "stored comparison ir: luma greater_than naro"
+    },
+    {
+      "phase": "before",
+      "category": "negation",
+      "prompt": "Luma does not tharne Naro.",
+      "ok": true,
+      "response": "stored comparison ir: luma less_than naro"
+    },
+    {
+      "phase": "before",
+      "category": "causal_question",
+      "prompt": "Does rain morp flood?",
+      "ok": true,
+      "response": "yes. i can prove: rain causes flood\n1. rain causes flood because known; rule=causal_memory; verifier=verified\n[active_memory] causal_graph_search -> path_len=1 -> verifier=verified"
+    },
+    {
+      "phase": "before",
+      "category": "causal_passive",
+      "prompt": "Flood was morped by rain.",
+      "ok": true,
+      "response": "stored causal ir: rain causes flood"
+    },
+    {
+      "phase": "before",
+      "category": "event_frame",
+      "prompt": "Eve ferried the crate from Oslo to Lima.",
+      "ok": true,
+      "response": "stored event ir: eve move crate in lima\nworld_effects=1"
+    },
+    {
+      "phase": "before",
+      "category": "world_query",
+      "prompt": "Where is crate?",
+      "ok": true,
+      "response": "yes. i can prove: crate located_at ?\n1. crate located_at lima because known; rule=current_fluent_lookup; verifier=verified\n[active_memory] retrieve_broad -> broad=1 -> zoom_in=claim_versions -> zoom_out=rules+graph -> fluent=current -> verifier=verified"
+    },
+    {
+      "phase": "before",
+      "category": "dialogue_act",
+      "prompt": "I need help",
+      "ok": true,
+      "response": "i can help. let’s make it concrete: state the goal, list the known facts, then test one small next step."
+    },
+    {
+      "phase": "after",
+      "category": "wrapper_question",
+      "prompt": "Would you say Luma tharnes Naro?",
+      "ok": true,
+      "response": "yes. i can prove: luma greater_than naro\n1. luma greater_than naro because known; rule=comparison_memory; verifier=verified\n[active_memory] comparison_graph_search -> path_len=1 -> verifier=verified"
+    },
+    {
+      "phase": "after",
+      "category": "did_question",
+      "prompt": "Did Luma tharne Naro?",
+      "ok": true,
+      "response": "yes. i can prove: luma greater_than naro\n1. luma greater_than naro because known; rule=comparison_memory; verifier=verified\n[active_memory] comparison_graph_search -> path_len=1 -> verifier=verified"
+    },
+    {
+      "phase": "after",
+      "category": "passive",
+      "prompt": "Naro was tharned by Luma.",
+      "ok": true,
+      "response": "stored comparison ir: luma greater_than naro"
+    },
+    {
+      "phase": "after",
+      "category": "negation",
+      "prompt": "Luma does not tharne Naro.",
+      "ok": true,
+      "response": "stored comparison ir: luma less_than naro"
+    },
+    {
+      "phase": "after",
+      "category": "causal_question",
+      "prompt": "Does rain morp flood?",
+      "ok": true,
+      "response": "yes. i can prove: rain causes flood\n1. rain causes flood because known; rule=causal_memory; verifier=verified\n[active_memory] causal_graph_search -> path_len=1 -> verifier=verified"
+    },
+    {
+      "phase": "after",
+      "category": "causal_passive",
+      "prompt": "Flood was morped by rain.",
+      "ok": true,
+      "response": "stored causal ir: rain causes flood"
+    },
+    {
+      "phase": "after",
+      "category": "event_frame",
+      "prompt": "Eve ferried the crate from Oslo to Lima.",
+      "ok": true,
+      "response": "stored event ir: eve move crate in lima\nworld_effects=1"
+    },
+    {
+      "phase": "after",
+      "category": "world_query",
+      "prompt": "Where is crate?",
+      "ok": true,
+      "response": "yes. i can prove: crate located_at ?\n1. crate located_at lima because known; rule=current_fluent_lookup; verifier=verified\n[active_memory] retrieve_broad -> broad=1 -> zoom_in=claim_versions -> zoom_out=rules+graph -> fluent=current -> verifier=verified"
+    },
+    {
+      "phase": "after",
+      "category": "dialogue_act",
+      "prompt": "I need help",
+      "ok": true,
+      "response": "i can help. let’s make it concrete: state the goal, list the known facts, then test one small next step."
+    }
+  ]
+}

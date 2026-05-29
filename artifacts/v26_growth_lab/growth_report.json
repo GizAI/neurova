@@ -1,0 +1,336 @@
+{
+  "before": {
+    "passed": 7,
+    "total": 18,
+    "score": 0.3888888888888889
+  },
+  "after": {
+    "passed": 18,
+    "total": 18,
+    "score": 1.0
+  },
+  "growth_delta": 0.6111111111111112,
+  "tutor_experiences": [
+    {
+      "text": "Actually, \"A sparks B\" means A causes B.",
+      "predicted_ir": "ToolCallIR",
+      "response": "Learned construction: 'A sparks B' -> CausalClaimIR",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9035106
+    },
+    {
+      "text": "No, by \"A outruns B\" I mean A is greater than B.",
+      "predicted_ir": "ToolCallIR",
+      "response": "Learned construction: 'A outruns B' -> ComparisonIR",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9146924
+    },
+    {
+      "text": "In this domain, \"A absorbs B\" means A causes B.",
+      "predicted_ir": "ToolCallIR",
+      "response": "Learned construction: 'A absorbs B' -> CausalClaimIR",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9249902
+    },
+    {
+      "text": "For our task, interpret \"A trails B\" as A less_than B.",
+      "predicted_ir": "ToolCallIR",
+      "response": "Learned construction: 'A trails B' -> ComparisonIR",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9331346
+    },
+    {
+      "text": "Correction: \"A is regarded as B\" means A is B.",
+      "predicted_ir": "ToolCallIR",
+      "response": "Learned construction: 'A is regarded as B' -> ClaimIR",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9439788
+    },
+    {
+      "text": "When I say \"A buys B from C\", it means A has B.",
+      "predicted_ir": "CompositeIR",
+      "response": "CompositeIR stored:\nStored causal IR: i say \"a buys b from c\" causes it means a has b",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.963507
+    },
+    {
+      "text": "teach: rover is robot",
+      "predicted_ir": "ClaimIR",
+      "response": "Stored claim IR: rover is robot",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9724677
+    },
+    {
+      "text": "teach: robot is machine",
+      "predicted_ir": "ClaimIR",
+      "response": "Stored claim IR: robot is machine",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9789948
+    },
+    {
+      "text": "teach: oak is plant",
+      "predicted_ir": "ClaimIR",
+      "response": "Stored claim IR: oak is plant",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9854014
+    },
+    {
+      "text": "teach: plant needs water",
+      "predicted_ir": "ResearchTaskIR",
+      "response": "No relevant sources found. I will not fabricate research results. Provide sources or enable web/source retrieval.",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.989433
+    },
+    {
+      "text": "water plant causes plant grows",
+      "predicted_ir": "CausalClaimIR",
+      "response": "Stored causal IR: water plant causes plant grows",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995688.9965324
+    },
+    {
+      "text": "all birds can fly",
+      "predicted_ir": "QuantifiedRuleIR",
+      "response": "Stored rule IR: if X is bird then X can fly",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0020573
+    },
+    {
+      "text": "penguin is bird",
+      "predicted_ir": "ClaimIR",
+      "response": "Stored claim IR: penguin is bird",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0099912
+    },
+    {
+      "text": "Penguins are birds; however, they usually do not fly.",
+      "predicted_ir": "CompositeIR",
+      "response": "CompositeIR stored:\nStored claim IR: penguin is bird\nStored exception IR: penguin blocks is|bird=>can|fly",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0211704
+    },
+    {
+      "text": "From 2025 to 2026, Alice served as principal.",
+      "predicted_ir": "TemporalClaimIR",
+      "response": "Stored temporal claim IR: alice is principal @ 2025",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0302503
+    },
+    {
+      "text": "In 2026 Bob was not principal.",
+      "predicted_ir": "TemporalClaimIR",
+      "response": "Stored temporal claim IR: bob is not principal @ 2026",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0380836
+    },
+    {
+      "text": "Mina gave Joon a pencil in Seoul yesterday.",
+      "predicted_ir": "EventIR",
+      "response": "Stored event IR: mina give pencil to joon in seoul at yesterday\nworld_effects=2",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0500774
+    },
+    {
+      "text": "Joon received a notebook from Mina yesterday.",
+      "predicted_ir": "EventIR",
+      "response": "Stored event IR: mina give notebook to joon at yesterday\nworld_effects=2",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0602727
+    },
+    {
+      "text": "Sora bought a book from Dami yesterday.",
+      "predicted_ir": "EventIR",
+      "response": "Stored event IR: sora buy book to sora at yesterday\nworld_effects=1",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0719233
+    },
+    {
+      "text": "Dami sold a ruler to Sora today.",
+      "predicted_ir": "EventIR",
+      "response": "Stored event IR: dami sell ruler to sora at today\nworld_effects=1",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.081898
+    },
+    {
+      "text": "Teacher moved the box from classroom to library.",
+      "predicted_ir": "EventIR",
+      "response": "Stored event IR: teacher move box in library\nworld_effects=2",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.0943532
+    },
+    {
+      "text": "Alice asked Bob to open the door.",
+      "predicted_ir": "SpeechActIR",
+      "response": "Stored speech act IR: alice request\nworld_effects=1",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.104284
+    },
+    {
+      "text": "Bob thinks Alice is not the CEO.",
+      "predicted_ir": "BeliefIR",
+      "response": "Stored belief IR: bob believes alice is not ceo",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.124625
+    },
+    {
+      "text": "Kibo plans to collect rocks.",
+      "predicted_ir": "GoalIR",
+      "response": "Stored goal IR: kibo wants collect rock",
+      "success": true,
+      "user_feedback": null,
+      "created_at": 1779995689.1298885
+    }
+  ],
+  "after_rows": [
+    {
+      "prompt": "Mina has 12 marbles and gets 7 more. How many marbles does Mina have?",
+      "expected": "19",
+      "observed": "Arithmetic answer: 19",
+      "passed": true,
+      "ir_type": "ToolCallIR"
+    },
+    {
+      "prompt": "Joon had 20 stickers and gave 6 to Hana. How many stickers does Joon have?",
+      "expected": "14",
+      "observed": "Arithmetic answer: 14",
+      "passed": true,
+      "ir_type": "ToolCallIR"
+    },
+    {
+      "prompt": "There are 4 boxes with 6 pencils each. How many pencils are there?",
+      "expected": "24",
+      "observed": "Arithmetic answer: 24",
+      "passed": true,
+      "ir_type": "ToolCallIR"
+    },
+    {
+      "prompt": "24 candies are shared equally among 6 children. How many candies does each child get?",
+      "expected": "4",
+      "observed": "Arithmetic answer: 4",
+      "passed": true,
+      "ir_type": "ToolCallIR"
+    },
+    {
+      "prompt": "is rover machine?",
+      "expected": "Yes",
+      "observed": "Yes. I can prove: rover is machine\n1. rover is robot because known; rule=known; verifier=verified\n2. robot is machine because rover is robot; rule=taxonomy_transitivity; verifier=verified\n[active_memory] retrieve_broad -> broad=3 -> zoom_in=claim_versions -> zoom_out=rules+graph -> verifier=verified",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "Does Joon have pencil?",
+      "expected": "Yes",
+      "observed": "Yes. I can prove: joon has pencil\n1. joon has pencil because known; rule=known; verifier=verified\n[active_memory] retrieve_broad -> broad=3 -> zoom_in=claim_versions -> zoom_out=rules+graph -> verifier=verified",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "Does Sora have book?",
+      "expected": "Yes",
+      "observed": "Yes. I can prove: sora has book\n1. sora has book because known; rule=known; verifier=verified\n[active_memory] retrieve_broad -> broad=4 -> zoom_in=claim_versions -> zoom_out=rules+graph -> verifier=verified",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "Where is the box?",
+      "expected": "library",
+      "observed": "Yes. I can prove: what is box\n1. box located_at library because known; rule=memory_lookup; verifier=verified\n[active_memory] retrieve_broad -> zoom_in=claims_about:1 -> verifier=lookup",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "Who was principal in 2026?",
+      "expected": "alice",
+      "observed": "Yes. I can prove: who is principal at 2026\n1. alice is principal @ 2025 because known; rule=temporal_validity; verifier=verified\n[active_memory] temporal_retrieve -> time=2026 -> matches=1 -> verifier=verified",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "Can a penguin fly even though it is a bird?",
+      "expected": "Blocked by exception",
+      "observed": "Blocked by exception: penguin can fly\n1. penguin can fly because exception: penguin; rule=direct_exception_block; verifier=blocked\n[active_memory] retrieve_broad -> broad=1 -> zoom_in=claim_versions -> zoom_out=rules+graph -> verifier=blocked_by_exception",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "what happens after water plant?",
+      "expected": "plant grows",
+      "observed": "Yes. I can prove: what happens after water plant\n1. water plant causes plant grows because known; rule=causal_memory; verifier=verified\n[active_memory] causal_retrieve -> direct_effects=1 -> verifier=verified",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "heat sparks expansion",
+      "expected": "Stored causal IR",
+      "observed": "Stored causal IR: heat causes expansion",
+      "passed": true,
+      "ir_type": "CausalClaimIR"
+    },
+    {
+      "prompt": "heat causes expansion?",
+      "expected": "Yes",
+      "observed": "Yes. I can prove: heat causes expansion\n1. heat causes expansion because known; rule=causal_memory; verifier=verified\n[active_memory] causal_graph_search -> path_len=1 -> verifier=verified",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "orion outruns zephyr",
+      "expected": "Stored comparison IR",
+      "observed": "Stored comparison IR: orion greater_than zephyr",
+      "passed": true,
+      "ir_type": "ComparisonIR"
+    },
+    {
+      "prompt": "is orion greater than zephyr?",
+      "expected": "Yes",
+      "observed": "Yes. I can prove: orion greater_than zephyr\n1. orion greater_than zephyr because known; rule=comparison_memory; verifier=verified\n[active_memory] comparison_graph_search -> path_len=1 -> verifier=verified",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    },
+    {
+      "prompt": "철수는 영희보다 크지 않다",
+      "expected": "Stored comparison IR",
+      "observed": "Stored comparison IR: 철수 less_than 영희",
+      "passed": true,
+      "ir_type": "ComparisonIR"
+    },
+    {
+      "prompt": "Bob thinks Alice is not CEO.",
+      "expected": "Stored belief IR",
+      "observed": "Stored belief IR: bob believes alice is not ceo",
+      "passed": true,
+      "ir_type": "BeliefIR"
+    },
+    {
+      "prompt": "Does Bob believe Alice is not CEO?",
+      "expected": "Yes",
+      "observed": "Yes. I can prove: bob believes alice is not ceo\n1. bob believes alice is not ceo because known; rule=known; verifier=verified\n[active_memory] retrieve_broad -> broad=6 -> zoom_in=claim_versions -> zoom_out=rules+graph -> verifier=verified",
+      "passed": true,
+      "ir_type": "QuestionIR"
+    }
+  ],
+  "claim": "Synthetic grade-3-style benchmark growth, not proof of human-level intelligence."
+}
