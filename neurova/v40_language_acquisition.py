@@ -63,11 +63,23 @@ def norm(s: str) -> str:
 
 
 def sent_split(text: str) -> List[str]:
-    """Split into sentences by punctuation only — NO grammar rules."""
+    """Split into sentences by punctuation, handling common abbreviations."""
     if not text: return []
     text = text.replace('\n', ' ')
-    sents = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sents if s.strip()]
+    ABV = {'mr','mrs','ms','dr','etc','inc','ltd','st','ave','dept',
+           'u.s','u.k','dprk','rok','e.g','i.e','vs','al','jr','sr',
+           'corp','co','llc','prof','gen','capt','gov','sen','rep'}
+    parts = []
+    for w in text.split():
+        parts.append(w)
+        if w[-1] in '.!?':
+            base = w.rstrip('.!?').lower()
+            if base not in ABV and not (len(base) <= 2 and base.isalpha()):
+                parts.append('|||')
+    raw = ' '.join(parts).split('|||')
+    return [s.strip().strip('|').strip() for s in raw if s.strip().strip('|').strip()]
+
+
 
 
 def tokens(text: str) -> List[str]:
@@ -596,69 +608,36 @@ class SemanticParser:
         return ' '.join(words[:4]) if words else raw
 
     def _detect_event_type(self, text_lower: str, tokens_list: List[str]) -> Tuple[str, dict]:
-        """Detect event type from signal words in text.
-        Priority: specific relational verbs > copula.
-        This simulates how children learn: specific action words are more informative than generic 'is'."""
+        """Detect event type by scanning entire sentence for specific signals."""
         info = {}
-        
-        # SPECIFIC SIGNAL WORDS (high priority) — relational verbs
-        specific_signals = {
-            'bordered': ('BORDER', 'entity', 'after_prep'),
-            'borders': ('BORDER', 'entity', 'after_prep'),
-            'border': ('BORDER', 'entity', 'after_prep'),
-            'separated': ('SEPARATE', 'entity', 'after_prep'),
-            'separates': ('SEPARATE', 'entity', 'after_prep'),
-            'separate': ('SEPARATE', 'entity', 'after_prep'),
-            'divided': ('DIVIDE', 'entity', 'after_prep'),
-            'divides': ('DIVIDE', 'entity', 'after_prep'),
-            'divide': ('DIVIDE', 'entity', 'after_prep'),
-            'located': ('LOCATION', 'entity', 'after_prep'),
-            'situated': ('LOCATION', 'entity', 'after_prep'),
-            'consisting': ('COMPOSITION', 'entity', 'after_prep'),
-            'consists': ('COMPOSITION', 'entity', 'after_prep'),
-            'comprises': ('COMPOSITION', 'entity', 'after_prep'),
-            'founded': ('CREATION', 'entity', 'after'),
-            'launched': ('ACTION', 'entity', 'after'),
-            'developed': ('ACTION', 'entity', 'after'),
+        specific_flags = {
+            'bordered': ('BORDER',), 'borders': ('BORDER',), 'border': ('BORDER',),
+            'separated': ('SEPARATE',), 'separates': ('SEPARATE',), 'separate': ('SEPARATE',),
+            'divided': ('DIVIDE',), 'divides': ('DIVIDE',), 'divide': ('DIVIDE',),
+            'located': ('LOCATION',), 'situated': ('LOCATION',),
+            'headquartered': ('LOCATION',),
+            'consisting': ('COMPOSITION',), 'consists': ('COMPOSITION',), 'comprises': ('COMPOSITION',),
+            'founded': ('CREATION',), 'launched': ('ACTION',), 'developed': ('ACTION',),
+            'called': ('CLASSIFICATION',), 'named': ('CLASSIFICATION',), 'known': ('CLASSIFICATION',),
         }
-        
+        last_sig, last_idx, last_type = None, -1, None
         for i, t in enumerate(tokens_list):
-            if t in specific_signals:
-                etype, role, position = specific_signals[t]
-                info = {'signal': t, 'signal_idx': i, 'role': role, 'position': position}
-                return etype, info
-
-        # Check for 'is/are/was/were' followed by specific participle
+            if t in specific_flags:
+                last_sig, last_idx, last_type = t, i, specific_flags[t][0]
+        if last_sig and last_type:
+            has_copula = any(t in ('is','are','was','were','am','be') for t in tokens_list[:last_idx])
+            info = {'signal': last_sig, 'signal_idx': last_idx,
+                    'role': 'entity', 'position': 'after_prep' if has_copula else 'after'}
+            return last_type, info
         for i, t in enumerate(tokens_list):
             if t in ('is', 'are', 'was', 'were', 'am', 'be'):
-                # Look ahead for a specific signal
-                for j in range(i + 1, min(i + 3, len(tokens_list))):
-                    if tokens_list[j] in specific_signals:
-                        stype, srole, sposition = specific_signals[tokens_list[j]]
-                        info = {'signal': tokens_list[j], 'signal_idx': j, 
-                                'role': srole, 'position': sposition}
-                        return stype, info
-                # Also check for 'called', 'named', 'known as', 'headquartered'
-                for j in range(i + 1, min(i + 4, len(tokens_list))):
-                    if tokens_list[j] in ('called', 'named', 'known', 'headquartered'):
-                        if tokens_list[j] == 'headquartered':
-                            info = {'signal': tokens_list[j], 'signal_idx': j, 
-                                    'role': 'entity', 'position': 'after_prep'}
-                            return 'LOCATION', info
-                        info = {'signal': tokens_list[j], 'signal_idx': j, 
-                                'role': 'entity', 'position': 'after'}
-                        return 'CLASSIFICATION', info
-                # No specific signal after copula - use as CLASSIFICATION
                 info = {'signal': t, 'signal_idx': i, 'role': 'entity', 'position': 'after'}
                 return 'CLASSIFICATION', info
-
-        # Check SIGNAL_MAP for remaining general signals
         for i, t in enumerate(tokens_list):
             if t in SIGNAL_MAP:
                 etype, role, position = SIGNAL_MAP[t]
                 info = {'signal': t, 'signal_idx': i, 'role': role, 'position': position}
                 return etype, info
-
         return 'STATEMENT', info
 
     def _extract_relations(self, text_lower: str, tokens_list: List[str],
@@ -839,9 +818,25 @@ class SemanticParser:
 
     def _extract_location_statement(self, text_lower: str, tokens_list: List[str],
                                      ef: EventFrame, sig_idx: int, sig_word: str):
-        """Extract location: 'X is located in Y'"""
-        # Location is already handled by the standard location extraction
-        pass
+        """Extract location: 'X is located/headquartered in Y'
+        Extracts classification from words between copula and location signal."""
+        copula_idx = -1
+        for i in range(sig_idx - 1, -1, -1):
+            if tokens_list[i] in ('is', 'are', 'was', 'were', 'am', 'be'):
+                copula_idx = i
+                break
+        if copula_idx >= 0 and copula_idx + 1 < sig_idx:
+            between = tokens_list[copula_idx + 1:sig_idx]
+            attr_words = [w for w in between if w not in ('a', 'an', 'the', 'also')]
+            if attr_words and not ef.attributes.get('is_a'):
+                ef.attributes['is_a'] = ' '.join(attr_words[:4])
+        for i, t in enumerate(tokens_list):
+            if t in ('in', 'at', 'near') and i > sig_idx:
+                after_loc = tokens_list[i+1:]
+                loc_words = [w for w in after_loc if w not in ('the', 'a', 'an') and len(w) > 1]
+                if loc_words:
+                    ef.location = ' '.join(loc_words[:3])
+                break
 
     def _extract_composition(self, text_lower: str, tokens_list: List[str],
                               ef: EventFrame, sig_idx: int, sig_word: str):
@@ -979,7 +974,7 @@ class SemanticParser:
                     'in', 'on', 'at', 'near', 'of', 'to', 'by', 'from', 'with',
                     'the', 'a', 'an', 'this', 'that', 'these', 'those',
                     'border', 'borders', 'bordered', 'separated', 'called',
-                    'located', 'situated', 'found', 'known', 'referred',
+                    'located', 'situated', 'found', 'known', 'referred', 'founded', 'headquartered', 'headquarter', 'founded', 'headquartered', 'headquarter',
                     'there', 'any', 'some'}
 
         # Remove question type prefix and find the main entity
@@ -1256,8 +1251,14 @@ class LanguageAcquisitionEngine:
             target = resolved
         target_norm = norm(target) if target else ""
 
-        # Get entity
+        # Get entity - try exact match first, then partial
         entity = self.model.get(target_norm)
+        if not entity and target_norm:
+            for name, ent in self.model.entities.items():
+                if target_norm in name or name in target_norm:
+                    entity = ent
+                    target_norm = name
+                    break
 
         # Route by question type
         if qtype == 'WHERE':
@@ -1304,6 +1305,11 @@ class LanguageAcquisitionEngine:
     def _answer_who(self, target: str, entity) -> str:
         if not entity or not isinstance(entity, Entity):
             return "I don't know who that is."
+        for rel_type, entries in entity.relations.items():
+            if 'founded' in rel_type.lower() or 'created' in rel_type.lower():
+                founders = [t for t,_ in entries]
+                if founders:
+                    return f"It was founded by {', '.join(founders)}."
         if 'is_a' in entity.attributes:
             return f"You are {entity.attributes['is_a']}."
         desc = self.model.describe(target)

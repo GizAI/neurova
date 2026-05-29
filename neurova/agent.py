@@ -30,6 +30,7 @@ from .internet_world import InternetWorldMemory
 from .sleep import SleepConsolidationCycle
 from .self_improvement import SelfModelManager
 from .semantic_encoder import SchemaRetrievalIndex, ContrastiveLearningBuffer
+from .v40_language_acquisition import LanguageAcquisitionEngine
 
 
 
