@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI for Neurova TTT-Qwen Engine (Qwen3.5-4B + TTT)."""
+"""CLI for Neurova TTT-Qwen Engine (Qwen3.5-4B + TTT) with streaming."""
 from __future__ import annotations
 import os, sys, readline, atexit
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -35,8 +35,17 @@ def main():
         if not inp: continue
         if inp.lower() in ("exit", "quit", ":q"): break
         try:
-            ans = engine.hear(inp)
-            print(f"[TTT-Qwen] {ans}\n")
+            low = inp.lower()
+            if low in ("status", ":status"):
+                print(f"[TTT-Qwen] {engine.brain.status()}\n")
+            elif low.startswith("correct:") or low.startswith("learn:"):
+                print(f"[TTT-Qwen] {engine.hear(inp)}\n")
+            else:
+                # Streaming chat
+                print("[TTT-Qwen] ", end="", flush=True)
+                for token in engine.brain.chat_stream(inp, session_id=engine.session_id):
+                    print(token, end="", flush=True)
+                print("\n")
         except KeyboardInterrupt:
             print("\n[Interrupted]\n")
         except Exception as exc:

@@ -512,6 +512,71 @@ class TTTChatEngine:
         session.add_message("assistant", answer)
 
         return answer
+    def chat_stream(self, text: str, session_id: str = "",
+                    temperature: float = 0.7, max_tokens: int = 1024,
+                    use_corrections: bool = True):
+        """Stream chat response token by token."""
+        text = _norm(text)
+        if not text:
+            yield "Yes?"
+            return
+        
+        sid = session_id or "default"
+        session = self.sessions.get_or_create(sid)
+        
+        if use_corrections:
+            corr = self.corrections.find(text)
+            if corr is not None:
+                yield corr
+                return
+            for c in session.corrections:
+                if _norm(c.question).lower() == text.lower():
+                    yield c.answer
+                    return
+        
+        system_parts = [
+            "You are Neurova, a helpful AI assistant powered by Qwen3.5-4B.",
+            "You provide accurate, concise answers.",
+            "If you don't know something, say so rather than guessing.",
+        ]
+        all_corrections = self.corrections.all()
+        if all_corrections:
+            corr_text = "
+".join(
+                f"Q: {c.question}
+A: {c.answer}"
+                for c in all_corrections[-10:]
+            )
+            system_parts.append(f"
+Known corrections:
+{corr_text}")
+        
+        messages = [
+            {"role": "system", "content": "
+".join(system_parts)},
+        ]
+        messages.extend(session.history[-20:])
+        messages.append({"role": "user", "content": text})
+        
+        in_reasoning = False
+        collected = ""
+        try:
+            for token, is_reasoning, finished in self.client.chat_stream(
+                    messages, max_tokens=max_tokens, temperature=temperature):
+                if is_reasoning and not in_reasoning:
+                    in_reasoning = True
+                    continue
+                if not is_reasoning and in_reasoning:
+                    in_reasoning = False
+                    continue
+                collected += token
+                yield token
+        except Exception as e:
+            yield f"[Error: {e}]"
+        
+        answer = self.client.extract_answer(collected)
+        session.add_message("user", text)
+        session.add_message("assistant", answer)
 
     def correct(self, question: str, answer: str, session_id: str = ""):
         """Learn a correction (immediate, no forgetting)."""
