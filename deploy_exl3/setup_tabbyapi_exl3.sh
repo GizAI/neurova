@@ -51,10 +51,10 @@ cat > config.yml << "CONFIG_EOF"
 model:
   model_dir: /home/user/tabby-models/models
   model_name: Qwen3.6-27B-exl3-3.08bpw
-  max_seq_len: 102400
-  cache_size: 102400
-  cache_mode: "4,4"
-  chunk_size: 1024
+  max_seq_len: 131072
+  cache_size: 131072
+  cache_mode: "3,2"
+  chunk_size: 512
   output_chunking: true
   max_batch_size: 1
 
@@ -62,7 +62,7 @@ draft_model:
   draft_model_dir: /home/user/tabby-models/models
   draft_model_name: Qwen3.6-27B-DFlash-exl3
   draft_cache_mode: "Q4"
-  draft_num_tokens: 8
+  draft_num_tokens: 6
 
 network:
   host: 0.0.0.0
