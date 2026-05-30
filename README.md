@@ -1,98 +1,132 @@
-# Neurova V40 — Developmental Neuro-Symbolic Cognitive Engine
+# Neurova V6 — Pure Embedding Memory CLI
 
-A **genuine learning system** that acquires language and reasoning through conversation — no hardcoded templates, no question-type-specific handlers.
+**Zero hardcoded language rules. Language-acquisition substrate only.**
 
-## Architecture
+```text
+Don't program grammar rules.
+Create a vessel that can learn language.
 
+The vessel =
+  Embedding-based association (embed_tokens + USearch)
+  + Memory slots (raw text, no conversion)
+  + Prediction via generation (Qwen3.5-4B)
+  + Error-driven learning (auto-store + dedup)
+  + Per-user persistent memory
 ```
-Utterance → Perception Cortex → Knowledge Graph → Universal Query → Answer
-                                ↓
-                           Learning through prediction error
-```
-
-### Key Components
-
-- **V40CleanEngine** (`neurova/architecture/v40_engine_clean.py`): Single synchronous inference engine. No threads, no global workspace — pure fact storage + universal query.
-- **SensoryPerceptionCortex** (`neurova/architecture/perception_cortex.py`): spaCy + Kiwi NLP with singleton model loading. Handles deep preposition structures ("went back to the bathroom").
-- **KnowledgeGraph**: Universal fact store with inheritance, negation tracking, location overwrite, and object possession tracking.
-- **Universal Query Interface**: Single `query()` method handles all question types — no `if/elif` chains for grow/need/fly/where/what.
-
-### Learning Architecture
-
-- All utterances become facts in the graph
-- Inheritance is derived from is-a relations (not hardcoded)
-- Negation blocks inheritance naturally
-- Location tracking uses overwrite (last update wins)
-- Object possession tracked through pick/drop/put/give verbs
-- Multi-hop reasoning: object → holder → holder's location
 
 ## Quick Start
 
 ```bash
-# Requirements
-pip install spacy usearch numpy requests
-python -m spacy download en_core_web_sm
+# Requirements (conda env recommended)
+conda create -n neurova python=3.10
+conda activate neurova
+pip install torch transformers bitsandbytes usearch numpy sentencepiece
 
-# Run CLI
-PYTHONPATH=. python -m neurova.v40_cli
+# Run
+python3 neurova_v6.py
 
-# Or via rsync to ml-dmc8 (GPU server)
-./rsync_deploy.sh
-ssh ml-dmc8 "cd ~/workspace/neurova && PYTHONPATH=. python -m neurova.v40_cli"
+# Optional: fast attention kernels (fla)
+pip install flash-linear-attention causal-conv1d
 ```
 
-## Benchmarks
+## Usage
 
-### Elementary School Science Curriculum — 8/8 (100%)
-```
-Does a sunflower grow?  → Yes, it grows!
-What does a dog need?   → It needs water.
-Does a rock grow?       → No, it cannot grow.
-Can a robin fly?        → Yes, it can fly!
-Can a penguin fly?      → No, it cannot fly.
-Does a penguin need water? → It needs water.
-Does a penguin grow?    → Yes, it grows!
-```
+```text
+> My name is Alice.
+[auto-store] → remembers "My name is Alice."
 
-### bAbI Tasks
-- **Task 1 (Single Supporting Fact):** 1000/1000 (100.0%) SOLVED
-- **Task 2 (Two Supporting Facts):** 668/1000 (66.8%)
-- *More tasks being implemented...*
+> What is my name?
+Alice — retrieved from memory via embedding similarity.
 
-### Natural Language
-```
-> I am Kyungtae.
-Got it.
-> Kyungtae is the CEO of Giz Inc.
-Got it.
-> What is Giz?
-I recall: Its be ceo of giz inc.
+> /think              → enable thinking mode (deeper reasoning)
+> /nothink            → disable thinking (faster)
+> /effort low|mid|high → set reasoning effort
+> /user bob           → switch to bob's memory space
+> /clear              → reset conversation history
+> /status             → system info (user, slots, VRAM)
+> remember: <text>    → manually store memory
 ```
 
-## bAbI Evaluation
+## Architecture
 
-```bash
-# Download bAbI data and run full 20-task evaluation
-PYTHONPATH=. python eval_babi_full.py
 ```
+User Input
+  → Tokenize
+  → Embedding (mean-pooled embed_tokens)
+  → USearch cosine similarity → top-K memory recall
+  → apply_chat_template() with enable_thinking
+  → model.generate() → stream output
+  → Auto-store raw text to memory (after response)
+```
+
+### Memory System
+- Raw user text stored **verbatim** — no conversion, no templates
+- **MemSlot**: text, source, timestamp, retrieval count
+- **USearch** index: 2560-dim cosine, per-user namespace
+- **Dedup**: near-exact (dist < 0.10) skip / same-topic (dist < 0.45) update
+- **Isolation**: `~/.neurova_v6/users/<name>/` per user
+
+## What's Hardcoded (Cognitive Priors Only)
+
+```text
+Entity embedding exists        → embed_tokens layer
+Similar things are similar     → cosine similarity
+Memory persists                → JSON + USearch on disk
+Different users separate       → filesystem namespaces
+```
+
+## What's NOT Hardcoded (All Removed)
+
+```text
+Language-specific patterns     ❌
+1st→3rd person conversion      ❌
+Topic keyword lists             ❌
+Similarity thresholds           ❌
+Question-type handlers          ❌
+Grammar rules                   ❌
+Signal maps                     ❌
+Template extractors             ❌
+```
+
+## Performance (RTX 4080 16GB, Qwen3.5-4B)
+
+| Metric | Value |
+|--------|-------|
+| Prefill | 5,767 tok/s |
+| Generation | 32-33 tok/s |
+| TTFT (warm) | 54-80ms |
+| VRAM | 7.8GB (bf16) |
+| Max context | 16,384 tokens |
+
+## Files
+
+| File | Purpose | Lines |
+|------|---------|-------|
+| `neurova_v6.py` | Main engine | 331 |
+| `neurova.sh` | Launcher | 9 |
+| `ARCHITECTURE_v6.md` | Architecture docs | — |
+| `deploy_v6.sh` | ml-dmc8 deploy | 51 |
 
 ## Deployment
 
 ```bash
-# Local
-PYTHONPATH=. python -m neurova.v40_cli
+# To ml-dmc8
+bash deploy_v6.sh
 
-# Remote (ml-dmc8 GPU server)
-./rsync_deploy.sh
+# Or manual
+ssh ml-dmc8
+cd /home/user/workspace/neurova
+conda activate neurova_vsa
+python3 neurova_v6.py
 ```
 
-## Dependencies
+## Design Principles
 
-- Python 3.10+
-- spaCy + en_core_web_sm (NLP parsing)
-- kiwipiepy (Korean NLP, optional)
-- usearch (vector search, optional)
-- numpy
+1. **No TTT** — embedding memory is faster and equally effective for personal info
+2. **No separate embedding model** — uses model's own `embed_tokens`
+3. **No background threads** — memory store after response (user sees no delay)
+4. **Raw text storage** — no conversion, model handles attribution
+5. **Per-user directories** — complete memory isolation
 
 ## License
 

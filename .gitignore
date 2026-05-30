@@ -1,4 +1,3 @@
-.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -7,6 +6,7 @@ __pycache__/
 neurova.egg-info/
 neurova_state/
 neurova_test_state/
-test_db_2/
-.neurova_ttt_*.json
 data/
+.neurova_ttt_*.json
+.neurova_v6/
+.neurova_v6_backups/
