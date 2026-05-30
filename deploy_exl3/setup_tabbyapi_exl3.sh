@@ -51,9 +51,9 @@ cat > config.yml << "CONFIG_EOF"
 model:
   model_dir: /home/user/tabby-models/models
   model_name: Qwen3.6-27B-exl3-3.08bpw
-  max_seq_len: 131072
-  cache_size: 131072
-  cache_mode: "3,2"
+  max_seq_len: 147456
+  cache_size: 147456
+  cache_mode: "2,2"
   chunk_size: 512
   output_chunking: true
   max_batch_size: 1

@@ -6,7 +6,7 @@
 - **Target Model**: `UnstableLlama/Qwen3.6-27B-exl3-3.08bpw` (약 13GB)
 - **Draft Model (초안 가속)**: `turboderp/Qwen3.6-27B-DFlash-exl3` (브랜치: `3.00bpw`)
 - **Backend**: ExLlamaV3 (Pre-built wheel) + TabbyAPI (Source)
-- **Context Limit**: `131072` 토큰 (16GB VRAM 한계상 DFlash 사용 시 128K가 안정적. DFlash 미사용 시 128K 가능)
+- **Context Limit**: `147456` 토큰 (16GB VRAM 한계상 DFlash 사용 시 144K가 안정적. DFlash 미사용 시 144K 가능)
 - **KV Cache**: `4,4` 비트 양자화 (메모리 절약)
 - **출력 속도**: 약 **79.2 tokens/sec** (DFlash 투기적 디코딩 적용 시 2배 가속)
 
