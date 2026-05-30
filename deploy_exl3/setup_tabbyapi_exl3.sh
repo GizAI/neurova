@@ -54,7 +54,7 @@ model:
   max_seq_len: 147456
   cache_size: 147456
   cache_mode: "3,2"
-  chunk_size: 512
+  chunk_size: 256
   output_chunking: true
   max_batch_size: 1
 
