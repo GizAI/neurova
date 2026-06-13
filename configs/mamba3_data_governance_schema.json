@@ -1,0 +1,41 @@
+{
+  "name": "mamba3-data-governance-v1",
+  "required_fields": [
+    "text",
+    "source",
+    "license",
+    "language",
+    "domain",
+    "quality_score",
+    "toxicity_score",
+    "pii_score",
+    "dedup_hash",
+    "benchmark_contamination_flag",
+    "teacher_model",
+    "generation_date"
+  ],
+  "field_contract": {
+    "text": "raw sample text, not templated unless it is an instruction dataset",
+    "source": "dataset or crawl source identifier",
+    "license": "license or terms tag; unknown is not allowed for training",
+    "language": "ISO language code; English-first path expects en",
+    "domain": "web|edu|code|math|science|books|wiki|qa|instruction|preference|safety|tool|other",
+    "quality_score": "float 0..1 or integer bucket normalized upstream",
+    "toxicity_score": "float 0..1; lower is better",
+    "pii_score": "float 0..1; lower is better",
+    "dedup_hash": "stable exact or fuzzy dedup hash",
+    "benchmark_contamination_flag": "boolean; true samples are blocked from train",
+    "teacher_model": "none for human/raw data, otherwise exact generator or judge model id",
+    "generation_date": "ISO-8601 date or null for raw historical data"
+  },
+  "hard_blocks": {
+    "license": ["unknown", "forbidden", "noncommercial_blocked"],
+    "benchmark_contamination_flag": [true],
+    "toxicity_score_greater_than": 0.8,
+    "pii_score_greater_than": 0.2
+  },
+  "notes": [
+    "The architecture remains pure Mamba-3; teacher_model is data provenance, not a model architecture dependency.",
+    "Any synthetic, preference, or Magpie-style sample must keep teacher_model and generation_date."
+  ]
+}

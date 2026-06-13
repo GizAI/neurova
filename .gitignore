@@ -10,3 +10,10 @@ data/
 .neurova_ttt_*.json
 .neurova_v6/
 .neurova_v6_backups/
+.env
+runs/
+mamba/
+mamba.c/
+papers/
+tokenizers/
+kor-racing-predictor/

@@ -1,0 +1,60 @@
+{
+  "name": "mamba3-english-mimo-r4-no-teacher",
+  "tokenizer": "llama31",
+  "architecture_order": [
+    "mimo-r4-tiny",
+    "mimo-r4-paper-180m",
+    "mimo-r4-440m",
+    "mimo-r4-880m",
+    "mimo-r4-1.5b"
+  ],
+  "paper_matched_mimo_r4": {
+    "tokenizer": "Llama-3.1",
+    "d_state": 128,
+    "headdim": 64,
+    "chunk_size": 16,
+    "mlp_dims": {
+      "180m": 1264,
+      "440m": 1792,
+      "880m": 2800,
+      "1.5b": 3824
+    },
+    "notes": [
+      "Tiny RTX 4080 kernel-validation presets may reduce d_state/headdim.",
+      "Do not use tiny bootstrap quality as evidence for paper-scale language ability."
+    ]
+  },
+  "pretraining_tokens": {
+    "minimum_target": 100000000000,
+    "preferred_target": 300000000000,
+    "stretch_target": 1000000000000
+  },
+  "data_mix": {
+    "english_education_web": 0.35,
+    "code_and_docs": 0.20,
+    "math_science": 0.15,
+    "long_document_qa": 0.15,
+    "reasoning_with_verifiable_answers": 0.10,
+    "style_and_instruction_format": 0.05
+  },
+  "long_state_curriculum": [
+    {"context": 2048, "task": "base language modeling"},
+    {"context": 8192, "task": "state passing and near-context recall"},
+    {"context": 32768, "task": "distractor robust document QA"},
+    {"context": 131072, "task": "checkpointed recurrent state replay"}
+  ],
+  "post_training": {
+    "sft_role": "format, refusal boundaries, tool output stability",
+    "rlvr_only": true,
+    "allowed_verifiers": ["exact", "casefold_exact", "contains_all", "python_assert", "unit_test", "span_citation"],
+    "forbidden": ["external_llm_teacher", "external_llm_judge", "unverified_self_generation"]
+  },
+  "forbidden_architecture_changes": [
+    "siso_only_target",
+    "remove_data_dependent_rope_or_complex_state",
+    "remove_bc_bias",
+    "remove_bc_qk_norm",
+    "add_short_conv_back",
+    "claim_long_context_from_2k_only_training"
+  ]
+}
