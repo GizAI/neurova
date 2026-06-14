@@ -134,7 +134,7 @@ if [[ "${1:-}" == "saneflow" ]]; then
       remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python scripts/saneflow_eval_prompts.py --ckpt \"\$CKPT\" --out runs/saneflow_latest_prompt_eval.json --max-new 80 --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE")"
       ;;
     status)
-      remote_exec "pgrep -af 'saneflow_train.py|saneflow_pipeline_dmc8.sh|saneflow_after_base_dmc8.sh|saneflow_standard_sft_after_base_dmc8.sh|saneflow_autoresearch_loop.sh' || true; python scripts/saneflow_researchctl_dmc8.sh status 2>/dev/null || true"
+      remote_exec "pgrep -af 'saneflow_train.py|saneflow_autoresearch_loop.sh' || true; python scripts/saneflow_researchctl_dmc8.sh status 2>/dev/null || true"
       ;;
     train)
       remote_exec "chmod +x scripts/saneflow_researchctl_dmc8.sh scripts/saneflow_autoresearch_loop.sh; scripts/saneflow_researchctl_dmc8.sh start-auto"

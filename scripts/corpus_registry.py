@@ -48,7 +48,7 @@ def classify(path: Path) -> tuple[str, str]:
     if "no_cheat" in name or "mcq" in name or "rlvr" in name:
         return "verifiable_later", "verified_skill"
     if "tinystories" in full or "stage_b_prose_mix" in full:
-        return "preserved", "preserved"
+        return "legacy_sources", "legacy_speak_bootstrap"
     if path.suffix in {".jsonl", ".txt"}:
         return "legacy_sources", "raw_text"
     return "manifests", "metadata"

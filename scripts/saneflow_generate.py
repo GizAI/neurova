@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
-    payload = torch.load(Path(args.ckpt), map_location=args.device, weights_only=True)
+    payload = torch.load(Path(args.ckpt), map_location="cpu", weights_only=True)
     cfg = SaneFlowConfig(**payload["config"])
     tokenizer = SaneFlowBPETokenizer(cfg.tokenizer_path)
     im_end_id = tokenizer.token_to_id(IM_END)
@@ -55,7 +55,7 @@ def main() -> None:
         ids = [tokenizer.bos_token_id]
     generated: list[int] = []
     start = time.perf_counter()
-    with torch.no_grad():
+    with torch.inference_mode():
         cache = None
         if args.decode == "cache":
             prompt = torch.tensor([ids[-args.context :]], dtype=torch.long, device=args.device)

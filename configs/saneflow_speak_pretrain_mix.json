@@ -11,34 +11,28 @@
   "max_chars": 2400,
   "sources": [
     {
-      "name": "tinystories",
-      "path": "data/corpus/preserved/preserved/data__saneflow__tinystories__train.jsonl",
-      "ratio": 0.35,
-      "role": "coherent_short_story_language"
-    },
-    {
-      "name": "stage_b_prose",
-      "path": "data/corpus/preserved/preserved/data__saneflow__stage_b_prose_mix_v1__train.jsonl",
-      "ratio": 0.20,
-      "role": "short_prose_and_explanations"
-    },
-    {
       "name": "fineweb_edu",
       "path": "data/corpus/sources/fineweb_edu_sample10bt/train.jsonl",
-      "ratio": 0.20,
+      "ratio": 0.45,
       "role": "general_educational_web"
     },
     {
       "name": "dclm_baseline",
       "path": "data/corpus/sources/dclm_baseline_v1/train.jsonl",
-      "ratio": 0.15,
+      "ratio": 0.30,
       "role": "filtered_web_language"
     },
     {
       "name": "no_cheat_knowledge",
       "path": "data/corpus/verifiable_later/verified_skill/data__splits__no_cheat_knowledge_v1_train.jsonl",
-      "ratio": 0.10,
+      "ratio": 0.15,
       "role": "clean_knowledge_continuation"
+    },
+    {
+      "name": "cosmopedia",
+      "path": "data/corpus/sources/cosmopedia_v1/train.jsonl",
+      "ratio": 0.10,
+      "role": "textbook_style_explanations"
     }
   ],
   "synthetic_textbook": {

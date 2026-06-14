@@ -3,6 +3,13 @@
   "train_out": "data/corpus/mixes/saneflow_practical_pretrain_v1/train.jsonl",
   "valid_out": "data/corpus/mixes/saneflow_practical_pretrain_v1/valid.jsonl",
   "manifest_out": "data/corpus/mixes/saneflow_practical_pretrain_v1/manifest.json",
+  "ratio_override": "data/corpus/mixes/saneflow_practical_pretrain_v1/doremi_ratios.json",
+  "quality_filter": {
+    "min_quality_score": 0.55,
+    "max_pii_score": 0.20,
+    "dedup": "normalized_text_sha256",
+    "policy": "education/document-quality heuristic plus upstream score when present"
+  },
   "train_records": 120000,
   "valid_records": 3000,
   "sources": [

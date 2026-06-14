@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import os
+import types
 from typing import Any
 
 import torch
@@ -9,14 +11,40 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
+_USE_LIGER_KERNELS = os.environ.get("SANEFLOW_USE_LIGER_KERNELS", "").strip().lower() in {"1", "true", "yes", "on"}
+_LIGER_RMS_NORM_FUNCTION = None
+_LIGER_SILU_MUL_FUNCTION = None
+if _USE_LIGER_KERNELS:
+    try:
+        if not hasattr(torch.distributed, "tensor"):
+            try:
+                import torch.distributed.tensor as dist_tensor
+
+                torch.distributed.tensor = dist_tensor
+            except Exception:
+                torch.distributed.tensor = types.SimpleNamespace(DTensor=type("DTensor", (), {}))
+        from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+        from liger_kernel.transformers.swiglu import LigerSiLUMulFunction
+
+        _LIGER_RMS_NORM_FUNCTION = LigerRMSNormFunction
+        _LIGER_SILU_MUL_FUNCTION = LigerSiLUMulFunction
+    except Exception:
+        _LIGER_RMS_NORM_FUNCTION = None
+        _LIGER_SILU_MUL_FUNCTION = None
+
+
 @dataclass
 class SaneFlowConfig:
     vocab_size: int
+    model_type: str = "saneflow"
     d_embed: int = 0
     d_model: int = 384
     n_layer: int = 8
     n_heads: int = 6
+    n_kv_heads: int = 0
     d_ff: int = 1024
+    rope_theta: float = 10000.0
+    qk_norm: bool = False
     conv_kernel: int = 5
     syntax_mix_version: str = "v1"
     syntax_kernels: tuple[int, ...] = (3, 7, 15)
@@ -33,7 +61,7 @@ class SaneFlowConfig:
     landmark_chunk: int = 64
     landmark_max: int = 64
     tokenizer_backend: str = "saneflow_bpe"
-    tokenizer_path: str = "tokenizers/saneflow_tinystories_16k"
+    tokenizer_path: str = "tokenizers/saneflow_fineweb_edu_16k"
     tokenizer_sha256: str = ""
 
     def to_dict(self) -> dict:
@@ -47,6 +75,8 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _LIGER_RMS_NORM_FUNCTION is not None and x.is_cuda:
+            return _LIGER_RMS_NORM_FUNCTION.apply(x, self.weight, self.eps, 0.0, "llama", False, None)
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
 
 
@@ -336,6 +366,21 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, gate = self.w1(x).chunk(2, dim=-1)
+        if _LIGER_SILU_MUL_FUNCTION is not None and x.is_cuda:
+            return self.w2(_LIGER_SILU_MUL_FUNCTION.apply(gate, x))
+        return self.w2(F.silu(gate) * x)
+
+
+class BiasFreeSwiGLU(nn.Module):
+    def __init__(self, dim: int, hidden: int) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(dim, hidden * 2, bias=False)
+        self.w2 = nn.Linear(hidden, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, gate = self.w1(x).chunk(2, dim=-1)
+        if _LIGER_SILU_MUL_FUNCTION is not None and x.is_cuda:
+            return self.w2(_LIGER_SILU_MUL_FUNCTION.apply(gate, x))
         return self.w2(F.silu(gate) * x)
 
 
@@ -429,6 +474,120 @@ class SparseAttentionIsland(nn.Module):
         probs = F.softmax(scores, dim=-1)
         y = torch.einsum("bht,bthd->bhd", probs, values).reshape(x.shape[0], self.dim)
         return self.out(y), {"k": k_cache, "v": v_cache, "len": cache["len"] + 1}
+
+
+def _repeat_kv(x: torch.Tensor, repeats: int) -> torch.Tensor:
+    if repeats == 1:
+        return x
+    batch, heads, length, head_dim = x.shape
+    return x[:, :, None, :, :].expand(batch, heads, repeats, length, head_dim).reshape(
+        batch, heads * repeats, length, head_dim
+    )
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.head_dim = int(head_dim)
+        if self.head_dim % 2 != 0:
+            inv_freq = torch.empty(0)
+        else:
+            inv_freq = 1.0 / (float(theta) ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if self.inv_freq.numel() == 0:
+            return x
+        freqs = torch.outer(positions.to(dtype=self.inv_freq.dtype), self.inv_freq).to(device=x.device)
+        sin = freqs.sin().to(dtype=x.dtype).view(1, 1, positions.numel(), self.head_dim // 2)
+        cos = freqs.cos().to(dtype=x.dtype).view(1, 1, positions.numel(), self.head_dim // 2)
+        pairs = x.view(*x.shape[:-1], self.head_dim // 2, 2)
+        x0 = pairs[..., 0]
+        x1 = pairs[..., 1]
+        return torch.stack((x0 * cos - x1 * sin, x0 * sin + x1 * cos), dim=-1).flatten(-2)
+
+
+class DenseGQAAttention(nn.Module):
+    def __init__(self, cfg: SaneFlowConfig) -> None:
+        super().__init__()
+        if cfg.d_model % cfg.n_heads != 0:
+            raise ValueError(f"d_model={cfg.d_model} must be divisible by n_heads={cfg.n_heads}")
+        kv_heads = cfg.n_kv_heads or cfg.n_heads
+        if cfg.n_heads % kv_heads != 0:
+            raise ValueError(f"n_heads={cfg.n_heads} must be divisible by n_kv_heads={kv_heads}")
+        self.dim = cfg.d_model
+        self.n_heads = cfg.n_heads
+        self.n_kv_heads = kv_heads
+        self.head_dim = cfg.d_model // cfg.n_heads
+        self.q_proj = nn.Linear(cfg.d_model, cfg.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(cfg.d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.d_model, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.q_norm = RMSNorm(self.head_dim) if cfg.qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(self.head_dim) if cfg.qk_norm else nn.Identity()
+        self.rope = RotaryEmbedding(self.head_dim, cfg.rope_theta)
+
+    def _project(self, x: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, length, _ = x.shape
+        q = self.q_proj(x).view(batch, length, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch, length, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch, length, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = self.rope(q, positions)
+        k = self.rope(k, positions)
+        return q, k, v
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, length, _ = x.shape
+        positions = torch.arange(length, device=x.device)
+        q, k, v = self._project(x, positions)
+        repeats = self.n_heads // self.n_kv_heads
+        k = _repeat_kv(k, repeats)
+        v = _repeat_kv(v, repeats)
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=True,
+        )
+        return self.o_proj(y.transpose(1, 2).contiguous().view(batch, length, self.dim))
+
+    def init_cache(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+        max_cache_len = 8192
+        return {
+            "k": torch.empty(batch_size, self.n_kv_heads, max_cache_len, self.head_dim, device=device, dtype=dtype),
+            "v": torch.empty(batch_size, self.n_kv_heads, max_cache_len, self.head_dim, device=device, dtype=dtype),
+            "len": torch.zeros((), device=device, dtype=torch.long),
+            "positions": torch.arange(max_cache_len, device=device),
+        }
+
+    def step(self, x: torch.Tensor, cache: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        batch = x.shape[0]
+        length = int(cache["len"].item())
+        if length >= cache["k"].shape[2]:
+            grow_by = max(1024, cache["k"].shape[2])
+            k_cache = torch.empty(batch, self.n_kv_heads, cache["k"].shape[2] + grow_by, self.head_dim, device=x.device, dtype=cache["k"].dtype)
+            v_cache = torch.empty_like(k_cache)
+            k_cache[:, :, :length].copy_(cache["k"][:, :, :length])
+            v_cache[:, :, :length].copy_(cache["v"][:, :, :length])
+            cache = {"k": k_cache, "v": v_cache, "len": cache["len"], "positions": torch.arange(k_cache.shape[2], device=x.device)}
+        positions = cache["positions"][length : length + 1]
+        q, k, v = self._project(x[:, None, :], positions)
+        cache["k"][:, :, length : length + 1].copy_(k)
+        cache["v"][:, :, length : length + 1].copy_(v)
+        next_len = length + 1
+        repeats = self.n_heads // self.n_kv_heads
+        y = F.scaled_dot_product_attention(
+            q,
+            _repeat_kv(cache["k"][:, :, :next_len], repeats),
+            _repeat_kv(cache["v"][:, :, :next_len], repeats),
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        cache["len"].add_(1)
+        return self.o_proj(y.transpose(1, 2).contiguous().view(batch, self.dim)), cache
 
 
 class ThoughtSlotMixer(nn.Module):
@@ -716,7 +875,7 @@ class SaneFlowBlock(nn.Module):
         }
 
 
-class SaneFlowLM(nn.Module):
+class SaneFlowRecurrentLM(nn.Module):
     def __init__(self, cfg: SaneFlowConfig) -> None:
         super().__init__()
         self.cfg = cfg
@@ -784,3 +943,96 @@ class SaneFlowLM(nn.Module):
             x, next_cache = block.step(x, block_cache)
             new_cache.append(next_cache)
         return self.lm_head(self.head_proj(self.norm(x))), new_cache
+
+
+class DenseTransformerBlock(nn.Module):
+    def __init__(self, cfg: SaneFlowConfig) -> None:
+        super().__init__()
+        self.norm_attn = RMSNorm(cfg.d_model)
+        self.attn = DenseGQAAttention(cfg)
+        self.norm_ff = RMSNorm(cfg.d_model)
+        self.ff = BiasFreeSwiGLU(cfg.d_model, cfg.d_ff)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop(self.attn(self.norm_attn(x)))
+        x = x + self.drop(self.ff(self.norm_ff(x)))
+        return x
+
+    def init_cache(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+        return self.attn.init_cache(batch_size, device=device, dtype=dtype)
+
+    def step(self, x: torch.Tensor, cache: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        attn, cache = self.attn.step(self.norm_attn(x), cache)
+        x = x + attn
+        x = x + self.ff(self.norm_ff(x))
+        return x, cache
+
+
+class DenseTransformerLM(nn.Module):
+    def __init__(self, cfg: SaneFlowConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.d_embed = cfg.d_embed if cfg.d_embed and cfg.d_embed > 0 else cfg.d_model
+        self.embed = nn.Embedding(cfg.vocab_size, self.d_embed)
+        self.embed_proj = nn.Identity() if self.d_embed == cfg.d_model else nn.Linear(self.d_embed, cfg.d_model, bias=False)
+        self.blocks = nn.ModuleList([DenseTransformerBlock(cfg) for _ in range(cfg.n_layer)])
+        self.norm = RMSNorm(cfg.d_model)
+        self.head_proj = nn.Identity() if self.d_embed == cfg.d_model else nn.Linear(cfg.d_model, self.d_embed, bias=False)
+        self.lm_head = nn.Linear(self.d_embed, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight
+        self.apply(SaneFlowRecurrentLM._init_weights)
+
+    def forward_hidden(self, input_ids: torch.Tensor, *, activation_checkpointing: bool = False) -> torch.Tensor:
+        x = self.embed_proj(self.embed(input_ids))
+        for block in self.blocks:
+            if activation_checkpointing and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+        return x
+
+    def logits_from_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(self.head_proj(self.norm(hidden)))
+
+    def forward(self, input_ids: torch.Tensor, *, activation_checkpointing: bool = False) -> torch.Tensor:
+        return self.logits_from_hidden(self.forward_hidden(input_ids, activation_checkpointing=activation_checkpointing))
+
+    def init_cache(self, batch_size: int, *, device: torch.device | None = None, dtype: torch.dtype | None = None) -> list[dict[str, torch.Tensor]]:
+        param = next(self.parameters())
+        device = device or param.device
+        dtype = dtype or param.dtype
+        return [block.init_cache(batch_size, device=device, dtype=dtype) for block in self.blocks]
+
+    def forward_step(
+        self,
+        input_ids: torch.Tensor,
+        cache: list[dict[str, torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor]]]:
+        if input_ids.ndim == 2:
+            if input_ids.shape[1] != 1:
+                logits = None
+                for t in range(input_ids.shape[1]):
+                    logits, cache = self.forward_step(input_ids[:, t], cache)
+                assert logits is not None
+                return logits, cache
+            input_ids = input_ids[:, 0]
+        if cache is None:
+            cache = self.init_cache(input_ids.shape[0], device=input_ids.device, dtype=self.embed.weight.dtype)
+        x = self.embed_proj(self.embed(input_ids))
+        new_cache = []
+        for block, block_cache in zip(self.blocks, cache):
+            x, next_cache = block.step(x, block_cache)
+            new_cache.append(next_cache)
+        return self.logits_from_hidden(x), new_cache
+
+
+class SaneFlowLM(nn.Module):
+    def __new__(cls, cfg: SaneFlowConfig):
+        if cls is SaneFlowLM:
+            if cfg.model_type == "dense_transformer":
+                return DenseTransformerLM(cfg)
+            if cfg.model_type == "saneflow":
+                return SaneFlowRecurrentLM(cfg)
+            raise ValueError(f"unknown model_type={cfg.model_type!r}")
+        return super().__new__(cls)

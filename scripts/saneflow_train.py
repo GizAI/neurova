@@ -116,6 +116,99 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
+class GaLoreAdamW(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        weight_decay: float = 0.0,
+        rank: int = 128,
+        update_proj_gap: int = 200,
+        scale: float = 0.25,
+        betas: tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
+    ) -> None:
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            rank=rank,
+            update_proj_gap=update_proj_gap,
+            scale=scale,
+            betas=betas,
+            eps=eps,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def _project(self, grad: torch.Tensor, state: dict, rank: int, update_gap: int, step: int) -> tuple[torch.Tensor, str]:
+        if grad.ndim != 2 or min(grad.shape) <= rank:
+            return grad, "full"
+        if "side" not in state or step % update_gap == 1:
+            g = grad.float()
+            try:
+                if g.shape[0] >= g.shape[1]:
+                    u, _, _ = torch.linalg.svd(g, full_matrices=False)
+                    state["proj"] = u[:, :rank].to(dtype=grad.dtype, device=grad.device).contiguous()
+                    state["side"] = "left"
+                else:
+                    _, _, vh = torch.linalg.svd(g, full_matrices=False)
+                    state["proj"] = vh[:rank, :].to(dtype=grad.dtype, device=grad.device).contiguous()
+                    state["side"] = "right"
+            except RuntimeError:
+                return grad, "full"
+        proj = state["proj"]
+        if state["side"] == "left":
+            return proj.T @ grad, "left"
+        return grad @ proj.T, "right"
+
+    @torch.no_grad()
+    def _deproject(self, update: torch.Tensor, state: dict, side: str) -> torch.Tensor:
+        if side == "left":
+            return state["proj"] @ update
+        if side == "right":
+            return update @ state["proj"]
+        return update
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            rank = int(group["rank"])
+            update_gap = int(group["update_proj_gap"])
+            scale = float(group["scale"])
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if wd:
+                    p.mul_(1.0 - lr * wd)
+                grad = p.grad
+                state = self.state[p]
+                if not state:
+                    state["step"] = 0
+                state["step"] += 1
+                step = int(state["step"])
+                grad_proj, side = self._project(grad, state, rank, update_gap, step)
+                if "m" not in state or state["m"].shape != grad_proj.shape:
+                    state["m"] = torch.zeros_like(grad_proj)
+                    state["v"] = torch.zeros_like(grad_proj)
+                m = state["m"]
+                v = state["v"]
+                m.lerp_(grad_proj, 1.0 - beta1)
+                v.mul_(beta2).addcmul_(grad_proj, grad_proj, value=1.0 - beta2)
+                m_hat = m / (1.0 - beta1**step)
+                v_hat = v / (1.0 - beta2**step)
+                update = m_hat / (v_hat.sqrt().add_(eps))
+                p.add_(self._deproject(update, state, side), alpha=-lr * scale)
+        return loss
+
+
 class CombinedOptim:
     def __init__(self, optimizers) -> None:
         self.optimizers = [o for o in optimizers if o is not None]
@@ -129,29 +222,49 @@ class CombinedOptim:
         for opt in self.optimizers:
             opt.step()
 
+    def state_dict(self) -> dict:
+        return {
+            "optimizers": [opt.state_dict() for opt in self.optimizers],
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        states = state_dict.get("optimizers", [])
+        if len(states) != len(self.optimizers):
+            raise ValueError(f"optimizer count mismatch: {len(states)} != {len(self.optimizers)}")
+        for opt, state in zip(self.optimizers, states, strict=True):
+            opt.load_state_dict(state)
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train SaneFlowLM from scratch.")
     p.add_argument("--out", default="runs/saneflow_smoke")
     p.add_argument("--train-data", nargs="+", required=True)
     p.add_argument("--valid-data", nargs="*", default=[])
-    p.add_argument("--tokenizer-path", default="tokenizers/saneflow_tinystories_16k")
+    p.add_argument("--tokenizer-path", default="tokenizers/saneflow_fineweb_edu_16k")
     p.add_argument("--init-from", default="", help="Optional checkpoint to continue/fine-tune from.")
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--eval-batch-size", type=int, default=0, help="Validation micro-batch size. Defaults to --batch-size.")
     p.add_argument("--seq-len", type=int, default=256)
+    p.add_argument("--model-type", choices=["saneflow", "dense_transformer"], default="saneflow")
     p.add_argument("--d-embed", type=int, default=0)
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--layers", type=int, default=8)
     p.add_argument("--heads", type=int, default=6)
+    p.add_argument("--kv-heads", type=int, default=0)
     p.add_argument("--d-ff", type=int, default=1024)
+    p.add_argument("--rope-theta", type=float, default=10000.0)
+    p.add_argument("--qk-norm", action="store_true")
     p.add_argument("--conv-kernel", type=int, default=5)
     p.add_argument("--syntax-mix-version", choices=["v1", "v2"], default="v1")
     p.add_argument("--syntax-kernels", default="3,7,15")
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--optimizer", choices=["adamw", "ademamix", "muon"], default="adamw")
+    p.add_argument("--optimizer", choices=["adamw", "ademamix", "muon", "galore_adamw"], default="adamw")
     p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--muon-momentum", type=float, default=0.95)
+    p.add_argument("--galore-rank", type=int, default=128)
+    p.add_argument("--galore-update-proj-gap", type=int, default=200)
+    p.add_argument("--galore-scale", type=float, default=0.25)
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=0.1)
@@ -161,6 +274,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss-mode", choices=["causal", "chatml_assistant"], default="causal")
     p.add_argument("--max-records", type=int, default=0)
     p.add_argument("--save-every", type=int, default=250)
+    p.add_argument("--no-save-optimizer", action="store_true", help="Write weight-only checkpoints. Default saves optimizer state for exact resume.")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=["fp32", "bf16", "fp16"], default="bf16" if torch.cuda.is_available() else "fp32")
@@ -182,6 +296,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--activation-checkpointing", action="store_true")
     p.add_argument("--tf32", action="store_true")
     p.add_argument("--fused-adamw", action="store_true")
+    p.add_argument("--liger-fused-linear-ce", action="store_true")
     return p.parse_args()
 
 
@@ -198,6 +313,7 @@ def eval_loss(
     device: torch.device,
     loss_chunk_tokens: int,
     loss_mode: str,
+    liger_fused_linear_ce: object | None = None,
 ) -> float:
     model.eval()
     losses = []
@@ -208,7 +324,7 @@ def eval_loss(
         else:
             x, y, mask = data.batch_with_mask(batch_size, device)
         hidden = model.forward_hidden(x, activation_checkpointing=False)
-        losses.append(lm_loss(model, hidden, y, cfg.vocab_size, loss_chunk_tokens, mask).item())
+        losses.append(lm_loss(model, hidden, y, cfg.vocab_size, loss_chunk_tokens, mask, liger_fused_linear_ce).item())
     model.train()
     return sum(losses) / len(losses)
 
@@ -220,7 +336,20 @@ def lm_loss(
     vocab_size: int,
     chunk_tokens: int,
     target_mask: torch.Tensor | None = None,
+    liger_fused_linear_ce: object | None = None,
 ) -> torch.Tensor:
+    def linear_ce(flat_hidden: torch.Tensor, flat_targets: torch.Tensor, *, reduction: str) -> torch.Tensor:
+        if liger_fused_linear_ce is None:
+            logits = model.logits_from_hidden(flat_hidden)
+            return F.cross_entropy(logits.reshape(-1, vocab_size), flat_targets, reduction=reduction)
+        projected = model.head_proj(model.norm(flat_hidden))
+        old_reduction = liger_fused_linear_ce.reduction
+        liger_fused_linear_ce.reduction = reduction
+        try:
+            return liger_fused_linear_ce(model.lm_head.weight, projected, flat_targets)
+        finally:
+            liger_fused_linear_ce.reduction = old_reduction
+
     if target_mask is not None:
         flat_mask = target_mask.reshape(-1)
         selected = torch.nonzero(flat_mask, as_tuple=False).flatten()
@@ -230,26 +359,22 @@ def lm_loss(
         flat_targets = targets.reshape(-1).index_select(0, selected)
         token_count = flat_targets.numel()
         if chunk_tokens <= 0 or token_count <= chunk_tokens:
-            logits = model.logits_from_hidden(flat_hidden)
-            return F.cross_entropy(logits.reshape(-1, vocab_size), flat_targets)
+            return linear_ce(flat_hidden, flat_targets, reduction="mean")
         total = hidden.new_zeros(())
         for start in range(0, token_count, chunk_tokens):
             end = min(start + chunk_tokens, token_count)
-            logits = model.logits_from_hidden(flat_hidden[start:end])
-            total = total + F.cross_entropy(logits, flat_targets[start:end], reduction="sum")
+            total = total + linear_ce(flat_hidden[start:end], flat_targets[start:end], reduction="sum")
         return total / hidden.new_tensor(float(token_count))
 
     if chunk_tokens <= 0:
-        logits = model.logits_from_hidden(hidden)
-        return F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+        return linear_ce(hidden.reshape(-1, hidden.shape[-1]), targets.reshape(-1), reduction="mean")
     flat_hidden = hidden.reshape(-1, hidden.shape[-1])
     flat_targets = targets.reshape(-1)
     total = hidden.new_zeros(())
     token_count = flat_targets.numel()
     for start in range(0, token_count, chunk_tokens):
         end = min(start + chunk_tokens, flat_targets.numel())
-        logits = model.logits_from_hidden(flat_hidden[start:end])
-        total = total + F.cross_entropy(logits, flat_targets[start:end], reduction="sum")
+        total = total + linear_ce(flat_hidden[start:end], flat_targets[start:end], reduction="sum")
     return total / hidden.new_tensor(float(token_count))
 
 
@@ -296,21 +421,30 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     dtype = pick_dtype(args.dtype)
     if args.grad_accum_steps < 1:
         raise ValueError("--grad-accum-steps must be >= 1")
+    eval_batch_size = args.eval_batch_size or args.batch_size
     tokenizer = SaneFlowBPETokenizer(args.tokenizer_path)
     syntax_kernels = tuple(int(x.strip()) for x in args.syntax_kernels.split(",") if x.strip())
     cfg = SaneFlowConfig(
         vocab_size=len(tokenizer),
+        model_type=args.model_type,
         d_embed=args.d_embed,
         d_model=args.d_model,
         n_layer=args.layers,
         n_heads=args.heads,
+        n_kv_heads=args.kv_heads,
         d_ff=args.d_ff,
+        rope_theta=args.rope_theta,
+        qk_norm=args.qk_norm,
         conv_kernel=args.conv_kernel,
         syntax_mix_version=args.syntax_mix_version,
         syntax_kernels=syntax_kernels,
@@ -362,8 +496,12 @@ def main() -> None:
         )
     print(json.dumps({"event": "datasets_ready", "train_tokens": int(train.ids.numel())}), flush=True)
     model = SaneFlowLM(cfg).to(device=device, dtype=dtype)
+    init_payload = None
+    resume_step = 0
     if args.init_from:
         payload = torch.load(Path(args.init_from), map_location=device, weights_only=True)
+        init_payload = payload
+        resume_step = int(payload.get("global_step", payload.get("step", 0)) or 0)
         old_cfg = SaneFlowConfig(**payload["config"])
         expected = cfg.to_dict()
         loaded = old_cfg.to_dict()
@@ -371,11 +509,15 @@ def main() -> None:
             k: (loaded.get(k), expected.get(k))
             for k in (
                 "vocab_size",
+                "model_type",
                 "d_embed",
                 "d_model",
                 "n_layer",
                 "n_heads",
+                "n_kv_heads",
                 "d_ff",
+                "rope_theta",
+                "qk_norm",
                 "syntax_mix_version",
                 "syntax_kernels",
                 "state_mixer_version",
@@ -401,6 +543,13 @@ def main() -> None:
             model.load_state_dict(payload["model"])
     if args.compile:
         model = torch.compile(model, mode=args.compile_mode)
+    liger_fused_linear_ce = None
+    if args.liger_fused_linear_ce:
+        try:
+            from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+        except ImportError as exc:
+            raise RuntimeError("--liger-fused-linear-ce requires `pip install liger-kernel`") from exc
+        liger_fused_linear_ce = LigerFusedLinearCrossEntropyLoss()
     if args.optimizer == "ademamix":
         opt = AdEMAMix(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     elif args.optimizer == "muon":
@@ -417,6 +566,29 @@ def main() -> None:
                 torch.optim.AdamW(adam_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=args.fused_adamw) if adam_params else None,
             ]
         )
+    elif args.optimizer == "galore_adamw":
+        galore_params = []
+        adam_params = []
+        for name, param in model.named_parameters():
+            if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
+                galore_params.append(param)
+            else:
+                adam_params.append(param)
+        opt = CombinedOptim(
+            [
+                GaLoreAdamW(
+                    galore_params,
+                    lr=args.lr,
+                    weight_decay=args.weight_decay,
+                    rank=args.galore_rank,
+                    update_proj_gap=args.galore_update_proj_gap,
+                    scale=args.galore_scale,
+                )
+                if galore_params
+                else None,
+                torch.optim.AdamW(adam_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95), fused=args.fused_adamw) if adam_params else None,
+            ]
+        )
     else:
         opt = torch.optim.AdamW(
             model.parameters(),
@@ -425,11 +597,67 @@ def main() -> None:
             betas=(0.9, 0.95),
             fused=args.fused_adamw,
         )
+    if init_payload is not None:
+        optimizer_state = init_payload.get("optimizer")
+        if optimizer_state is not None:
+            try:
+                opt.load_state_dict(optimizer_state)
+                print(json.dumps({"event": "optimizer_state_loaded", "init_from": args.init_from, "global_step": resume_step}), flush=True)
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {
+                            "event": "optimizer_state_load_failed",
+                            "init_from": args.init_from,
+                            "global_step": resume_step,
+                            "error": repr(exc),
+                        }
+                    ),
+                    flush=True,
+                )
+        elif resume_step:
+            print(
+                json.dumps(
+                    {
+                        "event": "optimizer_state_missing",
+                        "init_from": args.init_from,
+                        "global_step": resume_step,
+                        "action": "resume_model_weights_only",
+                    }
+                ),
+                flush=True,
+            )
     log_path = out / "train_log.jsonl"
 
     def save(path: Path, step: int) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
-        torch.save({"config": cfg.to_dict(), "model": model.state_dict(), "step": step}, tmp)
+        payload = {
+            "config": cfg.to_dict(),
+            "model": model.state_dict(),
+            "step": step,
+            "global_step": step,
+            "optimizer_name": args.optimizer,
+            "train_state": {
+                "micro_batch_size": args.batch_size,
+                "eval_batch_size": eval_batch_size,
+                "grad_accum_steps": args.grad_accum_steps,
+                "effective_batch_size": args.batch_size * args.grad_accum_steps,
+                "seq_len": args.seq_len,
+                "loss_chunk_tokens": args.loss_chunk_tokens,
+                "loss_mode": args.loss_mode,
+                "dtype": args.dtype,
+                "activation_checkpointing": args.activation_checkpointing,
+                "dataset_layout": args.dataset_layout,
+                "dataset_device": args.dataset_device,
+                "lr": args.lr,
+                "muon_lr": args.muon_lr,
+                "warmup_steps": args.warmup_steps,
+                "min_lr_ratio": args.min_lr_ratio,
+            },
+        }
+        if not args.no_save_optimizer:
+            payload["optimizer"] = opt.state_dict()
+        torch.save(payload, tmp)
         tmp.replace(path)
 
     print(json.dumps({
@@ -439,7 +667,13 @@ def main() -> None:
         "config": cfg.to_dict(),
         "optimizer": args.optimizer,
         "muon_lr": args.muon_lr if args.optimizer == "muon" else None,
+        "galore": {
+            "rank": args.galore_rank,
+            "update_proj_gap": args.galore_update_proj_gap,
+            "scale": args.galore_scale,
+        } if args.optimizer == "galore_adamw" else None,
         "micro_batch_size": args.batch_size,
+        "eval_batch_size": eval_batch_size,
         "grad_accum_steps": args.grad_accum_steps,
         "effective_batch_size": args.batch_size * args.grad_accum_steps,
         "loss_chunk_tokens": args.loss_chunk_tokens,
@@ -448,13 +682,18 @@ def main() -> None:
         "dataset_device": args.dataset_device,
         "dataset_layout": args.dataset_layout,
         "compile": args.compile,
+        "liger_fused_linear_ce": args.liger_fused_linear_ce,
         "tf32": args.tf32,
+        "resume_step": resume_step,
+        "save_optimizer": not args.no_save_optimizer,
     }), flush=True)
     model.train()
     train_start_time = time.perf_counter()
     last_log_time = train_start_time
-    last_log_step = 0
-    for step in range(1, args.steps + 1):
+    last_log_step = resume_step
+    if resume_step >= args.steps:
+        print(json.dumps({"event": "already_reached_target_steps", "resume_step": resume_step, "target_steps": args.steps}), flush=True)
+    for step in range(resume_step + 1, args.steps + 1):
         if args.warmup_steps > 0 and step <= args.warmup_steps:
             lr_scale = step / args.warmup_steps
         else:
@@ -474,7 +713,7 @@ def main() -> None:
             else:
                 x, y, mask = train.batch_with_mask(args.batch_size, device)
             hidden = model.forward_hidden(x, activation_checkpointing=args.activation_checkpointing)
-            loss = lm_loss(model, hidden, y, cfg.vocab_size, args.loss_chunk_tokens, mask)
+            loss = lm_loss(model, hidden, y, cfg.vocab_size, args.loss_chunk_tokens, mask, liger_fused_linear_ce)
             loss_total += float(loss.item())
             (loss / args.grad_accum_steps).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -496,7 +735,16 @@ def main() -> None:
             last_log_time = now
             last_log_step = step
             if valid is not None and (step == 1 or step % (args.log_every * 10) == 0 or step == args.steps):
-                row["valid_loss"] = round(eval_loss(model, valid, cfg, args.batch_size, device, args.loss_chunk_tokens, args.loss_mode), 4)
+                row["valid_loss"] = round(eval_loss(
+                    model,
+                    valid,
+                    cfg,
+                    eval_batch_size,
+                    device,
+                    args.loss_chunk_tokens,
+                    args.loss_mode,
+                    liger_fused_linear_ce,
+                ), 4)
             print(json.dumps(row), flush=True)
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")

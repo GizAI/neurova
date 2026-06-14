@@ -113,7 +113,7 @@ def eval_loss(model: SaneFlowLM, valid: TokenStreamDataset, cfg: SaneFlowConfig,
     return sum(losses) / max(1, len(losses))
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate(
     model: SaneFlowLM,
     tokenizer: SaneFlowBPETokenizer,
@@ -272,7 +272,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     dtype = pick_dtype(args.dtype)
-    payload = torch.load(Path(args.ckpt), map_location=device, weights_only=True)
+    payload = torch.load(Path(args.ckpt), map_location="cpu", weights_only=True)
     cfg = SaneFlowConfig(**payload["config"])
     tokenizer = SaneFlowBPETokenizer(cfg.tokenizer_path)
     model = SaneFlowLM(cfg).to(device=device, dtype=dtype)

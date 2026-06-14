@@ -112,7 +112,7 @@ def stream_generate(model, tokenizer, prompt: str, args: argparse.Namespace) -> 
 def main() -> None:
     args = parse_args()
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
-    payload = torch.load(Path(args.ckpt), map_location=args.device, weights_only=True)
+    payload = torch.load(Path(args.ckpt), map_location="cpu", weights_only=True)
     cfg = SaneFlowConfig(**payload["config"])
     tokenizer = SaneFlowBPETokenizer(cfg.tokenizer_path)
     model = SaneFlowLM(cfg).to(device=args.device, dtype=dtype)

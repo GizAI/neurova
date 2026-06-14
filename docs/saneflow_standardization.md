@@ -1,272 +1,155 @@
 # SaneFlow Standardization
 
-This document defines the active SaneFlow layout. The final SFT path is single
-format ChatML with assistant-only labels. Old `open_sft`, `sft/current`
-symlinks, and full-sequence ChatML loss are not active paths.
+This document is the current SaneFlow contract. Anything not listed here is not
+an active SaneFlow launch path.
 
-The practical retraining plan lives in:
-
-```text
-docs/neurova_training_data_master_plan.md
-```
-
-The autonomous research program SSOT lives in:
+## Single Source Of Truth
 
 ```text
 configs/saneflow_research_program.json
+configs/saneflow_profiles.json
+scripts/saneflow_run.py
+scripts/saneflow_autoresearch_loop.sh
+```
+
+`configs/saneflow_profiles.json` is the canonical source for profile runtime,
+data paths, output paths, optimizer settings, and checkpoint initialization.
+`configs/saneflow_research_program.json` is the canonical source for which
+profiles are active. `scripts/saneflow_run.py` is only a thin launcher over
+those configs; it must not grow hardcoded model lines.
+
+## Active Lines
+
+```text
+Line A, speak/chat on ml-dmc8 GPU0:
+  dmc8-speak-base-v1
+  dmc8-chatml-sft-v9
+
+Line B, practical base on ml-dmc9 GPU0:
+  dmc9-practical-base-100m
+
+Line C, dense Transformer baseline on ml-dmc9 GPU1:
+  dmc9-dense-0.3b-v1
+```
+
+Line A trains stable natural continuation first. It runs assistant-only ChatML
+SFT only after the speak-base quality gate passes.
+
+Line B is base pretraining only. It exists to improve the language prior from
+verified continuation data before any SFT is considered.
+
+Line C is a direct PyTorch decoder-only Transformer baseline: RMSNorm, bias-free
+GQA attention, RoPE, QK-Norm, bias-free SwiGLU, bf16, SDPA/Flash-style attention
+backend, activation checkpointing, and Muon. It is research-only until it passes
+both generation and reasoning gates.
+
+Line C uses `tokenizers/neurova_spm_unigram_64k`: SentencePiece Unigram, 64K
+target vocab, byte fallback enabled, identity normalization, character coverage
+0.99995, and the canonical chat/tool special tokens:
+`<pad>`, `<bos>`, `<eos>`, `<unk>`, `<|user|>`, `<|assistant|>`,
+`<|system|>`, `<|tool|>`, `<|im_start|>`, `<|im_end|>`. The tokenizer is
+trained from the same practical pretraining mix ratio used by the active dense
+line.
+
+System optimization contract:
+
+```text
+FlashAttention path:
+  Use torch.scaled_dot_product_attention. On CUDA, training enables PyTorch
+  Flash SDP and memory-efficient SDP backends. The external flash_attn package
+  is optional and not required by the active profile.
+
+Precision:
+  Active training uses bf16. fp8 is not enabled by default just because the dtype
+  exists; it needs an explicit smoke test and scaling recipe before use.
+
+Optimizer:
+  Active profile uses Muon for 2D matrix parameters and AdamW for embedding,
+  norm, and scalar parameters. Built-in GaLoreAdamW is available as an
+  optimizer-state memory experiment, not mixed into the Muon mainline.
+
+FSDP/ZeRO:
+  Single-GPU profiles do not use FSDP/ZeRO. Torch FSDP can be used by a future
+  multi-process launcher. ZeRO requires DeepSpeed to be installed and is
+  currently represented only by config files.
+
+Checkpointing:
+  Dense 0.3B enables activation checkpointing.
+  Active checkpoints keep the existing `latest.pt` and `model.pt` filenames and
+  include `config`, `model`, `step`, `global_step`, `train_state`, and optimizer
+  state by default. Older weight-only checkpoints still load, but they resume
+  with a fresh optimizer once and write full resume checkpoints on the next save.
 ```
 
 ## Canonical Data
 
-Base pretraining:
-
 ```text
-data/corpus/sources/fineweb_edu_sample10bt/train.jsonl
-data/corpus/sources/fineweb_edu_sample10bt/valid.jsonl
+Base/practical sources:
+  data/corpus/sources/*/{train,valid}.jsonl
+
+Speak bridge:
+  configs/saneflow_speak_pretrain_mix.json
+  data/corpus/mixes/saneflow_speak_pretrain_v1/{train,valid}.jsonl
+
+Practical pretrain:
+  configs/saneflow_practical_pretrain_sources.json
+  configs/saneflow_practical_pretrain_mix.json
+  data/corpus/mixes/saneflow_practical_pretrain_v1/{train,valid}.jsonl
+
+ChatML SFT:
+  configs/saneflow_chatml_sft_recipe.json
+  data/corpus/sft_sources/*.jsonl
+  data/corpus/mixes/saneflow_chatml_sft_{train,valid}_v1.jsonl
 ```
 
-Practical base pretraining:
+Raw HF parquet/csv/json files are adapter inputs only. Training profiles never
+point directly at raw files.
 
-```text
-data/corpus/sources/fineweb_edu_sample10bt/{train,valid}.jsonl
-data/corpus/sources/dclm_baseline_v1/{train,valid}.jsonl
-data/corpus/sources/gneissweb_v1/{train,valid}.jsonl
-data/corpus/sources/fineweb2_hq_en/{train,valid}.jsonl
-data/corpus/sources/fineweb2_hq_ko/{train,valid}.jsonl
-data/corpus/mixes/saneflow_practical_pretrain_v1/{train,valid}.jsonl
-```
-
-Current R diagnostic pretrain is intentionally narrower:
-
-```text
-runs/saneflow_r_champion/d_delta_landmark_long
-  train-data: data/corpus/sources/fineweb_edu_sample10bt/train.jsonl
-```
-
-That FineWeb-Edu file contains many domains inside one source, but it is not the
-same as the explicit practical mix. DCLM-Baseline and GneissWeb become active
-only through `saneflow_practical_pretrain_v1`.
-
-Speak-base continuation before SFT:
-
-```text
-data/corpus/mixes/saneflow_speak_pretrain_v1/{train,valid}.jsonl
-```
-
-Chat SFT:
-
-```text
-data/corpus/sft_sources/*.jsonl
-data/corpus/mixes/saneflow_chatml_sft_train_v1.jsonl
-data/corpus/mixes/saneflow_chatml_sft_valid_v1.jsonl
-data/corpus/mixes/saneflow_chatml_sft_manifest_v1.json
-```
-
-Prepare raw HF/cache files once, then build SFT data with:
+## Canonical Commands
 
 ```bash
 python scripts/saneflow_prepare_chatml_sources.py
 python scripts/saneflow_build_chatml_sft.py
+python scripts/saneflow_build_speak_pretrain_v1.py
+python scripts/saneflow_build_practical_pretrain_mix.py
+python scripts/saneflow_train_tokenizer.py
+python scripts/saneflow_doremi_pipeline.py
+python scripts/saneflow_system_capabilities.py
+
+bash scripts/saneflow_fleetctl.sh active
+bash scripts/saneflow_fleetctl.sh start
+bash scripts/saneflow_researchctl_dmc8.sh status
+bash scripts/saneflow_researchctl_dmc9.sh status
 ```
 
-Recipe:
-
-```text
-configs/saneflow_chatml_sft_recipe.json
-```
-
-The recipe is the SFT data SSOT. `saneflow_prepare_chatml_sources.py` is the
-only raw-source adapter layer. `saneflow_build_chatml_sft.py` reads normalized
-JSONL sources only, applies clipping, benchmark-name filtering, exact/near
-dedup, and writes the single standard ChatML train/valid files above.
-
-Target SFT mix:
-
-```text
-Tulu3-SFT                 25%
-SmolTalk2-SFT             20%
-Reasoning/OpenR1/Stratos  25%
-OpenCodeInstruct          15%
-ToolACE/APIGen             7%
-Korean/KIT-19              5%
-Safety/PolyGuard           3%
-```
-
-`Salesforce/xlam-function-calling-60k` and `allenai/wildguardmix` require gated
-HF access in the current environment, so the standard recipe uses public
-ToolACE/APIGen and PolyGuardMix inputs for those buckets.
-
-## ChatML Contract
-
-All SFT rows use:
-
-```text
-<|im_start|>system
-...
-<|im_end|>
-<|im_start|>user
-...
-<|im_end|>
-<|im_start|>assistant
-...
-<|im_end|>
-```
-
-Training uses:
-
-```text
---loss-mode chatml_assistant
-```
-
-Only assistant answer tokens, including the closing `<|im_end|>`, contribute to
-loss. System/user tokens are context only.
-
-## Canonical Launchers
-
-Registry and profile launcher:
-
-```text
-scripts/saneflow_run.py
-```
-
-dmc8 after-base waiter:
-
-```text
-scripts/saneflow_after_base_dmc8.sh
-scripts/saneflow_researchctl_dmc8.sh
-profiles: dmc8-speak-base-v1, dmc8-chatml-sft-v9
-```
-
-dmc9 research control:
-
-```text
-scripts/saneflow_researchctl_dmc9.sh
-profiles: dmc9-practical-base-100m, dmc9-r-champion-delta-landmark-long
-```
-
-Autonomous host loops:
-
-```text
-scripts/saneflow_autoresearch_loop.sh dmc8
-scripts/saneflow_autoresearch_loop.sh dmc9
-scripts/saneflow_fleetctl.sh status
-scripts/saneflow_fleetctl.sh active
-scripts/saneflow_fleetctl.sh start
-```
-
-`saneflow_autoresearch_loop.sh` is a persistent state machine by default
-(`SANEFLOW_LOOP_FOREVER=1`). It does not own long-running training processes.
-Each cycle only checks whether a profile is running or complete, starts missing
-active work once, runs quality gates when checkpoints appear, and promotes only
-after the gate.
-
-## Active Profiles
-
-```text
-dmc8 line A:
-  dmc8-speak-base-v1
-  dmc8-chatml-sft-v9
-
-dmc9 line B:
-  dmc9-practical-base-100m
-
-dmc9 line C:
-  dmc9-r-champion-delta-landmark-long
-  dmc9-r-champion-practical-cont
-
-legacy/diagnostic:
-dmc8-base-100m
-dmc9-sparse-chatml-sft
-dmc9-neurova-r-full
-```
-
-Default status commands should focus on the active lines. Legacy/diagnostic
-runs can be inspected with explicit `status-all` commands, but they are not
-allowed to drive deployment or promotion.
-
-The active research lines are separate by design:
-
-```text
-Line A, speak/chat:
-  stable natural continuation first, gated ChatML SFT second
-  host: ml-dmc8
-  promotion: only after quality gate
-
-Line B, practical base:
-  best 100M-class base from explicit source mix
-  host: ml-dmc9 GPU0
-  data: FineWeb-Edu + DCLM-Baseline, plus verified future sources
-
-Line C, R architecture:
-  DeltaMatrix/landmark recurrent architecture research
-  host: ml-dmc9 GPU1
-  phase 1: FineWeb-Edu diagnostic continuation
-  phase 2: practical-mix continuation
-  status: research-only until generation gate passes
-```
-
-## Autonomous Policy
-
-The current default policy is:
-
-```text
-1. dmc8 Line A:
-   build speak-pretrain + ChatML data
-   run dmc8-speak-base-v1
-   quality-gate speak-base
-   only then run dmc8-chatml-sft-v9
-   quality-gate and promote to runs/saneflow_current/model.pt
-
-2. dmc9 Line B:
-   build practical pretrain mix from verified source config
-   run dmc9-practical-base-100m on GPU0
-   keep it base-pretrain only until language quality is good enough
-
-3. dmc9 Line C:
-   continue dmc9-r-champion-delta-landmark-long on GPU1
-   after it finishes, continue dmc9-r-champion-practical-cont
-   keep it research-only until it passes generation/reasoning gates
-```
-
-Meaningless SFT jobs should be stopped or left as legacy artifacts. New SFT
-should be scheduled only through `dmc8-chatml-sft-v9` or a future profile that
-explicitly initializes from a gated base checkpoint.
+`saneflow_autoresearch_loop.sh` is persistent by default. It does not own
+training processes; it checks profile status, starts missing active work once,
+runs quality gates, and promotes only after the gate.
 
 ## Inference
 
-`./neurova.sh` defaults to SaneFlow chat and passes `--chatml`. The generator and
-streaming chat both stop on `<|im_end|>` and strip ChatML control tokens before
-showing output. Runtime decoding supports:
-
-```text
---repetition-penalty
---no-repeat-ngram-size
-```
-
-Default shell values:
+`./neurova.sh` defaults to SaneFlow chat. Runtime decoding uses the shared
+decoder controls in `saneflow/decoding.py`:
 
 ```text
 NEUROVA_SANEFLOW_REPETITION_PENALTY=1.08
 NEUROVA_SANEFLOW_NO_REPEAT_NGRAM_SIZE=4
+NEUROVA_SANEFLOW_DECODE_MODE=cache
 ```
 
-These are inference controls only. A checkpoint that only becomes usable because
-of penalties still fails the model-quality gate.
+These are runtime controls only. A checkpoint that is usable only because of
+penalties still fails the model-quality gate.
 
-## Removed Paths
+## Removed Legacy
 
-Do not recreate these as active launch paths:
+Old one-off SaneFlow SFT builders, ablation launchers, speed sweeps, and
+pipeline wrappers were removed. New experiments must be added as either:
 
 ```text
-scripts/saneflow_sftctl_dmc9.sh
-scripts/saneflow_build_open_sft_mix.py
-data/corpus/sft/current
-runs/**/open_sft*
+1. a new profile in configs/saneflow_profiles.json, plus
+2. a matching entry in configs/saneflow_research_program.json, plus
+3. a quality-gate rule before promotion.
 ```
 
-Existing broad SFT files under `data/corpus/mixes/saneflow_open_sft_v2` are
-allowed only as builder inputs, never as direct training targets.
-
-Raw parquet/csv/json files are allowed only under `data/corpus/raw_hf_sft_v3`.
-They are never direct training targets and are never read by the remote training
-launcher.
+Do not reintroduce direct training from broad ad-hoc SFT mixes or raw downloaded
+files. Add data through the source adapters and recipe files above.

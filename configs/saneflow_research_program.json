@@ -36,17 +36,17 @@
       "policy": "train the best practical 100M-class base from verified high-quality continuation data before any SFT"
     },
     {
-      "id": "line_c_r_architecture",
+      "id": "line_c_dense_transformer_baseline",
       "host": "ml-dmc9",
       "gpu": 1,
       "profiles": [
-        "dmc9-r-champion-delta-landmark-long",
-        "dmc9-r-champion-practical-cont"
+        "dmc9-dense-0.3b-v1"
       ],
       "data_configs": [
-        "configs/saneflow_training_curriculum.json"
+        "configs/saneflow_practical_pretrain_sources.json",
+        "configs/saneflow_practical_pretrain_mix.json"
       ],
-      "policy": "continue the DeltaMatrix plus landmark architecture research line, then continue it on the practical base mix; keep research-only until generation gate passes"
+      "policy": "train the Neurova-Dense-0.3B First baseline with direct PyTorch decoder-only Transformer blocks, GQA, RoPE, QK-Norm, bf16, activation checkpointing, SDPA flash backend, and Muon"
     }
   ],
   "promotion_targets": {
@@ -54,7 +54,7 @@
     "speak_base": "runs/saneflow_speak_base_v1_100m/model.pt",
     "chat": "runs/saneflow_chatml_sft_v9_assistant/model.pt",
     "practical_base": "runs/saneflow_practical_pretrain_v1_100m_muon/model.pt",
-    "r_champion": "runs/saneflow_r_champion/d_delta_landmark_practical_cont/model.pt"
+    "dense_0_3b": "runs/neurova_dense_0_3b_v1/model.pt"
   },
   "quality_gates": {
     "generation": {

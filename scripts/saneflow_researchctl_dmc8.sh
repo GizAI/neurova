@@ -7,7 +7,7 @@ PYTHON="${SANEFLOW_PYTHON:-python}"
 cmd="${1:-status}"
 case "$cmd" in
   status)
-    "$PYTHON" scripts/saneflow_run.py status dmc8-base-100m dmc8-speak-base-v1 dmc8-chatml-sft-v9
+    "$PYTHON" scripts/saneflow_run.py status dmc8-speak-base-v1 dmc8-chatml-sft-v9
     echo
     nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu,power.draw --format=csv,noheader || true
     ;;

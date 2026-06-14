@@ -1,0 +1,65 @@
+{
+  "name": "saneflow_practical_pretrain_v2_en",
+  "train_out": "data/corpus/mixes/saneflow_practical_pretrain_v2_en/train.jsonl",
+  "valid_out": "data/corpus/mixes/saneflow_practical_pretrain_v2_en/valid.jsonl",
+  "manifest_out": "data/corpus/mixes/saneflow_practical_pretrain_v2_en/manifest.json",
+  "ratio_override": "data/corpus/mixes/saneflow_practical_pretrain_v2_en/doremi_ratios.json",
+  "quality_filter": {
+    "min_quality_score": 0.55,
+    "max_pii_score": 0.20,
+    "dedup": "normalized_text_sha256",
+    "policy": "English-only high-quality document mix; no Korean; local SFT sources are converted to raw continuation documents."
+  },
+  "train_records": 60000,
+  "valid_records": 2000,
+  "sources": [
+    {
+      "name": "fineweb_edu_sample10bt",
+      "train": "data/corpus/sources/practical_pretrain_v2_en/fineweb_edu_sample10bt/train.jsonl",
+      "valid": "data/corpus/sources/practical_pretrain_v2_en/fineweb_edu_sample10bt/valid.jsonl",
+      "ratio": 0.30
+    },
+    {
+      "name": "dclm_baseline_v1",
+      "train": "data/corpus/sources/practical_pretrain_v2_en/dclm_baseline_v1/train.jsonl",
+      "valid": "data/corpus/sources/practical_pretrain_v2_en/dclm_baseline_v1/valid.jsonl",
+      "ratio": 0.22
+    },
+    {
+      "name": "dclm_edu",
+      "train": "data/corpus/sources/practical_pretrain_v2_en/dclm_edu/train.jsonl",
+      "valid": "data/corpus/sources/practical_pretrain_v2_en/dclm_edu/valid.jsonl",
+      "ratio": 0.14
+    },
+    {
+      "name": "zyda2_sample100bt",
+      "train": "data/corpus/sources/practical_pretrain_v2_en/zyda2_sample100bt/train.jsonl",
+      "valid": "data/corpus/sources/practical_pretrain_v2_en/zyda2_sample100bt/valid.jsonl",
+      "ratio": 0.10
+    },
+    {
+      "name": "finemath_4plus",
+      "train": "data/corpus/sources/practical_pretrain_v2_en/finemath_4plus/train.jsonl",
+      "valid": "data/corpus/sources/practical_pretrain_v2_en/finemath_4plus/valid.jsonl",
+      "ratio": 0.10
+    },
+    {
+      "name": "opencodeinstruct_code",
+      "train": "data/corpus/sources/practical_pretrain_v2_en/opencodeinstruct_code/train.jsonl",
+      "valid": "data/corpus/sources/practical_pretrain_v2_en/opencodeinstruct_code/valid.jsonl",
+      "ratio": 0.08
+    },
+    {
+      "name": "openr1_math",
+      "train": "data/corpus/sources/practical_pretrain_v2_en/openr1_math/train.jsonl",
+      "valid": "data/corpus/sources/practical_pretrain_v2_en/openr1_math/valid.jsonl",
+      "ratio": 0.04
+    },
+    {
+      "name": "limo_math",
+      "train": "data/corpus/sources/practical_pretrain_v2_en/limo_math/train.jsonl",
+      "valid": "data/corpus/sources/practical_pretrain_v2_en/limo_math/valid.jsonl",
+      "ratio": 0.02
+    }
+  ]
+}

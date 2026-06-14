@@ -9,6 +9,20 @@ import torch
 from saneflow.chat_format import ASSISTANT_HEADER, IM_END
 
 
+def text_from_jsonl_line(line: str) -> str:
+    line = line.strip()
+    if not line:
+        return ""
+    if not line.startswith("{"):
+        return line
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return ""
+    text = row.get("text", "")
+    return text if isinstance(text, str) else ""
+
+
 def cache_key(paths: list[Path], tokenizer_name: str, seq_len: int, max_records: int, loss_mode: str, tokenizer_fingerprint: str = "") -> str:
     h = hashlib.sha256()
     h.update(tokenizer_name.encode())
@@ -105,13 +119,7 @@ class TokenStreamDataset:
         for path in paths:
             with path.open("r", encoding="utf-8") as f:
                 for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("{"):
-                        text = json.loads(line).get("text", "")
-                    else:
-                        text = line
+                    text = text_from_jsonl_line(line)
                     text = text.strip()
                     if not text:
                         continue
@@ -195,13 +203,7 @@ class SampleAlignedDataset:
         for path in paths:
             with path.open("r", encoding="utf-8") as f:
                 for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("{"):
-                        text = json.loads(line).get("text", "")
-                    else:
-                        text = line
+                    text = text_from_jsonl_line(line)
                     text = text.strip()
                     if not text:
                         continue

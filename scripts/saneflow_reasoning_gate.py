@@ -139,10 +139,24 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
+def answer_matches(text: str, answers: list[str]) -> bool:
+    norm = normalize(text)
+    for answer in answers:
+        ans = normalize(answer)
+        if not ans:
+            continue
+        if re.fullmatch(r"[a-z0-9]+", ans):
+            if re.search(rf"(?<![a-z0-9]){re.escape(ans)}(?![a-z0-9])", norm):
+                return True
+        elif ans in norm:
+            return True
+    return False
+
+
 def main() -> None:
     args = parse_args()
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
-    payload = torch.load(Path(args.ckpt), map_location=args.device, weights_only=True)
+    payload = torch.load(Path(args.ckpt), map_location="cpu", weights_only=True)
     cfg = SaneFlowConfig(**payload["config"])
     tokenizer = SaneFlowBPETokenizer(cfg.tokenizer_path)
     model = SaneFlowLM(cfg).to(device=args.device, dtype=dtype)
@@ -152,8 +166,7 @@ def main() -> None:
     rows = []
     for probe in PROBES:
         text, tokens, tok_s = generate(model, tokenizer, probe["prompt"], args)
-        norm = normalize(text)
-        passed = any(answer in norm for answer in probe["answers"])
+        passed = answer_matches(text, probe["answers"])
         rows.append({
             "id": probe["id"],
             "kind": probe["kind"],
