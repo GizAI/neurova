@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from .model import LUMAConfig, LUMALM
-from .tokenizer import ByteTokenizer
+from .tokenizer import assert_tokenizer_contract, build_tokenizer
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,17 +25,23 @@ def parse_args() -> argparse.Namespace:
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
-    tokenizer = ByteTokenizer()
     payload = torch.load(Path(args.ckpt), map_location=args.device, weights_only=True)
-    model = LUMALM(LUMAConfig(**payload["config"])).to(args.device)
+    raw_cfg = payload["config"]
+    cfg = LUMAConfig(**raw_cfg)
+    tokenizer = build_tokenizer(cfg.tokenizer_backend, cfg.qwen_tokenizer_path, cfg.bytepatch_vocab_path)
+    assert_tokenizer_contract(raw_cfg, tokenizer)
+    model = LUMALM(cfg).to(args.device)
     model.load_state_dict(payload["model"])
     model.eval()
     ids = tokenizer.encode(args.prompt, add_bos=True, add_eos=False)
+    x = torch.tensor([ids[-512:]], dtype=torch.long, device=args.device)
+    out = model(x, return_slots=True)
+    slots = LUMALM.detach_slots(out.slots) if out.slots is not None else None
     for _ in range(args.max_new):
-        x = torch.tensor([ids[-512:]], dtype=torch.long, device=args.device)
-        logits = model(x).logits[0, -1]
-        logits[tokenizer.pad_id] = -torch.inf
-        logits[tokenizer.bos_id] = -torch.inf
+        logits = out.logits[0, -1]
+        for special_id in {tokenizer.pad_id, tokenizer.bos_id} - {tokenizer.eos_id}:
+            if 0 <= int(special_id) < logits.numel():
+                logits[int(special_id)] = -torch.inf
         if args.no_repeat_ngram > 0 and len(ids) >= args.no_repeat_ngram - 1:
             prefix = tuple(ids[-(args.no_repeat_ngram - 1) :]) if args.no_repeat_ngram > 1 else tuple()
             banned = set()
@@ -54,6 +60,9 @@ def main() -> None:
         ids.append(next_id)
         if next_id == tokenizer.eos_id:
             break
+        x = torch.tensor([[next_id]], dtype=torch.long, device=args.device)
+        out = model(x, slots_in=slots, return_slots=True)
+        slots = LUMALM.detach_slots(out.slots) if out.slots is not None else None
     print(tokenizer.decode(ids))
 
 

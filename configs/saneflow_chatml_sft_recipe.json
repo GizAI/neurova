@@ -1,0 +1,120 @@
+{
+  "name": "saneflow_chatml_sft_v1",
+  "format": "chatml",
+  "loss_mode": "chatml_assistant",
+  "target_records": 24000,
+  "valid_records": 2000,
+  "max_chars": {
+    "default": 2200,
+    "reasoning": 4200,
+    "code": 3200,
+    "tool": 2800,
+    "smoltalk2": 4200,
+    "tulu3": 2800,
+    "korean": 2200,
+    "safety": 1800
+  },
+  "buckets": {
+    "tulu3": 0.25,
+    "smoltalk2": 0.20,
+    "reasoning": 0.25,
+    "code": 0.15,
+    "tool": 0.07,
+    "korean": 0.05,
+    "safety": 0.03
+  },
+  "sources": [
+    {
+      "name": "open_sft_v2",
+      "type": "jsonl",
+      "paths": [
+        "data/corpus/mixes/saneflow_open_sft_v2/train.jsonl",
+        "data/corpus/mixes/saneflow_open_sft_v2/valid.jsonl"
+      ]
+    },
+    {
+      "name": "openr1_math_220k",
+      "type": "jsonl",
+      "bucket": "reasoning",
+      "paths": ["data/corpus/sft_sources/openr1_math_220k.jsonl"],
+      "limit": 2500
+    },
+    {
+      "name": "smoltalk2_direct",
+      "type": "jsonl",
+      "bucket": "smoltalk2",
+      "paths": ["data/corpus/sft_sources/smoltalk2_direct.jsonl"],
+      "limit": 5000
+    },
+    {
+      "name": "opencodeinstruct_direct",
+      "type": "jsonl",
+      "bucket": "code",
+      "paths": ["data/corpus/sft_sources/opencodeinstruct_direct.jsonl"],
+      "limit": 3200
+    },
+    {
+      "name": "bespoke_stratos_17k",
+      "type": "jsonl",
+      "bucket": "reasoning",
+      "paths": ["data/corpus/sft_sources/bespoke_stratos_17k.jsonl"],
+      "limit": 2500
+    },
+    {
+      "name": "limo",
+      "type": "jsonl",
+      "bucket": "reasoning",
+      "paths": ["data/corpus/sft_sources/limo.jsonl"],
+      "limit": 817
+    },
+    {
+      "name": "toolace",
+      "type": "jsonl",
+      "bucket": "tool",
+      "paths": ["data/corpus/sft_sources/toolace.jsonl"],
+      "limit": 1200
+    },
+    {
+      "name": "apigen_function_calling",
+      "type": "jsonl",
+      "bucket": "tool",
+      "paths": ["data/corpus/sft_sources/apigen_function_calling.jsonl"],
+      "limit": 1000
+    },
+    {
+      "name": "kit19",
+      "type": "jsonl",
+      "bucket": "korean",
+      "paths": ["data/corpus/sft_sources/kit19.jsonl"],
+      "limit": 1400
+    },
+    {
+      "name": "polyguardmix",
+      "type": "jsonl",
+      "bucket": "safety",
+      "paths": ["data/corpus/sft_sources/polyguardmix.jsonl"],
+      "limit": 900
+    },
+    {
+      "name": "local_reasoning_memory",
+      "type": "jsonl",
+      "bucket": "reasoning",
+      "paths": [
+        "data/luma_stage_chatml_reasoning_v2.jsonl",
+        "data/luma_stage_chatml_slotproof_v2.jsonl",
+        "data/mamba3_programmatic_curriculum.jsonl"
+      ],
+      "limit": 2500
+    },
+    {
+      "name": "local_korean_chat",
+      "type": "jsonl",
+      "bucket": "korean",
+      "paths": [
+        "data/luma_clean_chatml_sft_v1.jsonl",
+        "data/luma_stage_chatml_dialogue_v2.jsonl"
+      ],
+      "limit": 800
+    }
+  ]
+}

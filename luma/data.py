@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import random
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
-from .tokenizer import ByteTokenizer
+from .tokenizer import LUMATokenizer
+from .chat_format import assistant_start_marker, chatml
 
 
 NAMES = ["Mina", "Joon", "Ara", "Noah", "Yuna", "Sora", "Liam", "Eun"]
@@ -15,7 +17,35 @@ OBJECTS = ["blue key", "red notebook", "silver coin", "green map", "black card"]
 PLACES = ["busan", "seoul", "lab7", "mars room", "quiet library"]
 COLORS = ["cyan", "amber", "violet", "white", "orange"]
 ANIMALS = ["cat", "dog", "horse", "otter", "eagle"]
+WORDS = [
+    "amber", "brisk", "cedar", "delta", "ember", "fable", "glade", "harbor",
+    "ion", "juniper", "lumen", "mosaic", "nova", "onyx", "quartz", "raven",
+]
 IGNORE_INDEX = -100
+
+
+def _tokenizer_cache_tag(tokenizer: LUMATokenizer) -> str:
+    name = getattr(tokenizer, "name", tokenizer.__class__.__name__)
+    return f"{name}-v{tokenizer.vocab_size}"
+
+
+def _paths_cache_tag(paths: list[Path], max_records: int, extra: str) -> str:
+    h = hashlib.sha256()
+    h.update(extra.encode("utf-8"))
+    h.update(str(max_records).encode("utf-8"))
+    for path in paths:
+        stat = path.stat()
+        h.update(str(path.resolve()).encode("utf-8"))
+        h.update(str(stat.st_size).encode("utf-8"))
+        h.update(str(int(stat.st_mtime_ns)).encode("utf-8"))
+    return h.hexdigest()[:24]
+
+
+def _cache_path(cache_dir: Path | None, name: str, tag: str) -> Path | None:
+    if cache_dir is None:
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{name}-{tag}.pt"
 
 
 def make_memory_story(rng: random.Random) -> str:
@@ -52,7 +82,7 @@ def make_memory_story(rng: random.Random) -> str:
 
 @dataclass
 class SyntheticMemoryDataset:
-    tokenizer: ByteTokenizer
+    tokenizer: LUMATokenizer
     seq_len: int = 256
     seed: int = 17
 
@@ -67,6 +97,74 @@ class SyntheticMemoryDataset:
             rows.append(ids[start : start + self.seq_len + 1])
         x = torch.tensor([row[:-1] for row in rows], dtype=torch.long, device=device)
         y = torch.tensor([row[1:] for row in rows], dtype=torch.long, device=device)
+        return x, y
+
+
+def make_slot_proof_story(rng: random.Random, gap_lines: int = 8) -> tuple[str, str]:
+    name = rng.choice(NAMES)
+    obj = rng.choice(OBJECTS)
+    place = rng.choice(PLACES)
+    color = rng.choice(COLORS)
+    code = f"{rng.choice(['AX', 'LM', 'QK', 'NV'])}-{rng.randint(100, 999)}"
+    facts = {
+        "object": obj,
+        "place": place,
+        "color": color,
+        "code": code,
+    }
+    key, answer = rng.choice(list(facts.items()))
+    question = {
+        "object": f"What object belongs to {name}?",
+        "place": f"Where should {name} go?",
+        "color": f"What is {name}'s color?",
+        "code": f"What is {name}'s code?",
+    }[key]
+    gap = "\n".join(
+        "Irrelevant note: " + " ".join(rng.choice(WORDS) for _ in range(12)) + "."
+        for _ in range(gap_lines)
+    )
+    user = (
+        "Memory page:\n"
+        f"{name} owns the {obj}.\n"
+        f"{name} should go to {place}.\n"
+        f"{name}'s color is {color}.\n"
+        f"{name}'s code is {code}.\n"
+        f"{gap}\n"
+        f"Question: {question}"
+    )
+    return chatml("You are LUMA, a precise memory assistant.", user), answer
+
+
+@dataclass
+class SyntheticSlotProofDataset:
+    tokenizer: LUMATokenizer
+    seq_len: int = 512
+    gap_lines: int = 8
+    seed: int = 4242
+    records: int = 1_000_000
+
+    def batch(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        rng = random.Random(self.seed + random.randint(0, 10_000_000))
+        rows: list[list[int]] = []
+        labels: list[list[int]] = []
+        for _ in range(batch_size):
+            prompt, answer = make_slot_proof_story(rng, self.gap_lines)
+            prompt_ids = self.tokenizer.encode(prompt, add_bos=True, add_eos=False)
+            ids = self.tokenizer.encode(prompt + answer + "<|im_end|>\n", add_bos=True, add_eos=True)
+            if len(ids) < self.seq_len + 1:
+                ids.extend([self.tokenizer.pad_id] * (self.seq_len + 1 - len(ids)))
+            row = ids[: self.seq_len + 1]
+            label = row[1:].copy()
+            label = [IGNORE_INDEX if token_id == self.tokenizer.pad_id else token_id for token_id in label]
+            answer_start = min(len(prompt_ids), self.seq_len)
+            label = [
+                token_id if label_idx + 1 >= answer_start else IGNORE_INDEX
+                for label_idx, token_id in enumerate(label)
+            ]
+            rows.append(row)
+            labels.append(label)
+        x = torch.tensor([row[:-1] for row in rows], dtype=torch.long, device=device)
+        y = torch.tensor(labels, dtype=torch.long, device=device)
         return x, y
 
 
@@ -93,25 +191,42 @@ def _read_text_record(line: str) -> str:
     return stripped
 
 
-def _find_subsequence(values: list[int], needle: list[int]) -> int:
-    if not needle or len(needle) > len(values):
-        return -1
-    last = len(values) - len(needle)
-    for start in range(last + 1):
-        if values[start : start + len(needle)] == needle:
-            return start
-    return -1
+def _answer_start_token_index(tokenizer: LUMATokenizer, text: str) -> int | None:
+    marker = assistant_start_marker()
+    marker_idx = text.rfind(marker)
+    if marker_idx >= 0:
+        prefix = text[: marker_idx + len(marker)]
+        return len(tokenizer.encode(prefix, add_bos=True, add_eos=False))
+
+    for marker in ("\nAnswer:", "Answer:"):
+        marker_idx = text.rfind(marker)
+        if marker_idx >= 0:
+            prefix = text[: marker_idx + len(marker)]
+            return len(tokenizer.encode(prefix, add_bos=True, add_eos=False))
+    return None
 
 
 @dataclass
 class PackedTextDataset:
-    tokenizer: ByteTokenizer
+    tokenizer: LUMATokenizer
     paths: list[Path]
     seq_len: int = 512
     max_records: int = 0
     seed: int = 17
+    cache_dir: Path | None = Path("data/.luma_cache")
 
     def __post_init__(self) -> None:
+        tag = _paths_cache_tag(
+            self.paths,
+            self.max_records,
+            f"packed-seq{self.seq_len}-{_tokenizer_cache_tag(self.tokenizer)}",
+        )
+        cache = _cache_path(self.cache_dir, "packed", tag)
+        if cache is not None and cache.exists():
+            payload = torch.load(cache, map_location="cpu", weights_only=True)
+            self.ids = payload["ids"].long()
+            self.records = int(payload["records"])
+            return
         ids: list[int] = []
         records = 0
         for path in self.paths:
@@ -130,6 +245,8 @@ class PackedTextDataset:
             raise ValueError(f"not enough tokens loaded from {self.paths}: {len(ids)}")
         self.ids = torch.tensor(ids, dtype=torch.long)
         self.records = records
+        if cache is not None:
+            torch.save({"ids": self.ids, "records": self.records}, cache)
 
     def batch(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         high = len(self.ids) - self.seq_len - 1
@@ -141,16 +258,28 @@ class PackedTextDataset:
 
 @dataclass
 class RecordTextDataset:
-    tokenizer: ByteTokenizer
+    tokenizer: LUMATokenizer
     paths: list[Path]
     seq_len: int = 512
     max_records: int = 0
     answer_only: bool = False
+    cache_dir: Path | None = Path("data/.luma_cache")
 
     def __post_init__(self) -> None:
+        tag = _paths_cache_tag(
+            self.paths,
+            self.max_records,
+            f"records-seq{self.seq_len}-answer{int(self.answer_only)}-{_tokenizer_cache_tag(self.tokenizer)}",
+        )
+        cache = _cache_path(self.cache_dir, "records", tag)
+        if cache is not None and cache.exists():
+            payload = torch.load(cache, map_location="cpu", weights_only=True)
+            self.rows = payload["rows"].long()
+            self.labels = payload["labels"].long()
+            self.records = int(payload["records"])
+            return
         rows: list[list[int]] = []
         labels: list[list[int]] = []
-        answer_marker = self.tokenizer.encode("Answer:", add_bos=False, add_eos=False)
         for path in self.paths:
             with path.open("r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -158,19 +287,22 @@ class RecordTextDataset:
                     if not text:
                         continue
                     ids = self.tokenizer.encode(text + "\n")
+                    answer_start = 0
+                    if self.answer_only:
+                        maybe_answer_start = _answer_start_token_index(self.tokenizer, text)
+                        if maybe_answer_start is None:
+                            continue
+                        answer_start = maybe_answer_start
                     if len(ids) < self.seq_len + 1:
                         ids.extend([self.tokenizer.pad_id] * (self.seq_len + 1 - len(ids)))
                     row = ids[: self.seq_len + 1]
                     label = row[1:].copy()
                     label = [IGNORE_INDEX if token_id == self.tokenizer.pad_id else token_id for token_id in label]
-                    if self.answer_only:
-                        marker_pos = _find_subsequence(row, answer_marker)
-                        if marker_pos >= 0:
-                            answer_start = marker_pos + len(answer_marker)
-                            label = [
-                                token_id if label_idx + 1 >= answer_start else IGNORE_INDEX
-                                for label_idx, token_id in enumerate(label)
-                            ]
+                    if self.answer_only and answer_start:
+                        label = [
+                            token_id if label_idx + 1 >= answer_start else IGNORE_INDEX
+                            for label_idx, token_id in enumerate(label)
+                        ]
                     rows.append(row)
                     labels.append(label)
                     if self.max_records and len(rows) >= self.max_records:
@@ -182,9 +314,52 @@ class RecordTextDataset:
         self.rows = torch.tensor(rows, dtype=torch.long)
         self.labels = torch.tensor(labels, dtype=torch.long)
         self.records = len(rows)
+        if cache is not None:
+            torch.save({"rows": self.rows, "labels": self.labels, "records": self.records}, cache)
 
     def batch(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         idx = torch.randint(0, self.records, (batch_size,))
         rows = self.rows[idx].to(device=device, non_blocking=True)
         labels = self.labels[idx].to(device=device, non_blocking=True)
         return rows[:, :-1], labels
+
+
+@dataclass
+class WeightedMixedDataset:
+    components: list[tuple[str, object, float]]
+
+    def __post_init__(self) -> None:
+        if not self.components:
+            raise ValueError("WeightedMixedDataset requires at least one component")
+        weights = torch.tensor([max(0.0, float(weight)) for _, _, weight in self.components], dtype=torch.float)
+        if float(weights.sum()) <= 0:
+            raise ValueError("mixed dataset weights must sum to a positive value")
+        self.weights = weights / weights.sum()
+        self.records = sum(int(getattr(dataset, "records", 0)) for _, dataset, _ in self.components)
+
+    def summary(self) -> list[dict]:
+        return [
+            {
+                "name": name,
+                "weight": float(weight),
+                "records": int(getattr(dataset, "records", 0)),
+                "tokens": int(getattr(dataset, "rows", getattr(dataset, "ids", torch.empty(0))).numel()),
+            }
+            for (name, dataset, _), weight in zip(self.components, self.weights.tolist())
+        ]
+
+    def batch(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        choices = torch.multinomial(self.weights, batch_size, replacement=True)
+        xs: list[torch.Tensor] = []
+        ys: list[torch.Tensor] = []
+        for component_idx, (name, dataset, _) in enumerate(self.components):
+            count = int((choices == component_idx).sum().item())
+            if count == 0:
+                continue
+            x, y = dataset.batch(count, device)
+            xs.append(x)
+            ys.append(y)
+        x = torch.cat(xs, dim=0)
+        y = torch.cat(ys, dim=0)
+        order = torch.randperm(x.size(0), device=device)
+        return x.index_select(0, order), y.index_select(0, order)

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Neurova V6 — Quick start
 # Usage:
-#   bash neurova.sh                                # interactive Mamba-3 chat
+#   bash neurova.sh                                # SaneFlow streaming chat
 #   bash neurova.sh [mode]                         # legacy V6: bf16 | 4bit
+#   bash neurova.sh saneflow                       # SaneFlow streaming chat
+#   bash neurova.sh saneflow [chat|generate|eval|status|train] [prompt]
+#   NEUROVA_ALLOW_LUMA=1 bash neurova.sh luma [prompt]
 #   bash neurova.sh mamba3                         # interactive chat
 #   bash neurova.sh mamba3 [prompt]                # one-shot prompt
 #   bash neurova.sh mamba3 [chat|official|eval|bench|bench-mcq|bench-mmlu|bench-mmlu-redux|bench-suite|tune|status|diagnose|probe|serve|server-start|server-stop|server-restart|server-status|research-start|research-status|research-stop|research-logs|research-tail|research-hybrid-start|research-hybrid-status|research-hybrid-stop|research-hybrid-tail|teacher-research-start|teacher-research-status|teacher-research-stop|teacher-research-tail] [prompt]
@@ -10,7 +13,134 @@
 cd "$(dirname "$0")"
 
 if [[ $# -eq 0 ]]; then
-  set -- mamba3
+  set -- saneflow
+fi
+
+if [[ "${1:-}" == "luma" ]]; then
+  if [[ "${NEUROVA_ALLOW_LUMA:-0}" != "1" ]]; then
+    echo "LUMA is stopped and archived; it is not the active Neurova path." >&2
+    echo "Use NEUROVA_ALLOW_LUMA=1 only for explicit archive/debug runs." >&2
+    exit 2
+  fi
+  shift
+  LUMA_CHECKPOINT="${NEUROVA_LUMA_CHECKPOINT:-runs/luma_current/model.pt}"
+  if [[ ! -f "$LUMA_CHECKPOINT" ]]; then
+    echo "LUMA checkpoint not found." >&2
+    echo "Expected: ${NEUROVA_LUMA_CHECKPOINT:-runs/luma_current/model.pt}" >&2
+    echo "Promote a current strict-tokenizer checkpoint after training finishes." >&2
+    exit 2
+  fi
+  DEVICE="${NEUROVA_LUMA_DEVICE:-$(python3 - <<'PY'
+import torch
+print("cuda" if torch.cuda.is_available() else "cpu")
+PY
+)}"
+  MAX_NEW="${NEUROVA_LUMA_MAX_NEW:-160}"
+  CONTEXT="${NEUROVA_LUMA_CONTEXT:-512}"
+  TEMP="${NEUROVA_LUMA_TEMP:-0.75}"
+  TOP_K="${NEUROVA_LUMA_TOP_K:-40}"
+  TOP_P="${NEUROVA_LUMA_TOP_P:-0.9}"
+  REP="${NEUROVA_LUMA_REPETITION_PENALTY:-1.08}"
+  NO_REPEAT="${NEUROVA_LUMA_NO_REPEAT_NGRAM:-4}"
+  DTYPE="${NEUROVA_LUMA_DTYPE:-auto}"
+  if [[ $# -gt 0 ]]; then
+    exec python3 scripts/luma_chat.py \
+      --ckpt "$LUMA_CHECKPOINT" \
+      --device "$DEVICE" \
+      --dtype "$DTYPE" \
+      --max-new "$MAX_NEW" \
+      --context "$CONTEXT" \
+      --temperature "$TEMP" \
+      --top-k "$TOP_K" \
+      --top-p "$TOP_P" \
+      --repetition-penalty "$REP" \
+      --no-repeat-ngram "$NO_REPEAT" \
+      --prompt "$*"
+  fi
+  exec python3 scripts/luma_chat.py \
+    --ckpt "$LUMA_CHECKPOINT" \
+    --device "$DEVICE" \
+    --dtype "$DTYPE" \
+    --max-new "$MAX_NEW" \
+    --context "$CONTEXT" \
+    --temperature "$TEMP" \
+    --top-k "$TOP_K" \
+    --top-p "$TOP_P" \
+    --repetition-penalty "$REP" \
+    --no-repeat-ngram "$NO_REPEAT"
+fi
+
+if [[ "${1:-}" == "saneflow" ]]; then
+  shift
+  if [[ $# -eq 0 ]]; then
+    ACTION="chat"
+  else
+    ACTION="${1:-chat}"
+    case "$ACTION" in
+      chat|generate|eval|status|train)
+        shift || true
+        ;;
+      *)
+        ACTION="generate"
+        ;;
+    esac
+  fi
+
+  HOST="${NEUROVA_SANEFLOW_HOST:-ml-dmc8}"
+  ROOT="${NEUROVA_SANEFLOW_ROOT:-/home/user/workspace/neurova}"
+  ENV_NAME="${NEUROVA_SANEFLOW_ENV:-mamba3_siso}"
+  CHECKPOINT="${NEUROVA_SANEFLOW_CHECKPOINT:-runs/saneflow_current/model.pt}"
+  FALLBACK_CHECKPOINT="${NEUROVA_SANEFLOW_FALLBACK_CHECKPOINT:-runs/saneflow_chatml_sft_v9_assistant/model.pt}"
+  TRAINING_CHECKPOINT="${NEUROVA_SANEFLOW_TRAINING_CHECKPOINT:-runs/saneflow_fineweb_edu_base_v3_100m_muon_mem/latest.pt}"
+  PROMPT="${*:-Explain what a computer is in simple words:}"
+  MAX_NEW="${NEUROVA_SANEFLOW_MAX_NEW:-160}"
+  CONTEXT="${NEUROVA_SANEFLOW_CONTEXT:-256}"
+  TEMP="${NEUROVA_SANEFLOW_TEMP:-0.75}"
+  TOP_K="${NEUROVA_SANEFLOW_TOP_K:-40}"
+  TOP_P="${NEUROVA_SANEFLOW_TOP_P:-0.9}"
+  REP="${NEUROVA_SANEFLOW_REPETITION_PENALTY:-1.08}"
+  NO_REPEAT="${NEUROVA_SANEFLOW_NO_REPEAT_NGRAM_SIZE:-4}"
+  DTYPE="${NEUROVA_SANEFLOW_DTYPE:-bf16}"
+  DECODE_MODE="${NEUROVA_SANEFLOW_DECODE_MODE:-cache}"
+  CHATML_FLAG=""
+  if [[ "${NEUROVA_SANEFLOW_CHATML:-1}" == "1" ]]; then
+    CHATML_FLAG="--chatml"
+  fi
+
+  q() { printf "%q" "$1"; }
+  CHAT_PROMPT_FLAG=""
+  if [[ "$ACTION" == "chat" && $# -gt 0 ]]; then
+    CHAT_PROMPT_FLAG="--prompt $(q "$PROMPT")"
+  fi
+
+  remote_exec() {
+    local remote_cmd
+    remote_cmd="cd $(q "$ROOT") && source ~/miniconda3/etc/profile.d/conda.sh && conda activate $(q "$ENV_NAME") && $*"
+    if [[ "$HOST" == "local" || "$HOST" == "$(hostname)" ]]; then
+      bash -lc "$remote_cmd"
+    else
+      ssh "$HOST" "bash -lc $(q "$remote_cmd")"
+    fi
+  }
+
+  case "$ACTION" in
+    chat)
+      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python scripts/saneflow_chat.py --ckpt \"\$CKPT\" --max-new $(q "$MAX_NEW") --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --repetition-penalty $(q "$REP") --no-repeat-ngram-size $(q "$NO_REPEAT") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE") $CHATML_FLAG $CHAT_PROMPT_FLAG"
+      ;;
+    generate)
+      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python scripts/saneflow_generate.py --ckpt \"\$CKPT\" --prompt $(q "$PROMPT") --max-new $(q "$MAX_NEW") --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --repetition-penalty $(q "$REP") --no-repeat-ngram-size $(q "$NO_REPEAT") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE") $CHATML_FLAG"
+      ;;
+    eval)
+      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python scripts/saneflow_eval_prompts.py --ckpt \"\$CKPT\" --out runs/saneflow_latest_prompt_eval.json --max-new 80 --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE")"
+      ;;
+    status)
+      remote_exec "pgrep -af 'saneflow_train.py|saneflow_pipeline_dmc8.sh|saneflow_after_base_dmc8.sh|saneflow_standard_sft_after_base_dmc8.sh|saneflow_autoresearch_loop.sh' || true; python scripts/saneflow_researchctl_dmc8.sh status 2>/dev/null || true"
+      ;;
+    train)
+      remote_exec "chmod +x scripts/saneflow_researchctl_dmc8.sh scripts/saneflow_autoresearch_loop.sh; scripts/saneflow_researchctl_dmc8.sh start-auto"
+      ;;
+  esac
+  exit $?
 fi
 
 if [[ "${1:-}" == "mamba3" ]]; then

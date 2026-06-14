@@ -1,0 +1,71 @@
+{
+  "name": "saneflow-autonomous-research-program-v1",
+  "principles": [
+    "Keep exactly three active model lines; everything else is legacy or diagnostic.",
+    "Do not train SFT from a weak base. Pretrain first, then gate, then SFT.",
+    "Use config-driven data sources and builders; do not hardcode corpus paths inside training loops.",
+    "Promote checkpoints only by quality gate, not by loss alone.",
+    "Do not stop running training jobs during orchestration refactors."
+  ],
+  "active_lines": [
+    {
+      "id": "line_a_speak_chat",
+      "host": "ml-dmc8",
+      "gpu": 0,
+      "profiles": [
+        "dmc8-speak-base-v1",
+        "dmc8-chatml-sft-v9"
+      ],
+      "data_configs": [
+        "configs/saneflow_speak_pretrain_mix.json",
+        "configs/saneflow_chatml_sft_recipe.json"
+      ],
+      "policy": "train speak-base continuation, quality-gate it, then run assistant-only ChatML SFT and promote to runs/saneflow_current"
+    },
+    {
+      "id": "line_b_practical_base",
+      "host": "ml-dmc9",
+      "gpu": 0,
+      "profiles": [
+        "dmc9-practical-base-100m"
+      ],
+      "data_configs": [
+        "configs/saneflow_practical_pretrain_sources.json",
+        "configs/saneflow_practical_pretrain_mix.json"
+      ],
+      "policy": "train the best practical 100M-class base from verified high-quality continuation data before any SFT"
+    },
+    {
+      "id": "line_c_r_architecture",
+      "host": "ml-dmc9",
+      "gpu": 1,
+      "profiles": [
+        "dmc9-r-champion-delta-landmark-long",
+        "dmc9-r-champion-practical-cont"
+      ],
+      "data_configs": [
+        "configs/saneflow_training_curriculum.json"
+      ],
+      "policy": "continue the DeltaMatrix plus landmark architecture research line, then continue it on the practical base mix; keep research-only until generation gate passes"
+    }
+  ],
+  "promotion_targets": {
+    "interactive_default": "runs/saneflow_current/model.pt",
+    "speak_base": "runs/saneflow_speak_base_v1_100m/model.pt",
+    "chat": "runs/saneflow_chatml_sft_v9_assistant/model.pt",
+    "practical_base": "runs/saneflow_practical_pretrain_v1_100m_muon/model.pt",
+    "r_champion": "runs/saneflow_r_champion/d_delta_landmark_practical_cont/model.pt"
+  },
+  "quality_gates": {
+    "generation": {
+      "empty_output_rate_max": 0.05,
+      "invalid_output_rate_max": 0.02,
+      "max_repeated_4gram_max": 4,
+      "mean_distinct_1_min": 0.22,
+      "mean_distinct_2_min": 0.45
+    },
+    "reasoning": {
+      "status": "tracked separately; no benchmark-training contamination allowed"
+    }
+  }
+}

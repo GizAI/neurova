@@ -1,0 +1,40 @@
+{
+  "name": "saneflow_practical_pretrain_v1",
+  "train_out": "data/corpus/mixes/saneflow_practical_pretrain_v1/train.jsonl",
+  "valid_out": "data/corpus/mixes/saneflow_practical_pretrain_v1/valid.jsonl",
+  "manifest_out": "data/corpus/mixes/saneflow_practical_pretrain_v1/manifest.json",
+  "train_records": 120000,
+  "valid_records": 3000,
+  "sources": [
+    {
+      "name": "fineweb_edu_sample10bt",
+      "train": "data/corpus/sources/fineweb_edu_sample10bt/train.jsonl",
+      "valid": "data/corpus/sources/fineweb_edu_sample10bt/valid.jsonl",
+      "ratio": 0.45
+    },
+    {
+      "name": "dclm_baseline_v1",
+      "train": "data/corpus/sources/dclm_baseline_v1/train.jsonl",
+      "valid": "data/corpus/sources/dclm_baseline_v1/valid.jsonl",
+      "ratio": 0.25
+    },
+    {
+      "name": "gneissweb_v1",
+      "train": "data/corpus/sources/gneissweb_v1/train.jsonl",
+      "valid": "data/corpus/sources/gneissweb_v1/valid.jsonl",
+      "ratio": 0.15
+    },
+    {
+      "name": "fineweb2_hq_en",
+      "train": "data/corpus/sources/fineweb2_hq_en/train.jsonl",
+      "valid": "data/corpus/sources/fineweb2_hq_en/valid.jsonl",
+      "ratio": 0.10
+    },
+    {
+      "name": "fineweb2_hq_ko",
+      "train": "data/corpus/sources/fineweb2_hq_ko/train.jsonl",
+      "valid": "data/corpus/sources/fineweb2_hq_ko/valid.jsonl",
+      "ratio": 0.05
+    }
+  ]
+}

@@ -1,0 +1,196 @@
+{
+  "name": "saneflow-training-curriculum-v2",
+  "canonical_model_line": "SaneFlowLM",
+  "hard_constraints": {
+    "use_transformers_library_in_model": false,
+    "use_transformer_blocks": false,
+    "use_full_attention_matrix": false,
+    "use_mamba_kernels": false,
+    "promote_on_loss_only": false,
+    "train_on_mmlu_eval": false
+  },
+  "architecture": {
+    "tokenizer": "local byte-level BPE, 16K vocab",
+    "decode_policy": {
+      "default": "cache",
+      "diagnostic_fallback": "full",
+      "launcher_env": "NEUROVA_SANEFLOW_DECODE_MODE",
+      "quality_gate_artifact": "runs/saneflow_tinystories_v2/quality_gate_cache_v2.json",
+      "quality_gate_result": {
+        "checkpoint": "runs/saneflow_tinystories_v2/model.pt",
+        "valid_loss": 3.00390625,
+        "cache_avg_total_tok_s": 196.8472662737044,
+        "cache_avg_decode_tok_s": 225.59209066808035,
+        "full_short_avg_tok_s": 56.14197045430797,
+        "cache_full_argmax_match": 1.0,
+        "cache_full_max_abs_logit_diff": 0.0625,
+        "empty_output_rate": 0.0,
+        "invalid_output_rate": 0.0,
+        "max_repeated_4gram": 3
+      }
+    },
+    "core": [
+      "causal depthwise local conv",
+      "optional HERA-derived multi-kernel SyntaxMix v2",
+      "gated multi-timescale recurrent state",
+      "v2 erase/write decoupled state mixer",
+      "SwiGLU",
+      "tied LM head"
+    ],
+    "ablation_results": {
+      "syntax_mix_v2_600": {
+        "baseline_run": "runs/saneflow_ablation_syntax_v1_600",
+        "candidate_run": "runs/saneflow_ablation_syntax_v2_600",
+        "baseline_params": 10819346,
+        "candidate_params": 10853138,
+        "baseline_valid_loss_600": 3.582,
+        "candidate_valid_loss_600": 3.5586,
+        "baseline_avg_tok_s": 29.0,
+        "candidate_avg_tok_s": 29.1,
+        "verdict": "candidate positive on final short-run valid loss and speed-neutral; needs larger-run confirmation before becoming default"
+      }
+    },
+    "separate_architecture_track": {
+      "preserve_main_run": "runs/saneflow_fineweb_edu_base_v1",
+      "merge_rule": "merge only if same-data ablation improves validation loss and quality gate without cache parity or speed regression",
+      "candidates": {
+        "state_v2": {
+          "state_mixer_version": "v2",
+          "syntax_mix_version": "v1",
+          "role": "control"
+        },
+        "state_v2_stable": {
+          "state_mixer_version": "v2",
+          "state_clip": 8.0,
+          "state_zoneout": 0.02,
+          "role": "low-risk stabilization"
+        },
+        "delta_matrix": {
+          "state_mixer_version": "delta_matrix",
+          "state_clip": 8.0,
+          "role": "associative key-value recurrent memory"
+        },
+        "delta_matrix_syntax_v2": {
+          "state_mixer_version": "delta_matrix",
+          "state_clip": 8.0,
+          "syntax_mix_version": "v2",
+          "syntax_kernels": [3, 7, 15],
+          "role": "associative memory plus multi-kernel local syntax"
+        }
+      }
+    }
+  },
+  "data_tiers": {
+    "main_pretrain": [
+      {
+        "dataset": "HuggingFaceFW/fineweb-edu",
+        "config": "sample-10BT",
+        "target_train": "data/corpus/sources/fineweb_edu_sample10bt/train.jsonl",
+        "target_valid": "data/corpus/sources/fineweb_edu_sample10bt/valid.jsonl",
+        "target_tokenizer": "tokenizers/saneflow_fineweb_edu_16k",
+        "initial_subset_chars": [50000000, 200000000],
+        "role": "general_language_pretrain",
+        "prepared": {
+          "host": "ml-dmc8",
+          "train_rows": 39608,
+          "train_bytes": 200040125,
+          "train_sha256": "3dca4b9f4bcd1f8fd14172145c4840acbc4dd8c090a133250ba467dcea1124b7",
+          "valid_rows": 1016,
+          "valid_bytes": 5002473,
+          "valid_sha256": "3333097ca918256eba73d951d06ac976bac270f3c3f8587fdbd4d7bbdf3aaa1a",
+          "tokenizer_vocab_size": 16000,
+          "tokenizer_vocab_sha256": "1feec3f9f3fd7c9beab3401bcfb589959cc58ae4a0bdaa0f4d123f13d1ab60eb",
+          "tokenizer_merges_sha256": "a32a53a41fffe966db7593894a67bed1f9b599ab8ba5d10e680e04ed881abbd7"
+        }
+      }
+    ],
+    "explanation_expansion": [
+      {
+        "dataset": "Cosmopedia v2",
+        "role": "explanatory_continuation",
+        "mix_after_base_gate": "10-30%"
+      },
+      {
+        "dataset": "filtered textbook/explanation prose",
+        "role": "explanatory_continuation",
+        "mix_after_base_gate": "10-30%"
+      }
+    ],
+    "preserved_data_list": [
+      "data/saneflow/tinystories/train.jsonl",
+      "data/saneflow/tinystories/valid.jsonl",
+      "tokenizers/saneflow_tinystories_16k",
+      "runs/saneflow_tinystories_v2",
+      "data/saneflow/stage_b_prose_mix_v1/train.jsonl",
+      "data/saneflow/stage_b_prose_mix_v1/valid.jsonl"
+    ],
+    "sft_later": [
+      "data/luma_stage_natural_speak_raw_v2.jsonl",
+      "data/luma_stage_chatml_dialogue_v2.jsonl",
+      "data/luma_clean_chatml_sft_v1.jsonl",
+      "data/english_instruction_bootstrap.txt",
+      "data/train_dialogues.txt"
+    ],
+    "verifiable_later": [
+      "copy_phonebook_json_routing",
+      "no_cheat_mcq",
+      "held_out_code_math_verifier"
+    ],
+    "forbidden_for_base": [
+      "ChatML-only corpora as majority data",
+      "Answer-heavy corpora as majority data",
+      "slotproof/memory data before language prior",
+      "MMLU/MMLU-Redux eval data",
+      "collapsed checkpoint generations"
+    ]
+  },
+  "stages": [
+    {
+      "id": "stage_a_fineweb_edu_base_v1",
+      "goal": "General English continuation and simple explanatory behavior",
+      "data_mix": {
+        "fineweb_edu_sample10bt": 1.0
+      },
+      "candidate_config": {
+        "d_model": 384,
+        "layers": 8,
+        "heads": 6,
+        "d_ff": 1152,
+        "seq_len": 256,
+        "state_mixer_version": "v2"
+      },
+      "promotion_gate": [
+        "readable generic continuation",
+        "no repeated-token collapse",
+        "simple explanation prompt remains explanatory",
+        "short instruction prompt stays on instruction",
+        "prompt_eval artifact exists"
+      ]
+    },
+    {
+      "id": "stage_b_explanation_mix_v1",
+      "goal": "Short explanations and simple knowledge prose",
+      "data_mix": {
+        "fineweb_edu_replay": "70-90%",
+        "cosmopedia_or_filtered_explanation": "10-30%",
+        "plain_qa": "<=3%"
+      }
+    },
+    {
+      "id": "stage_c_minimal_sft_v1",
+      "goal": "Interactive assistant behavior",
+      "data_mix": {
+        "base_replay": "30-50%",
+        "answer_only_sft": "50-70%"
+      }
+    },
+    {
+      "id": "stage_d_verifiable_skills_v1",
+      "goal": "Copy, JSON, phonebook, MCQ and simple reasoning without benchmark contamination"
+    }
+  ],
+  "next_actions": [
+    "run stage_a_fineweb_edu_base_v1",
+    "gate with fixed prompt eval before any SFT"
+  ]
+}

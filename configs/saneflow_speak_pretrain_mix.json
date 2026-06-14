@@ -1,0 +1,56 @@
+{
+  "name": "saneflow_speak_pretrain_v1",
+  "description": "Continuation corpus for stable natural sentence generation before ChatML SFT.",
+  "train_out": "data/corpus/mixes/saneflow_speak_pretrain_v1/train.jsonl",
+  "valid_out": "data/corpus/mixes/saneflow_speak_pretrain_v1/valid.jsonl",
+  "manifest_out": "data/corpus/mixes/saneflow_speak_pretrain_v1/manifest.json",
+  "train_records": 70000,
+  "valid_records": 2000,
+  "max_scan_per_source": 120000,
+  "min_chars": 120,
+  "max_chars": 2400,
+  "sources": [
+    {
+      "name": "tinystories",
+      "path": "data/corpus/preserved/preserved/data__saneflow__tinystories__train.jsonl",
+      "ratio": 0.35,
+      "role": "coherent_short_story_language"
+    },
+    {
+      "name": "stage_b_prose",
+      "path": "data/corpus/preserved/preserved/data__saneflow__stage_b_prose_mix_v1__train.jsonl",
+      "ratio": 0.20,
+      "role": "short_prose_and_explanations"
+    },
+    {
+      "name": "fineweb_edu",
+      "path": "data/corpus/sources/fineweb_edu_sample10bt/train.jsonl",
+      "ratio": 0.20,
+      "role": "general_educational_web"
+    },
+    {
+      "name": "dclm_baseline",
+      "path": "data/corpus/sources/dclm_baseline_v1/train.jsonl",
+      "ratio": 0.15,
+      "role": "filtered_web_language"
+    },
+    {
+      "name": "no_cheat_knowledge",
+      "path": "data/corpus/verifiable_later/verified_skill/data__splits__no_cheat_knowledge_v1_train.jsonl",
+      "ratio": 0.10,
+      "role": "clean_knowledge_continuation"
+    }
+  ],
+  "synthetic_textbook": {
+    "enabled": true,
+    "ratio_floor_records": 300,
+    "topics": [
+      ["computers", "A computer follows instructions, stores information, and processes data. Programs tell the computer what steps to take."],
+      ["water", "Water is a clear liquid made of hydrogen and oxygen. Living things need water because cells use it to move nutrients and remove waste."],
+      ["the sky", "The sky often looks blue because molecules in the air scatter blue light from the sun more strongly than red light."],
+      ["books", "A book is a written work that can tell a story, explain an idea, or preserve information for another person to read later."],
+      ["learning", "Learning means changing what you know or can do after practice, feedback, or experience."],
+      ["addition", "Addition combines quantities. If you have two apples and get three more, you have five apples in total."]
+    ]
+  }
+}
