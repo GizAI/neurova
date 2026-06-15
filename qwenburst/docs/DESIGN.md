@@ -55,8 +55,35 @@ is low-bit projection, especially MLP `gate_proj`, `up_proj`, and `down_proj`.
 The current qwenburst kernel path is useful for correctness and controlled
 experiments, but 100+ emitted tok/s needs either:
 
-1. DFlash draft adapter accepting multiple tokens per qwenburst target verification, or
+1. a real block verifier inside `QwenBurstModel.forward_block`, backed by GDN
+   block scan and batched low-bit projection, and
 2. a much stronger low-bit dequant+MMA projection kernel.
+
+The DFlash adapter is now wired and can generate correct text, but it is not
+faster while `forward_block` internally verifies accepted tokens through the
+single-token recurrent path. DFlash only becomes a speed feature after the
+target verifier can process candidate blocks faster than one `forward_one` per
+emitted token.
+
+Latest dmc8 measurement, Qwen3.6-27B q3 target plus q3 DFlash draft:
+
+```text
+target-only, gpu embed/head: 6.10 tok/s
+DFlash block=4:             5.30 tok/s
+DFlash profile:
+  prefill: 2.15 s
+  draft:   0.60 s
+  verify:  1.78 s
+```
+
+This means draft overhead is visible, but the decisive blocker is target block
+verification: verify time is still essentially the same target work as normal
+decode. The next canonical optimization point is therefore `forward_block`, not
+another speculative wrapper.
+
+The default and only DFlash verification path is the early-stop verifier. Failed
+experimental verifier variants should not be kept as runtime options; new speed
+work must land behind `forward_block` itself.
 
 ## Correctness Policy
 

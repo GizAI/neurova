@@ -49,8 +49,10 @@ def main() -> None:
     ap.add_argument("--max-new-tokens", type=int, default=32)
     ap.add_argument("--recent-window", type=int, default=256)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--gpu-embed-head", action="store_true")
+    ap.add_argument("--gpu-embed-head", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--cpu-embed", action="store_true", help="offload only token embeddings to CPU if 16GB VRAM is too tight")
     ap.add_argument("--block-size", type=int, default=None)
+    ap.add_argument("--profile", action="store_true")
     args = ap.parse_args()
 
     cfg = Qwen36_27B_TextConfig.from_hf_config(args.hf_model)
@@ -60,8 +62,8 @@ def main() -> None:
 
     weight_device = choose_weight_device(args.qb_model, "auto", args.device)
     store = QuantizedStore(args.qb_model, device=weight_device)
-    embed_store = None if args.gpu_embed_head else QuantizedStore(args.qb_model, device="cpu")
-    head_store = None if args.gpu_embed_head else QuantizedStore(args.qb_model, device="cpu")
+    embed_store = QuantizedStore(args.qb_model, device="cpu") if args.cpu_embed else None
+    head_store = None
     model = QwenBurstModel(store, cfg=cfg, device=args.device, embed_store=embed_store, head_store=head_store)
     draft = DFlashDraftAdapter.from_lowbit_dir(args.dflash_draft_dir, device=args.device)
 
@@ -82,6 +84,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         eos_token_ids=eos,
         block_size=args.block_size,
+        profile=args.profile,
     ):
         dflash_ids.append(tid)
         accepted.append(acc_len)
@@ -96,6 +99,8 @@ def main() -> None:
     print(f"dflash generated={len(dflash_ids)} elapsed={dflash_dt:.3f}s tok/s={len(dflash_ids)/dflash_dt:.2f}")
     if accepted:
         print(f"dflash_accept avg={sum(accepted)/len(accepted):.2f} max={max(accepted)} steps={len(accepted)}")
+    if args.profile:
+        print("dflash_profile", draft.last_stats)
     print(f"speedup={((len(dflash_ids)/dflash_dt)/(len(base_ids)/base_dt) if base_ids and dflash_ids else 0):.3f}x")
 
 

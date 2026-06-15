@@ -47,6 +47,7 @@ def get_extensions():
     sources = [
         "csrc/qwenburst_ext.cpp",
         "csrc/lowbit_gemv.cu",
+        "csrc/marlin_cuda_kernel.cu",
         "csrc/rmsnorm.cu",
         "csrc/gdn_recurrent.cu",
         "csrc/attention_decode.cu",

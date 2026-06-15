@@ -1,7 +1,70 @@
 #include <torch/extension.h>
 #include "kernels.cuh"
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 
 namespace py = pybind11;
+
+int marlin_cuda(
+  const void* A,
+  const void* B,
+        void* C,
+        void* s,
+  int prob_m,
+  int prob_n,
+  int prob_k,
+  void* workspace,
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 16
+);
+
+torch::Tensor lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size) {
+  QB_CHECK_CUDA(qweight); QB_CHECK_CUDA(scales); QB_CHECK_CUDA(x);
+  QB_CHECK_CONTIGUOUS(qweight); QB_CHECK_CONTIGUOUS(scales); QB_CHECK_CONTIGUOUS(x);
+  TORCH_CHECK(qweight.scalar_type() == at::kInt, "marlin qweight must be int32");
+  QB_CHECK_HALF(scales); QB_CHECK_HALF(x);
+  TORCH_CHECK(x.dim() == 2, "x must be [batch, cols]");
+  TORCH_CHECK(x.size(1) == cols, "x cols mismatch");
+  TORCH_CHECK(cols % 128 == 0, "Marlin requires K divisible by 128");
+  const int prob_m = static_cast<int>(x.size(0));
+  const int prob_k = static_cast<int>(cols);
+  TORCH_CHECK(qweight.dim() == 2 && qweight.size(0) == prob_k / 16, "marlin qweight must be [K/16, N*2]");
+  TORCH_CHECK(qweight.size(1) % 2 == 0, "marlin qweight second dim must be N*2");
+  const int prob_n = static_cast<int>(qweight.size(1) / 2);
+  TORCH_CHECK(prob_n % 256 == 0, "Marlin requires N divisible by 256");
+  TORCH_CHECK(scales.dim() == 2 && scales.size(1) == prob_n, "marlin scales must be [K/group, N]");
+  int groupsize = static_cast<int>(group_size);
+  if (groupsize <= 0 || groupsize == prob_k) groupsize = -1;
+  TORCH_CHECK(groupsize == -1 || (groupsize == 128 && scales.size(0) == prob_k / groupsize), "Marlin supports group_size -1 or 128");
+  auto y = torch::empty({prob_m, prob_n}, x.options());
+  constexpr int max_par = 16;
+  auto workspace = torch::zeros({prob_n / 128 * max_par}, torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
+  const int dev = x.get_device();
+  int err = marlin_cuda(
+    x.data_ptr(),
+    qweight.data_ptr(),
+    y.data_ptr(),
+    scales.data_ptr(),
+    prob_m,
+    prob_n,
+    prob_k,
+    workspace.data_ptr(),
+    groupsize,
+    dev,
+    at::cuda::getCurrentCUDAStream(dev),
+    -1,
+    -1,
+    -1,
+    max_par
+  );
+  TORCH_CHECK(err == 0, "Marlin kernel failed with code ", err);
+  return y;
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "QwenBurst CUDA kernels";
@@ -27,12 +90,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("group_size"),
         py::arg("bits"),
         py::arg("rows_per_cta") = 8);
+  m.def("lowbit_gemm", &lowbit_gemm,
+        "Groupwise symmetric low-bit GEMM: y = x @ dequant(qweight, scales, bits).T",
+        py::arg("qweight"),
+        py::arg("scales"),
+        py::arg("x"),
+        py::arg("cols"),
+        py::arg("group_size"),
+        py::arg("bits"),
+        py::arg("rows_per_cta") = 8);
+  m.def("lowbit_marlin_gemm", &lowbit_marlin_gemm,
+        "Marlin W4A16 GEMM: y = x @ dequant(qweight, scales).T",
+        py::arg("qweight"),
+        py::arg("scales"),
+        py::arg("x"),
+        py::arg("cols"),
+        py::arg("group_size"));
   m.def("rmsnorm", &rmsnorm, "RMSNorm fp16");
   m.def("rmsnorm_qwen", &rmsnorm_qwen, "Qwen RMSNorm fp16 using 1+weight");
   m.def("rmsnorm_silu_gate", &rmsnorm_silu_gate, "RMSNorm followed by SiLU gate fp16");
   m.def("rmsnorm_qwen_silu_gate", &rmsnorm_qwen_silu_gate, "Qwen RMSNorm followed by SiLU gate fp16");
   m.def("gdn_recurrent", &gdn_recurrent,
         "Single-token Qwen-style recurrent gated delta rule, state updated in-place");
+  m.def("gdn_recurrent_scan", &gdn_recurrent_scan,
+        "Block Qwen-style recurrent gated delta scan, state updated in-place");
   m.def("attention_decode_fp16", &attention_decode_fp16,
         "Small/medium context fp16 decode attention baseline");
   m.def("argmax", &argmax, "GPU argmax over a 1D fp16/fp32 logits tensor");

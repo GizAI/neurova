@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -9,7 +10,7 @@ from typing import Any, Iterable
 import torch
 import torch.nn.functional as F
 
-from .loader import QuantizedStore, LowBitTensor, FP16Tensor
+from .loader import QuantizedStore, LowBitTensor, LowBitMarlinTensor, FP16Tensor
 from .model import WeightResolver, embed_lookup, linear_any
 from .quantize import quantize_symmetric_lowbit, write_array
 from .state import DecodeState
@@ -202,6 +203,7 @@ class DFlashDraftAdapter:
         self.hidden_norm = self.weights.fp16("hidden_norm.weight")
         self.norm = self.weights.fp16("norm.weight")
         self.layers = [DFlashDraftLayer(self.cfg, self.weights, i, self.device) for i in range(self.cfg.num_hidden_layers)]
+        self.last_stats: dict[str, float | int] = {}
 
     @classmethod
     def from_lowbit_dir(cls, path: str | Path, device: str | torch.device = "cuda") -> "DFlashDraftAdapter":
@@ -249,11 +251,15 @@ class DFlashDraftAdapter:
         max_new_tokens: int,
         eos_token_ids: tuple[int, ...] = (),
         block_size: int | None = None,
+        profile: bool = False,
     ):
         if not prompt_ids:
             raise ValueError("prompt_ids must not be empty")
         target_hidden_history: list[torch.Tensor] = []
         logits = None
+        if profile and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        t_prefill = time.perf_counter()
         for tid in prompt_ids:
             logits, taps = target_model.forward_one(
                 tid,
@@ -266,43 +272,66 @@ class DFlashDraftAdapter:
         next_id = int(torch.argmax(logits, dim=-1).item())
         produced = 0
         accepted_lengths: list[int] = []
+        stats: dict[str, float | int] = {
+            "prefill_s": 0.0,
+            "draft_s": 0.0,
+            "verify_s": 0.0,
+            "steps": 0,
+            "accepted_sum": 0,
+            "accepted_max": 0,
+        }
         runtime_block_size = int(block_size or self.cfg.block_size)
         if runtime_block_size < 2 or runtime_block_size > self.cfg.block_size:
             raise ValueError(f"block_size must be in [2, {self.cfg.block_size}], got {runtime_block_size}")
+        if profile and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        stats["prefill_s"] = time.perf_counter() - t_prefill
         while produced < max_new_tokens:
             if eos_token_ids and next_id in eos_token_ids:
                 break
-            block = [next_id] + [self.cfg.mask_token_id] * (runtime_block_size - 1)
-            draft_logits = self.forward_block(block, target_hidden_history, target_model, logits_start=1 - runtime_block_size)
-            draft_ids = torch.argmax(draft_logits, dim=-1).detach().tolist()
+            step_block_size = min(runtime_block_size, max_new_tokens - produced)
+            block = [next_id] + [self.cfg.mask_token_id] * (step_block_size - 1)
+            if profile and self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t_draft = time.perf_counter()
+            draft_logits = self.forward_block(block, target_hidden_history, target_model, logits_start=1 - step_block_size)
+            draft_ids = torch.argmax(draft_logits, dim=-1).detach().tolist()[: step_block_size - 1]
+            if profile and self.device.type == "cuda":
+                torch.cuda.synchronize()
+            stats["draft_s"] = float(stats["draft_s"]) + (time.perf_counter() - t_draft)
             for i, tid in enumerate(draft_ids, start=1):
                 block[i] = int(tid)
 
-            verified = target_model.forward_block(block, state, hidden_tap_layers=self.target_layer_ids)
-            accepted = 0
-            next_id_after_commit: int | None = None
-            for i, (logits_i, taps_i) in enumerate(zip(verified.logits, verified.hidden_taps)):
-                pred = int(torch.argmax(logits_i, dim=-1).item())
-                if i == len(block) - 1:
-                    next_id_after_commit = pred
-                    break
-                if int(block[i + 1]) != pred:
-                    next_id_after_commit = pred
-                    break
-                accepted += 1
-
+            if profile and self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t_verify = time.perf_counter()
+            verified = target_model.forward_block(
+                block,
+                state,
+                hidden_tap_layers=self.target_layer_ids,
+                expected_next_tokens=block[1:],
+                commit=True,
+            )
+            if profile and self.device.type == "cuda":
+                torch.cuda.synchronize()
+            stats["verify_s"] = float(stats["verify_s"]) + (time.perf_counter() - t_verify)
+            accepted = verified.accepted_next
+            stats["steps"] = int(stats["steps"]) + 1
+            stats["accepted_sum"] = int(stats["accepted_sum"]) + accepted + 1
+            stats["accepted_max"] = max(int(stats["accepted_max"]), accepted + 1)
             commit_n = min(accepted + 1, max_new_tokens - produced)
-            committed = target_model.forward_block(block[:commit_n], state, hidden_tap_layers=self.target_layer_ids, commit=True)
             for i in range(commit_n):
-                target_hidden_history.append(torch.cat([t.detach() for t in committed.hidden_taps[i]], dim=0))
+                target_hidden_history.append(torch.cat([t.detach() for t in verified.hidden_taps[i]], dim=0))
                 produced += 1
                 yield int(block[i]), accepted + 1
                 if eos_token_ids and int(block[i]) in eos_token_ids:
+                    self.last_stats = stats
                     return
             accepted_lengths.append(accepted + 1)
-            if next_id_after_commit is None:
+            if not verified.next_ids:
                 raise RuntimeError("DFlash verification did not produce a next token")
-            next_id = next_id_after_commit
+            next_id = verified.next_ids[min(accepted, len(verified.next_ids) - 1)]
+        self.last_stats = stats
 
 
 def _rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -311,9 +340,21 @@ def _rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return (y * weight.to(device=x.device, dtype=torch.float32)).to(x.dtype)
 
 
-def _linear_seq(w: LowBitTensor | FP16Tensor, x: torch.Tensor, device: torch.device) -> torch.Tensor:
+def _linear_seq(w: LowBitTensor | LowBitMarlinTensor | FP16Tensor, x: torch.Tensor, device: torch.device) -> torch.Tensor:
+    device = torch.device(device)
     if x.ndim == 1:
         return linear_any(w, x)
+    if isinstance(w, (LowBitTensor, LowBitMarlinTensor)):
+        if isinstance(w, LowBitMarlinTensor) and w.qweight.device.type != device.type:
+            raise RuntimeError("Marlin tensors must be loaded on the target CUDA device")
+        target_device = w.qweight.device if isinstance(w, LowBitMarlinTensor) else device
+        if w.qweight.device != target_device:
+            q = w.qweight.to(device, non_blocking=True).contiguous()
+            s = w.scales.to(device, non_blocking=True).contiguous()
+            w = LowBitTensor(name=w.name, qweight=q, scales=s, cols=w.cols, group_size=w.group_size, bits=w.bits)
+        return w.gemm(x.to(device=target_device, dtype=torch.float16).contiguous())
+    if isinstance(w, FP16Tensor):
+        return torch.matmul(x.to(device=device, dtype=w.value.dtype), w.value.to(device=device).t())
     return torch.stack([linear_any(w, row.to(device)) for row in x], dim=0)
 
 

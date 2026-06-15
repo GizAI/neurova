@@ -223,6 +223,20 @@ class DecodeState:
         self.attn_v[layer][:, idx, :] = v
         return idx
 
+    def append_attention_kv_at(self, layer: int, k: torch.Tensor, v: torch.Tensor, *, logical_pos: int) -> int:
+        """Write KV for block verification without mutating global position."""
+        if self.kv_window_policy == "ring":
+            idx = logical_pos % self.max_seq_len
+        elif logical_pos < self.max_seq_len:
+            idx = logical_pos
+        elif self.kv_window_policy == "error":
+            raise RuntimeError(f"attention KV window is full at {self.max_seq_len} tokens")
+        else:
+            idx = self.max_seq_len - 1
+        self.attn_k[layer][:, idx, :] = k
+        self.attn_v[layer][:, idx, :] = v
+        return idx
+
     def attention_kv_view(self, layer: int) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Return KV in logical oldest→newest order for baseline attention.
 
@@ -234,6 +248,18 @@ class DecodeState:
         if self.kv_window_policy != "ring" or self.kv_len < self.max_seq_len:
             return self.attn_k[layer], self.attn_v[layer], live
         start = (self.pos + 1) % self.max_seq_len
+        if start == 0:
+            return self.attn_k[layer], self.attn_v[layer], live
+        k = torch.cat([self.attn_k[layer][:, start:, :], self.attn_k[layer][:, :start, :]], dim=1)
+        v = torch.cat([self.attn_v[layer][:, start:, :], self.attn_v[layer][:, :start, :]], dim=1)
+        return k, v, live
+
+    def attention_kv_view_at(self, layer: int, *, logical_pos: int, live_len: int) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Return KV view after a block-local write at `logical_pos`."""
+        live = min(live_len, self.max_seq_len)
+        if self.kv_window_policy != "ring" or live < self.max_seq_len:
+            return self.attn_k[layer], self.attn_v[layer], live
+        start = (logical_pos + 1) % self.max_seq_len
         if start == 0:
             return self.attn_k[layer], self.attn_v[layer], live
         k = torch.cat([self.attn_k[layer][:, start:, :], self.attn_k[layer][:, :start, :]], dim=1)

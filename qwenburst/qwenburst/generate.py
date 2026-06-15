@@ -112,6 +112,8 @@ def choose_weight_device(qb_model: Path, requested: str, runtime_device: str) ->
     import json
 
     index = json.loads((qb_model / "qwenburst_index.json").read_text(encoding="utf-8"))
+    if any(meta.get("kind") == "lowbit_marlin_groupwise" for meta in index.get("tensors", {}).values()):
+        return runtime_device
     bits = {
         int(meta["bits"])
         for meta in index.get("tensors", {}).values()
@@ -134,15 +136,16 @@ def main() -> None:
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--stats", action="store_true", help="print prefill/decode timing to stderr")
     ap.add_argument("--weight-device", choices=("auto", "cpu", "cuda"), default="auto", help="where low-bit layer weights live between matvecs")
-    ap.add_argument("--gpu-embed-head", action="store_true", help="keep embedding/lm_head on GPU; faster but may exceed 16GB")
+    ap.add_argument("--gpu-embed-head", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--cpu-embed", action="store_true", help="offload only token embeddings to CPU if 16GB VRAM is too tight")
     args = ap.parse_args()
 
     cfg = Qwen36_27B_TextConfig.from_hf_config(args.hf_model) if (args.hf_model / "config.json").exists() else Qwen36_27B_TextConfig()
     tokenizer = load_tokenizer(args.hf_model)
     weight_device = choose_weight_device(args.qb_model, args.weight_device, args.device)
     store = QuantizedStore(args.qb_model, device=weight_device)
-    embed_store = None if args.gpu_embed_head else QuantizedStore(args.qb_model, device="cpu")
-    head_store = None if args.gpu_embed_head else QuantizedStore(args.qb_model, device="cpu")
+    embed_store = QuantizedStore(args.qb_model, device="cpu") if args.cpu_embed else None
+    head_store = None
     model = QwenBurstModel(store, cfg=cfg, device=args.device, embed_store=embed_store, head_store=head_store)
     state = DecodeState.allocate(cfg, max_seq_len=args.recent_window, device=args.device, kv_window_policy="ring")
     runner = QwenBurstGenerator(model, state)

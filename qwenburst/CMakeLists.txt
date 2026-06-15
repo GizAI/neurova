@@ -8,6 +8,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_library(qwenburst_kernels STATIC
   csrc/lowbit_gemv.cu
+  csrc/marlin_cuda_kernel.cu
   csrc/rmsnorm.cu
   csrc/gdn_recurrent.cu
   csrc/attention_decode.cu

@@ -22,6 +22,8 @@
 
 // Launchers exposed through pybind.
 torch::Tensor lowbit_gemv(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size, int64_t bits, int64_t rows_per_cta);
+torch::Tensor lowbit_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size, int64_t bits, int64_t rows_per_cta);
+torch::Tensor lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size);
 std::vector<torch::Tensor> lowbit_gemv_pair(
     torch::Tensor qweight_a,
     torch::Tensor scales_a,
@@ -38,6 +40,7 @@ torch::Tensor rmsnorm_qwen(torch::Tensor x, torch::Tensor weight, double eps);
 torch::Tensor rmsnorm_silu_gate(torch::Tensor x, torch::Tensor weight, torch::Tensor gate, double eps);
 torch::Tensor rmsnorm_qwen_silu_gate(torch::Tensor x, torch::Tensor weight, torch::Tensor gate, double eps);
 torch::Tensor gdn_recurrent(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, torch::Tensor beta, torch::Tensor state);
+torch::Tensor gdn_recurrent_scan(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, torch::Tensor beta, torch::Tensor state);
 torch::Tensor attention_decode_fp16(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, int64_t seq_len, double softmax_scale);
 torch::Tensor argmax(torch::Tensor logits);
 torch::Tensor argmax_many(torch::Tensor logits);

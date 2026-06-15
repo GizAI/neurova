@@ -46,6 +46,53 @@ class LowBitTensor:
             row = row.to(device=self.qweight.device, dtype=torch.long).reshape(())
         return ops.lowbit_row_dequant(self.qweight, self.scales, row, self.cols, self.group_size, self.bits)
 
+    def gemm(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError("gemm expects x [batch, cols]")
+        if self.qweight.device.type == "cuda":
+            ops = cuda_ops()
+            return ops.lowbit_gemm(
+                self.qweight,
+                self.scales,
+                x.contiguous(),
+                self.cols,
+                self.group_size,
+                self.bits,
+                lowbit_rows_per_cta(),
+            )
+        dense = dequantize_lowbit_rows(self.qweight, self.scales, self.cols, self.group_size, self.bits)
+        return torch.matmul(x.contiguous().to(device=dense.device, dtype=dense.dtype), dense.t()).to(x.device)
+
+
+@dataclass
+class LowBitMarlinTensor:
+    name: str
+    qweight: torch.Tensor
+    scales: torch.Tensor
+    cols: int
+    group_size: int
+    bits: int = 4
+    exec_bits: int = 4
+
+    def gemv(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gemm(x.reshape(1, -1).contiguous()).reshape(-1)
+
+    def gemm(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2:
+            raise ValueError("gemm expects x [batch, cols]")
+        if self.qweight.device.type != "cuda":
+            raise RuntimeError("Marlin tensors require CUDA")
+        return cuda_ops().lowbit_marlin_gemm(
+            self.qweight,
+            self.scales,
+            x.to(device=self.qweight.device, dtype=torch.float16).contiguous(),
+            self.cols,
+            self.group_size,
+        )
+
+    def row_dequant(self, row: int | torch.Tensor) -> torch.Tensor:
+        raise RuntimeError("Marlin layout does not support row_dequant; keep embeddings in rowwise layout")
+
 
 def dequantize_lowbit_row(
     qweight: torch.Tensor,
@@ -102,9 +149,9 @@ class QuantizedStore:
         with open(self.root / "qwenburst_index.json", "r", encoding="utf-8") as f:
             self.index = json.load(f)
         self.device = torch.device(device)
-        self.cache: dict[str, LowBitTensor | FP16Tensor] = {}
+        self.cache: dict[str, LowBitTensor | LowBitMarlinTensor | FP16Tensor] = {}
 
-    def tensor(self, name: str) -> LowBitTensor | FP16Tensor:
+    def tensor(self, name: str) -> LowBitTensor | LowBitMarlinTensor | FP16Tensor:
         if name in self.cache:
             return self.cache[name]
         meta = self.index["tensors"][name]
@@ -119,6 +166,24 @@ class QuantizedStore:
             q = torch.from_numpy(np.array(q_np, copy=True)).to(self.device, non_blocking=True).contiguous()
             s = torch.from_numpy(np.array(s_np, copy=True)).to(self.device, non_blocking=True).contiguous()
             obj = LowBitTensor(name=name, qweight=q, scales=s, cols=meta["cols"], group_size=meta["group_size"], bits=bits)
+        elif meta["kind"] == "lowbit_marlin_groupwise":
+            rows = meta["cols"] // 16
+            packed_cols = meta["packed_cols"]
+            n_groups = meta["n_groups"]
+            out_rows = meta["rows"]
+            q_np = np.memmap(self.root / meta["qweight"], dtype=np.int32, mode="r", shape=(rows, packed_cols))
+            s_np = np.memmap(self.root / meta["scales"], dtype=np.float16, mode="r", shape=(n_groups, out_rows))
+            q = torch.from_numpy(np.array(q_np, copy=True)).to(self.device, non_blocking=True).contiguous()
+            s = torch.from_numpy(np.array(s_np, copy=True)).to(self.device, non_blocking=True).contiguous()
+            obj = LowBitMarlinTensor(
+                name=name,
+                qweight=q,
+                scales=s,
+                cols=meta["cols"],
+                group_size=meta["group_size"],
+                bits=int(meta.get("bits", 4)),
+                exec_bits=int(meta.get("exec_bits", 4)),
+            )
         elif meta["kind"] == "fp16_raw":
             arr = np.memmap(self.root / meta["path"], dtype=np.float16, mode="r", shape=tuple(meta["shape"]))
             val = torch.from_numpy(np.array(arr, copy=True)).to(self.device, non_blocking=True).contiguous()

@@ -44,6 +44,7 @@ class QwenBurstEngine:
     recent_window: int
     weight_device: str
     gpu_embed_head: bool
+    cpu_embed: bool
     model_name: str
     draft_adapter: DFlashDraftAdapter | None = None
 
@@ -52,8 +53,8 @@ class QwenBurstEngine:
         self.tokenizer = load_tokenizer(self.hf_model)
         resolved_weight_device = choose_weight_device(self.qb_model, self.weight_device, self.device)
         store = QuantizedStore(self.qb_model, device=resolved_weight_device)
-        embed_store = None if self.gpu_embed_head else QuantizedStore(self.qb_model, device="cpu")
-        head_store = None if self.gpu_embed_head else QuantizedStore(self.qb_model, device="cpu")
+        embed_store = QuantizedStore(self.qb_model, device="cpu") if self.cpu_embed else None
+        head_store = None
         self.model = QwenBurstModel(store, cfg=self.cfg, device=self.device, embed_store=embed_store, head_store=head_store)
         self.lock = threading.Lock()
 
@@ -206,7 +207,8 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--recent-window", type=int, default=8192)
     ap.add_argument("--weight-device", choices=("auto", "cpu", "cuda"), default="auto")
-    ap.add_argument("--gpu-embed-head", action="store_true")
+    ap.add_argument("--gpu-embed-head", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--cpu-embed", action="store_true", help="offload only token embeddings to CPU if 16GB VRAM is too tight")
     ap.add_argument("--speculative-backend", choices=("none", "dflash"), default="none")
     ap.add_argument("--draft-model", default="z-lab/Qwen3.6-27B-DFlash")
     ap.add_argument("--dflash-draft-dir", type=Path, default=None, help="converted qwenburst low-bit DFlash draft directory")
@@ -238,6 +240,7 @@ def main() -> None:
         recent_window=args.recent_window,
         weight_device=args.weight_device,
         gpu_embed_head=args.gpu_embed_head,
+        cpu_embed=args.cpu_embed,
         model_name=args.model_name,
         draft_adapter=draft_adapter,
     )

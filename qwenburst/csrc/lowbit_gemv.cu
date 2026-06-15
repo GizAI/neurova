@@ -142,6 +142,87 @@ __global__ void lowbit_gemv_pair_kernel(
   }
 }
 
+template<int BITS, int BLOCK, int ROWS_PER_CTA, int BATCH_TILE>
+__global__ void lowbit_gemm_kernel(
+    const uint8_t* __restrict__ qweight,
+    const half* __restrict__ scales,
+    const half* __restrict__ x,
+    half* __restrict__ y,
+    int batch,
+    int rows,
+    int cols,
+    int packed_cols,
+    int n_groups,
+    int group_size) {
+  const int row0 = blockIdx.x * ROWS_PER_CTA;
+  const int batch0 = blockIdx.y * BATCH_TILE;
+  const int tid = threadIdx.x;
+
+  float acc[ROWS_PER_CTA][BATCH_TILE];
+  #pragma unroll
+  for (int rr = 0; rr < ROWS_PER_CTA; ++rr) {
+    #pragma unroll
+    for (int bb = 0; bb < BATCH_TILE; ++bb) acc[rr][bb] = 0.0f;
+  }
+
+  for (int c = tid; c < cols; c += BLOCK) {
+    const int group = c / group_size;
+    #pragma unroll
+    for (int rr = 0; rr < ROWS_PER_CTA; ++rr) {
+      const int row = row0 + rr;
+      if (row < rows) {
+        const uint8_t* qw = qweight + static_cast<int64_t>(row) * packed_cols;
+        const int q = qb_lowbit_value<BITS>(qw, c);
+        const float s = __half2float(scales[static_cast<int64_t>(row) * n_groups + group]);
+        const float wv = static_cast<float>(q) * s;
+        #pragma unroll
+        for (int bb = 0; bb < BATCH_TILE; ++bb) {
+          const int b = batch0 + bb;
+          if (b < batch) {
+            const float xv = __half2float(x[static_cast<int64_t>(b) * cols + c]);
+            acc[rr][bb] += wv * xv;
+          }
+        }
+      }
+    }
+  }
+
+  __shared__ float smem[ROWS_PER_CTA][BATCH_TILE][BLOCK];
+  #pragma unroll
+  for (int rr = 0; rr < ROWS_PER_CTA; ++rr) {
+    #pragma unroll
+    for (int bb = 0; bb < BATCH_TILE; ++bb) smem[rr][bb][tid] = acc[rr][bb];
+  }
+  __syncthreads();
+
+  for (int stride = BLOCK / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      #pragma unroll
+      for (int rr = 0; rr < ROWS_PER_CTA; ++rr) {
+        #pragma unroll
+        for (int bb = 0; bb < BATCH_TILE; ++bb) {
+          smem[rr][bb][tid] += smem[rr][bb][tid + stride];
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    #pragma unroll
+    for (int rr = 0; rr < ROWS_PER_CTA; ++rr) {
+      const int row = row0 + rr;
+      if (row < rows) {
+        #pragma unroll
+        for (int bb = 0; bb < BATCH_TILE; ++bb) {
+          const int b = batch0 + bb;
+          if (b < batch) y[static_cast<int64_t>(b) * rows + row] = __float2half_rn(smem[rr][bb][0]);
+        }
+      }
+    }
+  }
+}
+
 template<int BITS>
 __global__ void lowbit_row_dequant_kernel(
     const uint8_t* __restrict__ qweight,
@@ -311,6 +392,54 @@ std::vector<torch::Tensor> lowbit_gemv_pair(
     case 6: return dispatch_lowbit_gemv_pair_rows<6>(qweight_a, scales_a, qweight_b, scales_b, x, cols, group_size, rows_per_cta);
     case 7: return dispatch_lowbit_gemv_pair_rows<7>(qweight_a, scales_a, qweight_b, scales_b, x, cols, group_size, rows_per_cta);
     case 8: return dispatch_lowbit_gemv_pair_rows<8>(qweight_a, scales_a, qweight_b, scales_b, x, cols, group_size, rows_per_cta);
+    default: TORCH_CHECK(false, "bits must be in [2, 8]");
+  }
+}
+
+template<int BITS, int ROWS_PER_CTA, int BATCH_TILE>
+torch::Tensor launch_lowbit_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size) {
+  QB_CHECK_CUDA(x); QB_CHECK_CONTIGUOUS(x); QB_CHECK_HALF(x);
+  TORCH_CHECK(x.dim() == 2, "x must be [batch, cols]");
+  TORCH_CHECK(x.size(1) >= cols, "x cols mismatch");
+  const int batch = static_cast<int>(x.size(0));
+  const int rows = static_cast<int>(qweight.size(0));
+  const int packed_cols = static_cast<int>(qweight.size(1));
+  const int n_groups = static_cast<int>((cols + group_size - 1) / group_size);
+  auto y = torch::empty({batch, rows}, x.options());
+
+  constexpr int BLOCK = 256;
+  dim3 grid((rows + ROWS_PER_CTA - 1) / ROWS_PER_CTA, (batch + BATCH_TILE - 1) / BATCH_TILE);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  lowbit_gemm_kernel<BITS, BLOCK, ROWS_PER_CTA, BATCH_TILE><<<grid, BLOCK, 0, stream>>>(
+      qweight.data_ptr<uint8_t>(),
+      reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(y.data_ptr<at::Half>()),
+      batch, rows, static_cast<int>(cols), packed_cols, n_groups, static_cast<int>(group_size));
+  QB_CUDA_CHECK(cudaGetLastError());
+  return y;
+}
+
+template<int BITS>
+torch::Tensor dispatch_lowbit_gemm_rows(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size, int64_t rows_per_cta) {
+  switch (rows_per_cta) {
+    case 4: return launch_lowbit_gemm<BITS, 4, 4>(qweight, scales, x, cols, group_size);
+    case 8: return launch_lowbit_gemm<BITS, 8, 4>(qweight, scales, x, cols, group_size);
+    case 16: return launch_lowbit_gemm<BITS, 16, 2>(qweight, scales, x, cols, group_size);
+    default: TORCH_CHECK(false, "rows_per_cta must be one of 4, 8, 16");
+  }
+}
+
+torch::Tensor lowbit_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size, int64_t bits, int64_t rows_per_cta) {
+  check_lowbit_args(qweight, scales, cols, group_size, bits);
+  switch (bits) {
+    case 2: return dispatch_lowbit_gemm_rows<2>(qweight, scales, x, cols, group_size, rows_per_cta);
+    case 3: return dispatch_lowbit_gemm_rows<3>(qweight, scales, x, cols, group_size, rows_per_cta);
+    case 4: return dispatch_lowbit_gemm_rows<4>(qweight, scales, x, cols, group_size, rows_per_cta);
+    case 5: return dispatch_lowbit_gemm_rows<5>(qweight, scales, x, cols, group_size, rows_per_cta);
+    case 6: return dispatch_lowbit_gemm_rows<6>(qweight, scales, x, cols, group_size, rows_per_cta);
+    case 7: return dispatch_lowbit_gemm_rows<7>(qweight, scales, x, cols, group_size, rows_per_cta);
+    case 8: return dispatch_lowbit_gemm_rows<8>(qweight, scales, x, cols, group_size, rows_per_cta);
     default: TORCH_CHECK(false, "bits must be in [2, 8]");
   }
 }
