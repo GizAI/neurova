@@ -20,11 +20,13 @@ from tqdm import tqdm
 # the converted checkpoint is actually executable and not a hidden fp16 memory bomb.
 DEFAULT_LINEAR_SUFFIXES = (
     "q_proj.weight",
+    "qkv_proj.weight",
     "k_proj.weight",
     "v_proj.weight",
     "o_proj.weight",
     "gate_proj.weight",
     "up_proj.weight",
+    "gate_up_proj.weight",
     "down_proj.weight",
     # Qwen3-Next fused naming
     "in_proj_qkvz.weight",
@@ -99,6 +101,7 @@ def should_use_marlin(name: str, tensor: torch.Tensor, *, layout: str, hybrid_po
     if hybrid_policy == "q3q4_hot":
         hot_suffixes = (
             "q_proj.weight",
+            "qkv_proj.weight",
             "k_proj.weight",
             "v_proj.weight",
             "o_proj.weight",
@@ -242,6 +245,78 @@ def write_array(path: Path, arr: np.ndarray) -> None:
         f.write(arr.tobytes(order="C"))
 
 
+def build_tensor_locations(model_dir: Path) -> dict[str, Path]:
+    locations: dict[str, Path] = {}
+    for st_path in iter_safetensors(model_dir):
+        with safe_open(st_path, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                locations[name] = st_path
+    return locations
+
+
+def build_fusion_plan(names: set[str]) -> tuple[dict[str, tuple[str, ...]], set[str]]:
+    plan: dict[str, tuple[str, ...]] = {}
+    skip: set[str] = set()
+    for name in sorted(names):
+        if name.endswith(".mlp.gate_proj.weight"):
+            up = name.replace(".mlp.gate_proj.weight", ".mlp.up_proj.weight")
+            if up in names:
+                fused = name.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight")
+                plan[fused] = (name, up)
+                skip.update((name, up))
+        elif name.endswith(".linear_attn.in_proj_qkv.weight") or name.endswith(".linear_attention.in_proj_qkv.weight"):
+            z = name.replace(".in_proj_qkv.weight", ".in_proj_z.weight")
+            if z in names:
+                fused = name.replace(".in_proj_qkv.weight", ".in_proj_qkvz.weight")
+                plan[fused] = (name, z)
+                skip.update((name, z))
+        elif name.endswith(".self_attn.q_proj.weight"):
+            k = name.replace(".q_proj.weight", ".k_proj.weight")
+            v = name.replace(".q_proj.weight", ".v_proj.weight")
+            if k in names and v in names:
+                fused = name.replace(".q_proj.weight", ".qkv_proj.weight")
+                plan[fused] = (name, k, v)
+                skip.update((name, k, v))
+    return plan, skip
+
+
+def read_source_tensor(name: str, locations: dict[str, Path]) -> torch.Tensor:
+    path = locations[name]
+    with safe_open(path, framework="pt", device="cpu") as f:
+        return f.get_tensor(name)
+
+
+def write_quantized_tensor(
+    *,
+    out_dir: Path,
+    index: dict,
+    name: str,
+    tensor: torch.Tensor,
+    group_size: int,
+    bits: int,
+    layout: str,
+    hybrid_policy: str,
+) -> None:
+    rel = name.replace(".", "__")
+    use_marlin = should_use_marlin(name, tensor, layout=layout, hybrid_policy=hybrid_policy, group_size=group_size)
+    if use_marlin:
+        packed, scales, meta = quantize_marlin4_groupwise(tensor, group_size=group_size)
+        q_path = Path("marlin_q4") / f"{rel}.marlin.int32.bin"
+        s_path = Path("marlin_q4") / f"{rel}.scale.fp16.bin"
+    else:
+        packed, scales, meta = quantize_symmetric_lowbit(tensor, group_size=group_size, bits=bits)
+        q_path = Path(f"q{bits}") / f"{rel}.q{bits}.bin"
+        s_path = Path(f"q{bits}") / f"{rel}.scale.fp16.bin"
+    write_array(out_dir / q_path, packed)
+    write_array(out_dir / s_path, scales)
+    index["tensors"][name] = {
+        "kind": "lowbit_marlin_groupwise" if use_marlin else "lowbit_symmetric_groupwise",
+        "qweight": str(q_path),
+        "scales": str(s_path),
+        **meta,
+    }
+
+
 def convert(
     model_dir: Path,
     out_dir: Path,
@@ -252,6 +327,7 @@ def convert(
     bits: int = 4,
     layout: str = "rowwise",
     hybrid_policy: str = "none",
+    fuse_projections: bool = False,
 ) -> None:
     if layout not in ("rowwise", "marlin"):
         raise ValueError("layout must be rowwise or marlin")
@@ -266,6 +342,7 @@ def convert(
         "bits": bits,
         "layout": layout,
         "hybrid_policy": hybrid_policy,
+        "fuse_projections": fuse_projections,
         "fp16_embed": fp16_embed,
         "tensors": {},
     }
@@ -277,33 +354,31 @@ def convert(
     if safe_open is None:
         raise RuntimeError("safetensors is required for checkpoint conversion: pip install safetensors")
 
+    locations = build_tensor_locations(model_dir)
+    fusion_plan, fused_sources = build_fusion_plan(set(locations)) if fuse_projections else ({}, set())
+
     for st_path in iter_safetensors(model_dir):
         with safe_open(st_path, framework="pt", device="cpu") as f:
             for name in tqdm(f.keys(), desc=st_path.name):
                 if max_tensors is not None and count >= max_tensors:
                     break
+                if name in fused_sources:
+                    continue
                 tensor = f.get_tensor(name)
-                rel = name.replace(".", "__")
                 if should_quantize(name, fp16_embed=fp16_embed) and tensor.ndim == 2:
-                    use_marlin = should_use_marlin(name, tensor, layout=layout, hybrid_policy=hybrid_policy, group_size=group_size)
-                    if use_marlin:
-                        packed, scales, meta = quantize_marlin4_groupwise(tensor, group_size=group_size)
-                        q_path = Path("marlin_q4") / f"{rel}.marlin.int32.bin"
-                        s_path = Path("marlin_q4") / f"{rel}.scale.fp16.bin"
-                    else:
-                        packed, scales, meta = quantize_symmetric_lowbit(tensor, group_size=group_size, bits=bits)
-                        q_path = Path(f"q{bits}") / f"{rel}.q{bits}.bin"
-                        s_path = Path(f"q{bits}") / f"{rel}.scale.fp16.bin"
-                    write_array(out_dir / q_path, packed)
-                    write_array(out_dir / s_path, scales)
-                    index["tensors"][name] = {
-                        "kind": "lowbit_marlin_groupwise" if use_marlin else "lowbit_symmetric_groupwise",
-                        "qweight": str(q_path),
-                        "scales": str(s_path),
-                        **meta,
-                    }
+                    write_quantized_tensor(
+                        out_dir=out_dir,
+                        index=index,
+                        name=name,
+                        tensor=tensor,
+                        group_size=group_size,
+                        bits=bits,
+                        layout=layout,
+                        hybrid_policy=hybrid_policy,
+                    )
                     count += 1
                 else:
+                    rel = name.replace(".", "__")
                     arr = tensor.detach().cpu().to(torch.float16).contiguous().numpy()
                     raw_path = Path("fp16") / f"{rel}.fp16.bin"
                     write_array(out_dir / raw_path, arr)
@@ -315,6 +390,21 @@ def convert(
                     }
         if max_tensors is not None and count >= max_tensors:
             break
+
+    if max_tensors is None:
+        for fused_name, source_names in tqdm(fusion_plan.items(), desc="fused projections"):
+            parts = [read_source_tensor(src, locations) for src in source_names]
+            tensor = torch.cat(parts, dim=0)
+            write_quantized_tensor(
+                out_dir=out_dir,
+                index=index,
+                name=fused_name,
+                tensor=tensor,
+                group_size=group_size,
+                bits=bits,
+                layout=layout,
+                hybrid_policy=hybrid_policy,
+            )
 
     with open(out_dir / "qwenburst_index.json", "w", encoding="utf-8") as f:
         json.dump(index, f, indent=2, ensure_ascii=False)
@@ -328,6 +418,7 @@ def main() -> None:
     ap.add_argument("--bits", type=int, default=4, help="weight bits for quantized 2D tensors")
     ap.add_argument("--layout", choices=("rowwise", "marlin"), default="rowwise", help="runtime weight layout")
     ap.add_argument("--hybrid-policy", choices=("none", "q3q4_hot"), default="none", help="Q3/Q4 mixed runtime policy")
+    ap.add_argument("--fuse-projections", action="store_true", help="store fused MLP/GDN/attention projections to reduce decode kernel launches")
     ap.add_argument("--max-tensors", type=int, default=None, help="debug: convert only N quantized tensors")
     ap.add_argument("--fp16-embed", action="store_true", help="keep embed_tokens.weight fp16; not recommended for 16GB")
     args = ap.parse_args()
@@ -340,6 +431,7 @@ def main() -> None:
         bits=args.bits,
         layout=args.layout,
         hybrid_policy=args.hybrid_policy,
+        fuse_projections=args.fuse_projections,
     )
 
 
