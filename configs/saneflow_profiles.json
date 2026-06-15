@@ -544,12 +544,12 @@
       ],
       "tokenizer_path": "tokenizers/neurova_spm_unigram_64k",
       "train_data": [
-        "data/corpus/mixes/saneflow_practical_pretrain_v2_en/train.jsonl"
+        "data/corpus/mixes/saneflow_practical_pretrain_v3_5b_en/train.jsonl"
       ],
       "valid_data": [
-        "data/corpus/mixes/saneflow_practical_pretrain_v2_en/valid.jsonl"
+        "data/corpus/mixes/saneflow_practical_pretrain_v3_5b_en/valid.jsonl"
       ],
-      "steps": 12000,
+      "steps": 153000,
       "batch_size": 2,
       "grad_accum_steps": 8,
       "loss_chunk_tokens": 8192,
@@ -603,10 +603,10 @@
       "init_from_fallbacks": [],
       "tokenizer_path": "tokenizers/neurova_spm_unigram_64k",
       "train_data": [
-        "data/corpus/mixes/saneflow_practical_pretrain_v2_en/train.jsonl"
+        "data/corpus/mixes/saneflow_practical_pretrain_v3_5b_en/train.jsonl"
       ],
       "valid_data": [
-        "data/corpus/mixes/saneflow_practical_pretrain_v2_en/valid.jsonl"
+        "data/corpus/mixes/saneflow_practical_pretrain_v3_5b_en/valid.jsonl"
       ],
       "steps": 153000,
       "batch_size": 3,
@@ -632,8 +632,8 @@
       "galore_rank": 128,
       "galore_update_proj_gap": 200,
       "galore_scale": "0.25",
-      "warmup_steps": 500,
-      "min_lr_ratio": "0.1",
+      "warmup_steps": 2000,
+      "min_lr_ratio": "0.08",
       "state_mixer_version": "off",
       "state_clip": "0.0",
       "attention_interval": 0,
@@ -645,7 +645,7 @@
       "landmark_chunk": 64,
       "landmark_max": 64,
       "save_every": 250,
-      "log_every": 5,
+      "log_every": 20,
       "dtype": "bf16",
       "dataset_device": "cuda",
       "activation_checkpointing": false,
