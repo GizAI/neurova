@@ -2,22 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import threading
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from .config import Qwen36_27B_TextConfig
-from .dflash import DFlashDraftAdapter
-from .generate import GenerationConfig, choose_weight_device, load_tokenizer, sample_next
-from .loader import QuantizedStore
-from .model import QwenBurstModel
-from .state import DecodeState
+from .adapters import Qwen36Adapter  # registers qwen36
+from .cli_features import add_runtime_feature_args, runtime_features_from_args
+from .core.adapter import adapter_registry
+from .core.features import RuntimeFeatureOverride, RuntimeFeatures
+from .core.runtime import GenerationConfig, RuntimeEngine
 
 
 class ChatMessage(BaseModel):
@@ -26,7 +22,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "qwenburst-qwen3.6-27b-q3"
+    model: str = "qwenburst-qwen3.6-27b-q4-marlin"
     messages: list[ChatMessage]
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
@@ -34,99 +30,39 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.0
     top_k: int = 0
     stream: bool = False
+    runtime_profile: Literal["original", "stateful", "research"] | None = None
+    kv_window_policy: Literal["error", "shift", "ring"] | None = None
+    stateful_chat: bool | None = None
+    infinite_streaming: bool | None = None
+    snapshots: bool | None = None
+    boundary_decay: float | None = None
+    episodic_memory: bool | None = None
+    ttt_sidecar: bool | None = None
+    speculative_mtp: bool | None = None
+    cuda_graph: bool | None = None
+    block_prefill: bool | None = None
+    prefill_chunk_size: int | None = None
 
 
-@dataclass
-class QwenBurstEngine:
-    hf_model: Path
-    qb_model: Path
-    device: str
-    recent_window: int
-    weight_device: str
-    gpu_embed_head: bool
-    cpu_embed: bool
-    model_name: str
-    draft_adapter: DFlashDraftAdapter | None = None
-
-    def __post_init__(self) -> None:
-        self.cfg = Qwen36_27B_TextConfig.from_hf_config(self.hf_model)
-        self.tokenizer = load_tokenizer(self.hf_model)
-        resolved_weight_device = choose_weight_device(self.qb_model, self.weight_device, self.device)
-        store = QuantizedStore(self.qb_model, device=resolved_weight_device)
-        embed_store = QuantizedStore(self.qb_model, device="cpu") if self.cpu_embed else None
-        head_store = None
-        self.model = QwenBurstModel(store, cfg=self.cfg, device=self.device, embed_store=embed_store, head_store=head_store)
-        self.lock = threading.Lock()
-
-    def encode_messages(self, messages: list[ChatMessage]) -> list[int]:
-        payload = [{"role": m.role, "content": self._content_to_text(m.content)} for m in messages]
-        encoded = self.tokenizer.apply_chat_template(
-            payload,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        if isinstance(encoded, dict):
-            encoded = encoded["input_ids"]
-        if hasattr(encoded, "input_ids"):
-            encoded = encoded.input_ids
-        if isinstance(encoded, torch.Tensor):
-            encoded = encoded.reshape(-1).tolist()
-        if encoded and isinstance(encoded[0], (list, tuple)):
-            encoded = encoded[0]
-        return [int(t) for t in encoded]
-
-    @staticmethod
-    def _content_to_text(content: str | list[dict[str, Any]] | None) -> str:
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            return content
-        parts: list[str] = []
-        for item in content:
-            if item.get("type") == "text":
-                parts.append(str(item.get("text", "")))
-        return "\n".join(p for p in parts if p)
-
-    def completion_tokens(self, req: ChatCompletionRequest):
-        if self.draft_adapter is not None:
-            raise RuntimeError(
-                "DFlash draft adapter is loaded, but qwenburst-native DFlash proposal execution "
-                "is not implemented yet. The target runtime was not replaced or bypassed."
-            )
-        max_new = req.max_new_tokens or req.max_completion_tokens or req.max_tokens or 256
-        prompt_ids = self.encode_messages(req.messages)
-        state = DecodeState.allocate(self.cfg, max_seq_len=self.recent_window, device=self.device, kv_window_policy="ring")
-        gen_cfg = GenerationConfig(
-            max_new_tokens=max_new,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            eos_token_ids=self.eos_token_ids(),
-        )
-        with self.lock, torch.no_grad():
-            logits: torch.Tensor | None = None
-            for i, tid in enumerate(prompt_ids):
-                logits = self.model.forward_one(tid, state, return_logits=(i == len(prompt_ids) - 1))
-            assert logits is not None
-            next_id = sample_next(logits, gen_cfg)
-            for _ in range(max_new):
-                if gen_cfg.eos_token_ids and next_id in gen_cfg.eos_token_ids:
-                    break
-                text = self.tokenizer.decode([next_id], skip_special_tokens=False)
-                yield next_id, text
-                logits = self.model.forward_one(next_id, state, return_logits=True)
-                next_id = sample_next(logits, gen_cfg)
-
-    def eos_token_ids(self) -> tuple[int, ...]:
-        ids = []
-        for name in ("eos_token_id", "pad_token_id"):
-            val = getattr(self.tokenizer, name, None)
-            if isinstance(val, int):
-                ids.append(val)
-        return tuple(set(ids))
+def _request_generation_config(engine: RuntimeEngine, req: ChatCompletionRequest) -> GenerationConfig:
+    return GenerationConfig(
+        max_new_tokens=req.max_new_tokens or req.max_completion_tokens or req.max_tokens or 256,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        eos_token_ids=engine.eos_token_ids(),
+    )
 
 
-def create_app(engine: QwenBurstEngine):
+def _request_messages(req: ChatCompletionRequest) -> list[dict[str, Any]]:
+    return [{"role": m.role, "content": m.content} for m in req.messages]
+
+
+def _request_features(engine: RuntimeEngine, req: ChatCompletionRequest) -> RuntimeFeatures:
+    features = RuntimeFeatures.from_profile(req.runtime_profile) if req.runtime_profile else engine.features
+    return features.with_overrides(RuntimeFeatureOverride.from_obj(req))
+
+
+def create_app(engine: RuntimeEngine):
     try:
         from fastapi import FastAPI
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -149,13 +85,22 @@ def create_app(engine: QwenBurstEngine):
             ],
         }
 
+    @app.get("/v1/qwenburst/features")
+    def features():
+        return engine.features.summary()
+
     @app.post("/v1/chat/completions")
     def chat_completions(req: ChatCompletionRequest):
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         if req.stream:
             def events():
-                for _, text in engine.completion_tokens(req):
+                request_features = _request_features(engine, req)
+                for _, text in engine.completion_tokens(
+                    _request_messages(req),
+                    _request_generation_config(engine, req),
+                    features=request_features,
+                ):
                     payload = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -176,8 +121,12 @@ def create_app(engine: QwenBurstEngine):
 
             return StreamingResponse(events(), media_type="text/event-stream")
 
-        pieces = [text for _, text in engine.completion_tokens(req)]
-        content = "".join(pieces)
+        ids = engine.completion_ids_greedy_gpu(
+            _request_messages(req),
+            _request_generation_config(engine, req),
+            features=_request_features(engine, req),
+        )
+        content = engine.tokenizer.decode(ids, skip_special_tokens=True)
         return JSONResponse(
             {
                 "id": completion_id,
@@ -200,8 +149,8 @@ def create_app(engine: QwenBurstEngine):
 def main() -> None:
     ap = argparse.ArgumentParser(description="OpenAI-compatible QwenBurst thin server")
     ap.add_argument("--hf-model", type=Path, default=Path("/home/user/models/Qwen3.6-27B"))
-    ap.add_argument("--qb-model", type=Path, default=Path("/home/user/models/Qwen3.6-27B-qb3"))
-    ap.add_argument("--model-name", default="qwenburst-qwen3.6-27b-q3")
+    ap.add_argument("--qb-model", type=Path, default=Path("/home/user/models/Qwen3.6-27B-qb4-marlin-fused"))
+    ap.add_argument("--model-name", default="qwenburst-qwen3.6-27b-q4-marlin")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8008)
     ap.add_argument("--device", default="cuda")
@@ -209,40 +158,26 @@ def main() -> None:
     ap.add_argument("--weight-device", choices=("auto", "cpu", "cuda"), default="auto")
     ap.add_argument("--gpu-embed-head", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--cpu-embed", action="store_true", help="offload only token embeddings to CPU if 16GB VRAM is too tight")
-    ap.add_argument("--speculative-backend", choices=("none", "dflash"), default="none")
-    ap.add_argument("--draft-model", default="z-lab/Qwen3.6-27B-DFlash")
-    ap.add_argument("--dflash-draft-dir", type=Path, default=None, help="converted qwenburst low-bit DFlash draft directory")
-    ap.add_argument("--num-speculative-tokens", type=int, default=15)
+    ap.add_argument("--adapter", default="qwen36", choices=("qwen36",), help="model adapter")
+    add_runtime_feature_args(ap)
     args = ap.parse_args()
-
-    draft_adapter = None
-    if args.speculative_backend == "dflash":
-        if args.dflash_draft_dir is None:
-            raise SystemExit(
-                "speculative-backend=dflash requires --dflash-draft-dir pointing to a converted "
-                "qwenburst low-bit DFlash draft. Convert with: python -m qwenburst.dflash convert <hf_dflash_dir> <out_dir> --bits 3"
-            )
-        draft_adapter = DFlashDraftAdapter.from_lowbit_dir(args.dflash_draft_dir, device=args.device)
-    elif args.speculative_backend != "none":
-        raise SystemExit(
-            "unknown speculative backend. qwenburst only supports target-local adapter paths."
-        )
+    features = runtime_features_from_args(args)
 
     try:
         import uvicorn
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("qwenburst-server requires uvicorn") from exc
 
-    engine = QwenBurstEngine(
+    engine = RuntimeEngine(
+        adapter=adapter_registry.get(args.adapter),
         hf_model=args.hf_model,
         qb_model=args.qb_model,
         device=args.device,
         recent_window=args.recent_window,
         weight_device=args.weight_device,
-        gpu_embed_head=args.gpu_embed_head,
         cpu_embed=args.cpu_embed,
         model_name=args.model_name,
-        draft_adapter=draft_adapter,
+        features=features,
     )
     app = create_app(engine)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

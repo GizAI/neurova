@@ -2,6 +2,7 @@
 #include "kernels.cuh"
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 namespace py = pybind11;
 
@@ -45,7 +46,11 @@ static void run_lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, 
   int groupsize = static_cast<int>(group_size);
   if (groupsize <= 0 || groupsize == prob_k) groupsize = -1;
   TORCH_CHECK(groupsize == -1 || (groupsize == 128 && scales.size(0) == prob_k / groupsize), "Marlin supports group_size -1 or 128");
-  constexpr int max_par = 16;
+  int max_par = 16;
+  if (const char* env = std::getenv("QWENBURST_MARLIN_MAX_PAR")) {
+    max_par = std::atoi(env);
+  }
+  TORCH_CHECK(max_par >= 1 && max_par <= 16, "QWENBURST_MARLIN_MAX_PAR must be in [1, 16]");
   TORCH_CHECK(workspace.numel() >= prob_n / 128 * max_par, "marlin workspace too small");
   const int dev = x.get_device();
   int err = marlin_cuda(
@@ -137,8 +142,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm_qwen_silu_gate", &rmsnorm_qwen_silu_gate, "Qwen RMSNorm followed by SiLU gate fp16");
   m.def("gdn_recurrent", &gdn_recurrent,
         "Single-token Qwen-style recurrent gated delta rule, state updated in-place");
+  m.def("gdn_recurrent_ab", &gdn_recurrent_ab,
+        "Single-token Qwen-style recurrent gated delta rule with fused a/b gate computation");
   m.def("gdn_recurrent_scan", &gdn_recurrent_scan,
         "Block Qwen-style recurrent gated delta scan, state updated in-place");
+  m.def("depthwise_conv_update", &depthwise_conv_update,
+        "Single-token causal depthwise conv update with SiLU");
+  m.def("depthwise_conv_update_scan", &depthwise_conv_update_scan,
+        "Block causal depthwise conv scan with SiLU, state updated in-place");
   m.def("attention_decode_fp16", &attention_decode_fp16,
         "Small/medium context fp16 decode attention baseline");
   m.def("argmax", &argmax, "GPU argmax over a 1D fp16/fp32 logits tensor");

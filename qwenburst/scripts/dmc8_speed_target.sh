@@ -2,8 +2,8 @@
 set -euo pipefail
 
 MODEL_DIR="${MODEL_DIR:-/home/user/models/Qwen3.6-27B}"
-QB_DIR="${QB_DIR:-/home/user/models/Qwen3.6-27B-qb3}"
-RECENT_WINDOW="${RECENT_WINDOW:-256}"
+QB_DIR="${QB_DIR:-/home/user/models/Qwen3.6-27B-qb4-marlin-fused}"
+RECENT_WINDOW="${RECENT_WINDOW:-8192}"
 PROMPT="${PROMPT:-Say hello.}"
 
 echo "[qwenburst target-only]"
@@ -17,10 +17,3 @@ python -m qwenburst.generate \
   --temperature 0 \
   --prompt "$PROMPT" \
   --stats
-
-cat <<'EOF'
-
-[speculative path]
-DFlash is allowed only as a qwenburst draft adapter. Do not switch the target
-runtime to vLLM/SGLang for qwenburst speed claims.
-EOF

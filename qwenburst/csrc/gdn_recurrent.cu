@@ -23,6 +23,145 @@
 constexpr int QB_GDN_D = 128;
 constexpr int QB_GDN_BLOCK = 128;
 
+__global__ void depthwise_conv_update_kernel(
+    half* __restrict__ state,
+    const half* __restrict__ x,
+    const half* __restrict__ weight,
+    const half* __restrict__ bias,
+    half* __restrict__ out,
+    int channels,
+    int history,
+    int kernel,
+    int weight_stride,
+    bool has_bias) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= channels) return;
+  float acc = 0.0f;
+  const int state_base = c * history;
+  const int weight_base = c * weight_stride;
+  for (int i = 0; i < history; ++i) {
+    acc += __half2float(state[state_base + i]) * __half2float(weight[weight_base + i]);
+  }
+  acc += __half2float(x[c]) * __half2float(weight[weight_base + history]);
+  if (has_bias) {
+    acc += __half2float(bias[c]);
+  }
+  for (int i = 0; i < history - 1; ++i) {
+    state[state_base + i] = state[state_base + i + 1];
+  }
+  if (history > 0) {
+    state[state_base + history - 1] = x[c];
+  }
+  out[c] = __float2half_rn(qb_silu(acc));
+}
+
+torch::Tensor depthwise_conv_update(torch::Tensor state, torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+  QB_CHECK_CUDA(state); QB_CHECK_CUDA(x); QB_CHECK_CUDA(weight); QB_CHECK_CUDA(bias);
+  QB_CHECK_CONTIGUOUS(state); QB_CHECK_CONTIGUOUS(x); QB_CHECK_CONTIGUOUS(weight); QB_CHECK_CONTIGUOUS(bias);
+  QB_CHECK_HALF(state); QB_CHECK_HALF(x); QB_CHECK_HALF(weight);
+  TORCH_CHECK(bias.numel() == 0 || bias.scalar_type() == at::kHalf, "bias must be empty or fp16");
+  TORCH_CHECK(state.dim() == 2, "state must be [channels, kernel-1]");
+  TORCH_CHECK(x.dim() == 1 && x.size(0) == state.size(0), "x must be [channels]");
+  int channels = static_cast<int>(state.size(0));
+  int history = static_cast<int>(state.size(1));
+  int kernel = history + 1;
+  int weight_stride = 0;
+  if (weight.dim() == 3) {
+    TORCH_CHECK(weight.size(0) == channels && weight.size(2) == kernel, "weight must be [channels, 1, kernel]");
+    weight_stride = static_cast<int>(weight.size(2));
+  } else {
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == channels && weight.size(1) == kernel, "weight must be [channels, kernel]");
+    weight_stride = static_cast<int>(weight.size(1));
+  }
+  bool has_bias = bias.numel() > 0;
+  TORCH_CHECK(!has_bias || bias.numel() == channels, "bias must be [channels]");
+  auto out = torch::empty_like(x);
+  int threads = 256;
+  int blocks = (channels + threads - 1) / threads;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  depthwise_conv_update_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<half*>(state.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
+      has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr,
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      channels, history, kernel, weight_stride, has_bias);
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
+__global__ void depthwise_conv_update_scan_kernel(
+    half* __restrict__ state,
+    const half* __restrict__ x,
+    const half* __restrict__ weight,
+    const half* __restrict__ bias,
+    half* __restrict__ out,
+    int tokens,
+    int channels,
+    int history,
+    int kernel,
+    int weight_stride,
+    bool has_bias) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= channels) return;
+  const int state_base = c * history;
+  const int weight_base = c * weight_stride;
+  for (int t = 0; t < tokens; ++t) {
+    float acc = 0.0f;
+    for (int i = 0; i < history; ++i) {
+      acc += __half2float(state[state_base + i]) * __half2float(weight[weight_base + i]);
+    }
+    half xv = x[t * channels + c];
+    acc += __half2float(xv) * __half2float(weight[weight_base + history]);
+    if (has_bias) {
+      acc += __half2float(bias[c]);
+    }
+    for (int i = 0; i < history - 1; ++i) {
+      state[state_base + i] = state[state_base + i + 1];
+    }
+    if (history > 0) {
+      state[state_base + history - 1] = xv;
+    }
+    out[t * channels + c] = __float2half_rn(qb_silu(acc));
+  }
+}
+
+torch::Tensor depthwise_conv_update_scan(torch::Tensor state, torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+  QB_CHECK_CUDA(state); QB_CHECK_CUDA(x); QB_CHECK_CUDA(weight); QB_CHECK_CUDA(bias);
+  QB_CHECK_CONTIGUOUS(state); QB_CHECK_CONTIGUOUS(x); QB_CHECK_CONTIGUOUS(weight); QB_CHECK_CONTIGUOUS(bias);
+  QB_CHECK_HALF(state); QB_CHECK_HALF(x); QB_CHECK_HALF(weight);
+  TORCH_CHECK(bias.numel() == 0 || bias.scalar_type() == at::kHalf, "bias must be empty or fp16");
+  TORCH_CHECK(state.dim() == 2, "state must be [channels, kernel-1]");
+  TORCH_CHECK(x.dim() == 2 && x.size(1) == state.size(0), "x must be [tokens, channels]");
+  int tokens = static_cast<int>(x.size(0));
+  int channels = static_cast<int>(state.size(0));
+  int history = static_cast<int>(state.size(1));
+  int kernel = history + 1;
+  int weight_stride = 0;
+  if (weight.dim() == 3) {
+    TORCH_CHECK(weight.size(0) == channels && weight.size(2) == kernel, "weight must be [channels, 1, kernel]");
+    weight_stride = static_cast<int>(weight.size(2));
+  } else {
+    TORCH_CHECK(weight.dim() == 2 && weight.size(0) == channels && weight.size(1) == kernel, "weight must be [channels, kernel]");
+    weight_stride = static_cast<int>(weight.size(1));
+  }
+  bool has_bias = bias.numel() > 0;
+  TORCH_CHECK(!has_bias || bias.numel() == channels, "bias must be [channels]");
+  auto out = torch::empty_like(x);
+  int threads = 256;
+  int blocks = (channels + threads - 1) / threads;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  depthwise_conv_update_scan_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<half*>(state.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
+      has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr,
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      tokens, channels, history, kernel, weight_stride, has_bias);
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
 __global__ void gdn_recurrent_128_kernel(
     const half* __restrict__ q,
     const half* __restrict__ k,
@@ -106,6 +245,91 @@ __global__ void gdn_recurrent_128_kernel(
   out[vh * QB_GDN_D + j] = __float2half_rn(yj);
 }
 
+__global__ void gdn_recurrent_ab_128_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    const half* __restrict__ a,
+    const half* __restrict__ b,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    half* __restrict__ state,
+    half* __restrict__ out,
+    int kv_heads,
+    int v_heads) {
+  int vh = blockIdx.x;
+  int tid = threadIdx.x;
+  if (vh >= v_heads || tid >= QB_GDN_D) return;
+
+  int ratio = v_heads / kv_heads;
+  int kh = vh / ratio;
+
+  __shared__ float q_s[QB_GDN_D];
+  __shared__ float k_s[QB_GDN_D];
+  __shared__ float red[QB_GDN_BLOCK];
+  __shared__ float delta_s[QB_GDN_D];
+
+  float qv = __half2float(q[kh * QB_GDN_D + tid]);
+  float kv = __half2float(k[kh * QB_GDN_D + tid]);
+  q_s[tid] = qv;
+  k_s[tid] = kv;
+
+  red[tid] = qv * qv;
+  __syncthreads();
+  for (int stride = QB_GDN_BLOCK / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) red[tid] += red[tid + stride];
+    __syncthreads();
+  }
+  float q_inv = rsqrtf(red[0] + 1e-6f);
+
+  red[tid] = kv * kv;
+  __syncthreads();
+  for (int stride = QB_GDN_BLOCK / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) red[tid] += red[tid + stride];
+    __syncthreads();
+  }
+  float k_inv = rsqrtf(red[0] + 1e-6f);
+
+  q_s[tid] *= q_inv * rsqrtf(static_cast<float>(QB_GDN_D));
+  k_s[tid] *= k_inv;
+  __syncthreads();
+
+  int j = tid;
+  half* S = state + static_cast<int64_t>(vh) * QB_GDN_D * QB_GDN_D;
+
+  float old_j = 0.0f;
+  #pragma unroll
+  for (int d = 0; d < QB_GDN_D; ++d) {
+    old_j += k_s[d] * __half2float(S[d * QB_GDN_D + j]);
+  }
+
+  float vj = __half2float(v[vh * QB_GDN_D + j]);
+  float delta = vj - old_j;
+  delta_s[j] = delta;
+  __syncthreads();
+
+  float ax = __half2float(a[vh]) + dt_bias[vh];
+  float softplus = ax > 20.0f ? ax : log1pf(__expf(ax));
+  float g = -__expf(A_log[vh]) * softplus;
+  float decay = __expf(g);
+  float beta = qb_sigmoid(__half2float(b[vh]));
+
+  #pragma unroll
+  for (int d = 0; d < QB_GDN_D; ++d) {
+    float s_old = __half2float(S[d * QB_GDN_D + j]);
+    float s_new = decay * s_old + beta * k_s[d] * delta;
+    S[d * QB_GDN_D + j] = __float2half_rn(s_new);
+  }
+  __syncthreads();
+
+  float yj = 0.0f;
+  #pragma unroll
+  for (int d = 0; d < QB_GDN_D; ++d) {
+    yj += q_s[d] * __half2float(S[d * QB_GDN_D + j]);
+  }
+  out[vh * QB_GDN_D + j] = __float2half_rn(yj);
+}
+
 torch::Tensor gdn_recurrent(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, torch::Tensor beta, torch::Tensor state) {
   QB_CHECK_CUDA(q); QB_CHECK_CUDA(k); QB_CHECK_CUDA(v); QB_CHECK_CUDA(g); QB_CHECK_CUDA(beta); QB_CHECK_CUDA(state);
   QB_CHECK_CONTIGUOUS(q); QB_CHECK_CONTIGUOUS(k); QB_CHECK_CONTIGUOUS(v); QB_CHECK_CONTIGUOUS(g); QB_CHECK_CONTIGUOUS(beta); QB_CHECK_CONTIGUOUS(state);
@@ -133,6 +357,38 @@ torch::Tensor gdn_recurrent(torch::Tensor q, torch::Tensor k, torch::Tensor v, t
       g.data_ptr<float>(),
       beta_h,
       beta_f,
+      reinterpret_cast<half*>(state.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      kv_heads, v_heads);
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
+torch::Tensor gdn_recurrent_ab(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor a, torch::Tensor b, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state) {
+  QB_CHECK_CUDA(q); QB_CHECK_CUDA(k); QB_CHECK_CUDA(v); QB_CHECK_CUDA(a); QB_CHECK_CUDA(b); QB_CHECK_CUDA(A_log); QB_CHECK_CUDA(dt_bias); QB_CHECK_CUDA(state);
+  QB_CHECK_CONTIGUOUS(q); QB_CHECK_CONTIGUOUS(k); QB_CHECK_CONTIGUOUS(v); QB_CHECK_CONTIGUOUS(a); QB_CHECK_CONTIGUOUS(b); QB_CHECK_CONTIGUOUS(A_log); QB_CHECK_CONTIGUOUS(dt_bias); QB_CHECK_CONTIGUOUS(state);
+  QB_CHECK_HALF(q); QB_CHECK_HALF(k); QB_CHECK_HALF(v); QB_CHECK_HALF(a); QB_CHECK_HALF(b); QB_CHECK_HALF(state);
+  TORCH_CHECK(A_log.scalar_type() == at::kFloat && dt_bias.scalar_type() == at::kFloat, "A_log/dt_bias must be fp32");
+  TORCH_CHECK(q.dim() == 2 && k.dim() == 2 && v.dim() == 2, "q/k/v shapes must be [heads, 128]");
+  TORCH_CHECK(q.size(1) == QB_GDN_D && k.size(1) == QB_GDN_D && v.size(1) == QB_GDN_D, "head dim must be 128");
+  int kv_heads = static_cast<int>(q.size(0));
+  int v_heads = static_cast<int>(v.size(0));
+  TORCH_CHECK(k.size(0) == kv_heads, "k heads mismatch");
+  TORCH_CHECK(v_heads % kv_heads == 0, "v_heads must be divisible by kv_heads");
+  TORCH_CHECK(a.size(0) == v_heads && b.size(0) == v_heads && A_log.size(0) == v_heads && dt_bias.size(0) == v_heads, "a/b/A_log/dt_bias v_heads mismatch");
+  TORCH_CHECK(state.dim() == 3 && state.size(0) == v_heads && state.size(1) == QB_GDN_D && state.size(2) == QB_GDN_D,
+              "state must be [v_heads, 128, 128]");
+
+  auto out = torch::empty({v_heads, QB_GDN_D}, q.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  gdn_recurrent_ab_128_kernel<<<v_heads, QB_GDN_BLOCK, 0, stream>>>(
+      reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(a.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(b.data_ptr<at::Half>()),
+      A_log.data_ptr<float>(),
+      dt_bias.data_ptr<float>(),
       reinterpret_cast<half*>(state.data_ptr<at::Half>()),
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
       kv_heads, v_heads);

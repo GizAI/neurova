@@ -30,22 +30,29 @@ __global__ void attention_decode_kernel(
   int ratio = q_heads / kv_heads;
   int kvh = qh / ratio;
 
-  // Numerically stable online softmax over seq_len.
+  __shared__ float qk[QB_ATT_BLOCK];
+
+  // Numerically stable online softmax over seq_len. One block owns one query
+  // head. Threads reduce the QK dot product once per timestep, then each thread
+  // updates one output dimension. The old baseline recomputed the same dot
+  // product independently for every output dimension.
   float m = -INFINITY;
   float l = 0.0f;
   float acc = 0.0f;
 
   for (int t = 0; t < seq_len; ++t) {
-    // One thread computes only its output dim, but all threads redundantly compute score.
-    // This is okay for the baseline. The production kernel should split score reduction
-    // and value accumulation across warps/pages.
-    float score_part = 0.0f;
-    for (int d = 0; d < D; ++d) {
-      float qv = __half2float(q[qh * D + d]);
-      float kv = __half2float(k_cache[(static_cast<int64_t>(kvh) * max_seq + t) * D + d]);
-      score_part += qv * kv;
+    float prod = 0.0f;
+    if (dim < D) {
+      prod = __half2float(q[qh * D + dim])
+        * __half2float(k_cache[(static_cast<int64_t>(kvh) * max_seq + t) * D + dim]);
     }
-    float s = score_part * scale;
+    qk[dim] = prod;
+    __syncthreads();
+    for (int stride = D / 2; stride > 0; stride >>= 1) {
+      if (dim < stride) qk[dim] += qk[dim + stride];
+      __syncthreads();
+    }
+    float s = qk[0] * scale;
     float new_m = fmaxf(m, s);
     float alpha = __expf(m - new_m);
     float p = __expf(s - new_m);

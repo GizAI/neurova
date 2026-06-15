@@ -1,20 +1,28 @@
 # QwenBurst
 
-QwenBurst is a narrow CUDA runtime for Qwen3.6-27B text inference on a single
-16GB RTX 4080/4090-class GPU. The engine targets batch-1 chat with flexible
-groupwise low-bit weights, Qwen Gated DeltaNet kernels, ring-KV attention, and
-streaming decode state.
+QwenBurst is a low-bit local inference runtime for single-user batch-1 chat on
+16GB RTX 4080/4090-class GPUs. The current champion adapter targets
+Qwen3.6-27B text inference with flexible groupwise low-bit weights, Qwen Gated
+DeltaNet kernels, ring-KV attention, and streaming decode state.
 
-This is not a general vLLM replacement. The current canonical contract is:
+This is not a general vLLM replacement. The runtime is now split into a common
+`RuntimeEngine` plus model adapters so future Gemma-style targets do not fork
+the server/decode loop. The current canonical adapter contract is:
 
+- Adapter: `qwen36`.
 - HF source model: Qwen3.6-27B / Qwen3.5-style text model.
-- Converted model format: `qwenburst-lowbit-v4`.
-- Quantized tensor kind: `lowbit_symmetric_groupwise`.
-- Supported weight bits: 2 through 8, selected by checkpoint metadata.
+- Champion converted model: Q4 Marlin fused projection checkpoint.
+- Quantized tensor kinds: `lowbit_marlin_groupwise`,
+  `lowbit_symmetric_groupwise`, and small `fp16_raw` gate projections.
+- Supported rowwise weight bits: 2 through 8, selected by checkpoint metadata.
 - Runtime entrypoints: `qwenburst-quantize`, `qwenburst-audit`,
-  `qwenburst-chat`, `qwenburst-doctor`.
-- CUDA extension symbols: `lowbit_gemv`, `lowbit_row_dequant`, RMSNorm, GDN
-  recurrence, attention decode, and sampling helpers.
+  `qwenburst-chat`, `qwenburst-server`, `qwenburst-doctor`,
+  `qwenburst-speculative`, `qwenburst-graph-audit`, `qwenburst-profile`.
+- CUDA extension symbols: Marlin W4A16 GEMM, rowwise low-bit fallback,
+  RMSNorm, GDN recurrence, attention decode, and sampling helpers.
+
+The adapter split is documented in `docs/ADAPTER_ARCHITECTURE.md`.
+Runtime feature profiles are documented in `docs/RUNTIME_FEATURES.md`.
 
 ## Environment
 
@@ -56,13 +64,17 @@ qwenburst-audit /home/user/models/Qwen3.6-27B-qb3 --hf-model /home/user/models/Q
 
 ## Chat
 
-The default `--weight-device auto` keeps q3 checkpoints GPU-resident and keeps
-larger checkpoints on the safer CPU staging path.
+The default `--weight-device auto` keeps Marlin checkpoints GPU-resident. CPU
+offload is only a fallback for checkpoints that cannot fit in VRAM.
 
 ```bash
 qwenburst-chat \
+  --adapter qwen36 \
+  --runtime-profile stateful \
+  --block-prefill on \
+  --prefill-chunk-size 64 \
   --hf-model /home/user/models/Qwen3.6-27B \
-  --qb-model /home/user/models/Qwen3.6-27B-qb4 \
+  --qb-model /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
   --prompt "안녕. 너는 누구야?" \
   --recent-window 8192 \
   --max-new-tokens 96 \
@@ -75,8 +87,10 @@ Force the GPU-resident path:
 
 ```bash
 qwenburst-chat \
+  --adapter qwen36 \
+  --runtime-profile original \
   --hf-model /home/user/models/Qwen3.6-27B \
-  --qb-model /home/user/models/Qwen3.6-27B-qb3 \
+  --qb-model /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
   --weight-device cuda \
   --prompt "Say hello." \
   --max-new-tokens 32 \
@@ -91,8 +105,10 @@ Run once and keep the model resident:
 ```bash
 QWENBURST_LOWBIT_ROWS_PER_CTA=8 \
 qwenburst-server \
+  --adapter qwen36 \
+  --runtime-profile stateful \
   --hf-model /home/user/models/Qwen3.6-27B \
-  --qb-model /home/user/models/Qwen3.6-27B-qb3 \
+  --qb-model /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
   --host 0.0.0.0 \
   --port 8008 \
   --recent-window 256
@@ -103,10 +119,20 @@ Smoke:
 ```bash
 curl -sS http://127.0.0.1:8008/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwenburst-qwen3.6-27b-q3","messages":[{"role":"user","content":"Say hello."}],"max_tokens":16,"temperature":0}'
+  -d '{"model":"qwenburst-qwen3.6-27b-q4-marlin","messages":[{"role":"user","content":"Say hello."}],"max_tokens":16,"temperature":0}'
 ```
 
 SSE streaming is supported with `"stream": true`.
+
+Inspect enabled runtime features:
+
+```bash
+curl http://127.0.0.1:8008/v1/qwenburst/features
+```
+
+The OpenAI-compatible chat endpoint also accepts per-request runtime overrides
+such as `"runtime_profile": "original"`, `"kv_window_policy": "ring"`,
+`"block_prefill": true`, or `"prefill_chunk_size": 64`.
 
 ## Runtime Tuning
 
@@ -124,6 +150,24 @@ Benchmark without rebuilding:
 python benchmarks/bench_kernels.py --bits 3 --rows-per-cta 8
 ```
 
+CUDA Graph is gated by audit, not enabled by default:
+
+```bash
+qwenburst-graph-audit --static
+```
+
+The current blocker is architectural: decode state still uses Python `pos` /
+`kv_len` counters and Python ring-KV logical views. Do not count CUDA Graph as a
+speed feature until a real device-counter `GraphDecodeState` path lands.
+
+Long prompt prefill uses chunked `forward_block` by default in every runtime
+profile. This preserves target-model math while avoiding the old token-by-token
+prefill loop. Disable it only for regression bisects:
+
+```bash
+qwenburst-chat --block-prefill off ...
+```
+
 Current dmc8 result for q3 5120x5120 GEMV:
 
 ```text
@@ -132,62 +176,66 @@ rows_per_cta=8  : ~56.8 us
 rows_per_cta=16 : ~119.0 us
 ```
 
-The current champion is `8`. This is still not enough for 100 tok/s; the next
-major bottleneck is the scalar low-bit MLP projection path, not GDN recurrence.
+The rowwise fallback champion is `8`. The current speed path is Q4 Marlin, so
+rowwise GEMV tuning is only relevant for fallback tensors and embeddings.
 
-## DFlash Speculative Path
+## Current Champion
 
-Do not wire guessed native-MTP code into qwenburst, and do not replace the
-qwenburst target runtime with vLLM/SGLang. DFlash must be a draft adapter:
-
-```text
-DFlash draft proposes tokens -> qwenburst target verifies -> qwenburst commits
-```
-
-Default pairing:
-
-```text
-target: /home/user/models/Qwen3.6-27B-qb3 through qwenburst
-draft : z-lab/Qwen3.6-27B-DFlash
-```
-
-On a 16GB GPU the draft path must also have an explicit memory budget. The
-target model is already the q3/q4 low-bit qwenburst checkpoint, so a DFlash
-adapter may not silently load a large fp16 side model. The acceptable forms are:
-
-```text
-1. DFlash weights are already compact enough to stay resident beside q3 target.
-2. DFlash weights are converted to qwenburst low-bit draft tensors.
-3. DFlash reuses target hidden/state and only stores small draft heads.
-```
-
-If the DFlash safetensors structure requires a full fp16 draft network, it must
-be quantized before it is enabled by default.
-
-The server already exposes the runtime option placeholder:
+The current 16GB path is target-only Q4 Marlin with fused projections:
 
 ```bash
-qwenburst-server --speculative-backend none
+python -m qwenburst.quantize \
+  /home/user/models/Qwen3.6-27B \
+  /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
+  --bits 4 \
+  --layout marlin \
+  --group-size 128 \
+  --fuse-projections
 ```
 
-DFlash artifacts use a separate conversion command:
+Run it with all target weights GPU-resident:
 
 ```bash
-python -m qwenburst.dflash inspect /path/to/Qwen3.6-27B-DFlash
-python -m qwenburst.dflash convert /path/to/Qwen3.6-27B-DFlash /home/user/models/Qwen3.6-27B-DFlash-qb3 --bits 3
+python -m qwenburst.generate \
+  --adapter qwen36 \
+  --hf-model /home/user/models/Qwen3.6-27B \
+  --qb-model /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
+  --device cuda \
+  --recent-window 256 \
+  --max-new-tokens 512 \
+  --stats \
+  --prompt "Write a concise technical note about quantized LLM inference."
 ```
 
-Then the server can load the converted draft adapter without launching another
-runtime:
+Latest dmc8 result:
+
+```text
+128-token English: 29.63 tok/s
+512-token English: 34.03 tok/s
+```
+
+Detailed per-change speed history is in `docs/PERFORMANCE_LOG.md`.
+State/runtime feature coverage is in `docs/V05_FEATURE_TEST_MATRIX.md`.
+DFlash-free speculative research is in `docs/SPECULATIVE_RESEARCH.md`.
+
+Break down decode bottlenecks without changing the serving path:
 
 ```bash
-qwenburst-server \
-  --speculative-backend dflash \
-  --dflash-draft-dir /home/user/models/Qwen3.6-27B-DFlash-qb3
+qwenburst-profile \
+  --hf-model /home/user/models/Qwen3.6-27B \
+  --qb-model /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
+  --max-new-tokens 16
 ```
 
-The native qwenburst DFlash proposal executor is still the remaining work item;
-the option is intentionally wired to the adapter boundary instead of vLLM.
+Compare feature profiles when the GPU is free:
+
+```bash
+qwenburst-bench-profiles \
+  --hf-model /home/user/models/Qwen3.6-27B \
+  --qb-model /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
+  --profiles original,stateful,research \
+  --max-new-tokens 128
+```
 
 ## dmc8 One-Shot
 
@@ -224,6 +272,7 @@ python -m pytest -q \
 
 ## Current Speed Boundary
 
-The qwenburst kernel path is currently limited by low-bit MLP projection.
-Reaching 100 emitted tok/s requires either a DFlash draft adapter verified by
-qwenburst or a stronger dequant+MMA projection kernel.
+The qwenburst kernel path is currently dominated by target-model Marlin
+projection work, especially MLP `gate_up` and `down` projections. Reaching 100
+emitted tok/s requires native MTP/NEXTN with an exact target-compatible accept
+contract, or a deeper fused target layer path that preserves logits.

@@ -4,86 +4,54 @@
 
 QwenBurst is a narrow Qwen3.6-27B text runtime for one 16GB Ada GPU. It keeps
 the custom runtime focused on target-model correctness, low-bit weights, GDN
-state, and OpenAI-compatible serving.
-
-Speculative acceleration must keep qwenburst as the target runtime. DFlash can
-only be added as a draft adapter feeding candidates into qwenburst verification.
-Do not switch the target runtime to vLLM/SGLang.
+state, fused projection checkpoints, and OpenAI-compatible serving.
 
 ## Runtime Split
 
 ```text
 qwenburst target path
-  - q3/q4 low-bit checkpoint
-  - custom CUDA lowbit GEMV
+  - q4 Marlin fused checkpoint
+  - GPU-resident target weights
   - Qwen3.6 Gated DeltaNet recurrence
+  - fused GDN gate/decay and depthwise conv kernels
   - qwenburst-server OpenAI-compatible API
-
-DFlash speculative option
-  - qwenburst remains the target verifier
-  - trained z-lab Qwen3.6-27B DFlash draft model proposes candidates
-  - qwenburst verifies and commits accepted tokens
-  - draft weights must be compact, low-bit, or target-state-reusing on 16GB
 ```
 
-## DFlash Memory Policy
-
-The qwenburst target model owns the correctness path and should remain GPU
-resident as the q3/q4 checkpoint. A DFlash adapter is only valid if its own
-weights fit the remaining VRAM without forcing target offload. If the published
-DFlash safetensors file is a full fp16 draft network, convert it to qwenburst
-low-bit draft tensors before enabling `--speculative-backend dflash`.
-
-The current public Qwen3.6-27B DFlash artifact is a BF16 drafter component, not
-a normal target CausalLM. Treat it as a side model with its own memory budget;
-for 16GB deployment the default path is q3 draft conversion.
-
-The adapter contract is:
+The runtime follows the same separation used by mature editor/server runtimes
+such as VS Code extensions and vLLM model executors, but compressed for this
+single-user engine:
 
 ```text
-target forward collects DFlash target_layer_ids hidden taps
-converted DFlash draft predicts a block of candidates
-qwenburst target verifies candidates on a forked DecodeState
-accepted tokens are committed to the real DecodeState
+ModelAdapter       owns architecture-specific config, weights, tokenizer, state
+RuntimeEngine      owns prefill/decode/streaming/generation orchestration
+RuntimeFeatures    owns runtime capability defaults
+RuntimeFeatureOverride owns per-call/CLI/bench overrides
 ```
+
+`generate.py`, `server.py`, and `bench_profiles.py` must stay thin consumers of
+`RuntimeEngine`; they should not reimplement prefill or decode loops.
 
 ## Current Bottleneck
 
-The GDN recurrent kernel is not the limiting path. The main target-runtime cost
-is low-bit projection, especially MLP `gate_proj`, `up_proj`, and `down_proj`.
+The current champion is target-only Q4 Marlin fused projection decoding. It is
+correct, all-GPU, and avoids CPU offload. Remaining speed work must preserve
+the exact target-model output distribution.
 
-The current qwenburst kernel path is useful for correctness and controlled
-experiments, but 100+ emitted tok/s needs either:
-
-1. a real block verifier inside `QwenBurstModel.forward_block`, backed by GDN
-   block scan and batched low-bit projection, and
-2. a much stronger low-bit dequant+MMA projection kernel.
-
-The DFlash adapter is now wired and can generate correct text, but it is not
-faster while `forward_block` internally verifies accepted tokens through the
-single-token recurrent path. DFlash only becomes a speed feature after the
-target verifier can process candidate blocks faster than one `forward_one` per
-emitted token.
-
-Latest dmc8 measurement, Qwen3.6-27B q3 target plus q3 DFlash draft:
+Latest dmc8 measurement, Qwen3.6-27B Q4 Marlin fused target:
 
 ```text
-target-only, gpu embed/head: 6.10 tok/s
-DFlash block=4:             5.30 tok/s
-DFlash profile:
-  prefill: 2.15 s
-  draft:   0.60 s
-  verify:  1.78 s
+128-token English: 29.63 tok/s
+512-token English: 34.03 tok/s
 ```
 
-This means draft overhead is visible, but the decisive blocker is target block
-verification: verify time is still essentially the same target work as normal
-decode. The next canonical optimization point is therefore `forward_block`, not
-another speculative wrapper.
+The per-change performance history is recorded in `PERFORMANCE_LOG.md`.
 
-The default and only DFlash verification path is the early-stop verifier. Failed
-experimental verifier variants should not be kept as runtime options; new speed
-work must land behind `forward_block` itself.
+The remaining target-only cost is dominated by Marlin projection work. A short
+CUDA profile after the attention and gate fixes showed MLP `gate_up` and `down`
+as the largest categories; `lm_head` is no longer the primary bottleneck. The
+model includes native MTP weights, but they are not enabled until an exact
+accept/verify contract is implemented and shown to preserve greedy target
+output.
 
 ## Correctness Policy
 
@@ -92,6 +60,5 @@ No speed claim is valid until all numbers include:
 - backend and model path,
 - quantization level,
 - prompt and max token count,
-- accepted draft tokens per target step if using DFlash,
 - end-to-end tok/s from the serving API,
 - sanity output text.

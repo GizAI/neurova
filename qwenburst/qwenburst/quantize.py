@@ -245,6 +245,19 @@ def write_array(path: Path, arr: np.ndarray) -> None:
         f.write(arr.tobytes(order="C"))
 
 
+def write_fp16_tensor(*, out_dir: Path, index: dict, name: str, tensor: torch.Tensor) -> None:
+    rel = name.replace(".", "__")
+    arr = tensor.detach().cpu().to(torch.float16).contiguous().numpy()
+    raw_path = Path("fp16") / f"{rel}.fp16.bin"
+    write_array(out_dir / raw_path, arr)
+    index["tensors"][name] = {
+        "kind": "fp16_raw",
+        "path": str(raw_path),
+        "shape": list(tensor.shape),
+        "dtype": "float16",
+    }
+
+
 def build_tensor_locations(model_dir: Path) -> dict[str, Path]:
     locations: dict[str, Path] = {}
     for st_path in iter_safetensors(model_dir):
@@ -270,6 +283,12 @@ def build_fusion_plan(names: set[str]) -> tuple[dict[str, tuple[str, ...]], set[
                 fused = name.replace(".in_proj_qkv.weight", ".in_proj_qkvz.weight")
                 plan[fused] = (name, z)
                 skip.update((name, z))
+        elif name.endswith(".linear_attn.in_proj_b.weight") or name.endswith(".linear_attention.in_proj_b.weight"):
+            a = name.replace(".in_proj_b.weight", ".in_proj_a.weight")
+            if a in names:
+                fused = name.replace(".in_proj_b.weight", ".in_proj_ba.weight")
+                plan[fused] = (name, a)
+                skip.update((name, a))
         elif name.endswith(".self_attn.q_proj.weight"):
             k = name.replace(".q_proj.weight", ".k_proj.weight")
             v = name.replace(".q_proj.weight", ".v_proj.weight")
@@ -378,16 +397,7 @@ def convert(
                     )
                     count += 1
                 else:
-                    rel = name.replace(".", "__")
-                    arr = tensor.detach().cpu().to(torch.float16).contiguous().numpy()
-                    raw_path = Path("fp16") / f"{rel}.fp16.bin"
-                    write_array(out_dir / raw_path, arr)
-                    index["tensors"][name] = {
-                        "kind": "fp16_raw",
-                        "path": str(raw_path),
-                        "shape": list(tensor.shape),
-                        "dtype": "float16",
-                    }
+                    write_fp16_tensor(out_dir=out_dir, index=index, name=name, tensor=tensor)
         if max_tensors is not None and count >= max_tensors:
             break
 
@@ -395,6 +405,12 @@ def convert(
         for fused_name, source_names in tqdm(fusion_plan.items(), desc="fused projections"):
             parts = [read_source_tensor(src, locations) for src in source_names]
             tensor = torch.cat(parts, dim=0)
+            if fused_name.endswith(".in_proj_ba.weight") and layout == "marlin":
+                # Qwen3.6 in_proj_ba is only 96 output rows, below Marlin's
+                # N%256 contract. FP16 fused ba is faster than two tiny scalar
+                # low-bit GEMVs and avoids quantizing recurrent gates.
+                write_fp16_tensor(out_dir=out_dir, index=index, name=fused_name, tensor=tensor)
+                continue
             write_quantized_tensor(
                 out_dir=out_dir,
                 index=index,

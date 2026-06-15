@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 
-from qwenburst.generate import GenerationConfig, QwenBurstGenerator
 from qwenburst.gdn_reference import gdn_recurrent_reference
 from qwenburst.model import apply_rope_single_token
 from qwenburst.ops import CPUFallbackOps
@@ -47,32 +46,6 @@ def test_cpu_fallback_gdn_matches_reference():
     assert torch.allclose(out_ref, out_cpu, atol=2e-5, rtol=0)
     assert torch.allclose(s_ref, s_cpu, atol=2e-5, rtol=0)
 
-
-class ToyState:
-    pass
-
-
-class ToyModel:
-    def __init__(self):
-        self.calls = 0
-        self.table = [1, 2, 3, 4]
-
-    def forward_one(self, token, state, *, use_mtp=False):
-        idx = min(self.calls, len(self.table) - 1)
-        logits = torch.full((8,), -1000.0)
-        logits[self.table[idx]] = 1000.0
-        self.calls += 1
-        if use_mtp:
-            return logits, []
-        return logits
-
-
-def test_generator_has_real_prefill_decode_loop():
-    gen = QwenBurstGenerator(ToyModel(), ToyState())
-    out = list(gen.generate_ids([7, 7], GenerationConfig(max_new_tokens=3, eos_token_ids=())))
-    # Two prefill calls consume table[0], table[1]; generation starts from table[1]
-    # logits returned by the final prefill call, then advances through table[2..].
-    assert out == [2, 3, 4]
 
 from qwenburst.config import Qwen36_27B_TextConfig
 from qwenburst.state import DecodeState

@@ -126,6 +126,43 @@ class CPUFallbackOps:
         return out.to(v.dtype)
 
     @staticmethod
+    def gdn_recurrent_ab(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        beta = torch.sigmoid(b).to(torch.float16).contiguous()
+        g = (-torch.exp(A_log.to(a.device)) * torch.nn.functional.softplus(a.float() + dt_bias.to(a.device))).contiguous()
+        return CPUFallbackOps.gdn_recurrent(q, k, v, g, beta, state)
+
+    @staticmethod
+    def depthwise_conv_update(state: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        if weight.ndim == 3:
+            w = weight[:, 0, :]
+        else:
+            w = weight
+        window = torch.cat([state, x[:, None]], dim=1)
+        y = (window * w.to(device=x.device, dtype=x.dtype)).sum(dim=1)
+        if bias.numel() > 0:
+            y = y + bias.to(device=x.device, dtype=x.dtype)
+        if state.numel() > 0:
+            state[:, :-1] = state[:, 1:].clone()
+            state[:, -1] = x
+        return torch.nn.functional.silu(y)
+
+    @staticmethod
+    def depthwise_conv_update_scan(state: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        outs = []
+        for row in x:
+            outs.append(CPUFallbackOps.depthwise_conv_update(state, row.contiguous(), weight, bias))
+        return torch.stack(outs, dim=0).contiguous()
+
+    @staticmethod
     def attention_decode_fp16(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, length: int, scale: float) -> torch.Tensor:
         qf = q.to(torch.float32)
         kf = k_cache[:, :length, :].to(torch.float32)

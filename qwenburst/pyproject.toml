@@ -30,6 +30,10 @@ qwenburst-infinite-demo = "qwenburst.infinite_demo:main"
 qwenburst-chat = "qwenburst.generate:main"
 qwenburst-audit = "qwenburst.audit:main"
 qwenburst-server = "qwenburst.server:main"
+qwenburst-speculative = "qwenburst.speculative:main"
+qwenburst-graph-audit = "qwenburst.graph:main"
+qwenburst-profile = "qwenburst.profile:main"
+qwenburst-bench-profiles = "qwenburst.bench_profiles:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

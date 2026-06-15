@@ -92,7 +92,7 @@ class DecodeState:
             for layer in cfg.gdn_layers
         }
         attn_k = {
-            layer: torch.empty(
+            layer: torch.zeros(
                 cfg.num_key_value_heads,
                 max_seq_len,
                 cfg.attention_head_dim,
@@ -101,7 +101,7 @@ class DecodeState:
             )
             for layer in cfg.attention_layers
         }
-        attn_v = {layer: torch.empty_like(attn_k[layer]) for layer in cfg.attention_layers}
+        attn_v = {layer: torch.zeros_like(attn_k[layer]) for layer in cfg.attention_layers}
         return cls(
             cfg=cfg,
             gdn_states=gdn_states,
@@ -165,7 +165,7 @@ class DecodeState:
             tensor.mul_(factor)
 
     def fork(self, *, clone_attention: bool = True) -> "DecodeState":
-        """Create an independent branch state for speculative/beam search."""
+        """Create an independent branch state for block or beam-style evaluation."""
         return DecodeState(
             cfg=self.cfg,
             gdn_states={k: v.clone() for k, v in self.gdn_states.items()},
@@ -289,9 +289,12 @@ class DecodeState:
             "gdn_conv_states": {k: v.detach().cpu() for k, v in self.gdn_conv_states.items()},
         }
         if include_attention_kv:
-            # Store only the live prefix/window, not uninitialized capacity.
-            payload["attn_k"] = {k: v[:, : self.kv_len, :].detach().cpu() for k, v in self.attn_k.items()}
-            payload["attn_v"] = {k: v[:, : self.kv_len, :].detach().cpu() for k, v in self.attn_v.items()}
+            # Store the physical ring buffers, not only a prefix. Once the ring
+            # has wrapped, the live logical window is split across the end and
+            # beginning of the allocation; saving a prefix would corrupt
+            # warm-boot continuation.
+            payload["attn_k"] = {k: v.detach().cpu() for k, v in self.attn_k.items()}
+            payload["attn_v"] = {k: v.detach().cpu() for k, v in self.attn_v.items()}
         return payload
 
     def save_snapshot(self, path: str | Path, *, include_attention_kv: bool = True) -> None:
@@ -309,7 +312,7 @@ class DecodeState:
         dtype: torch.dtype | None = None,
         max_seq_len: int | None = None,
     ) -> "DecodeState":
-        payload = torch.load(Path(path), map_location="cpu")
+        payload = torch.load(Path(path), map_location="cpu", weights_only=True)
         info = payload["info"]
         if int(info.get("schema_version", 0)) != 3:
             raise ValueError(f"unsupported snapshot schema: {info.get('schema_version')}")

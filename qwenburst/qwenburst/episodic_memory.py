@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import math
 import hashlib
+import re
 
 import torch
 import torch.nn.functional as F
@@ -33,8 +34,7 @@ class HashEmbedding:
 
     def encode(self, text: str) -> torch.Tensor:
         vec = torch.zeros(self.dim, dtype=torch.float32)
-        for raw in text.lower().replace("/", " ").replace("_", " ").split():
-            token = raw.strip(".,:;()[]{}<>!?\"'")
+        for token in re.findall(r"[0-9a-zA-Z가-힣]+", text.lower()):
             if not token:
                 continue
             h = int(hashlib.blake2b(token.encode("utf-8"), digest_size=8).hexdigest(), 16)
