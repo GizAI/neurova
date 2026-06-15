@@ -67,6 +67,18 @@ class CPUFallbackOps:
         raise RuntimeError("lowbit_marlin_gemm requires qwenburst_cuda")
 
     @staticmethod
+    def lowbit_marlin_gemm_out(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        workspace: torch.Tensor,
+        cols: int,
+        group_size: int,
+    ) -> None:
+        raise RuntimeError("lowbit_marlin_gemm_out requires qwenburst_cuda")
+
+    @staticmethod
     def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         x32 = x.to(torch.float32)
         inv = torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps)

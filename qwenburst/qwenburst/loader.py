@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -73,6 +73,8 @@ class LowBitMarlinTensor:
     group_size: int
     bits: int = 4
     exec_bits: int = 4
+    _out_cache: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
+    _workspace: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def gemv(self, x: torch.Tensor) -> torch.Tensor:
         return self.gemm(x.reshape(1, -1).contiguous()).reshape(-1)
@@ -82,13 +84,26 @@ class LowBitMarlinTensor:
             raise ValueError("gemm expects x [batch, cols]")
         if self.qweight.device.type != "cuda":
             raise RuntimeError("Marlin tensors require CUDA")
-        return cuda_ops().lowbit_marlin_gemm(
+        x = x.to(device=self.qweight.device, dtype=torch.float16).contiguous()
+        batch = int(x.size(0))
+        rows = int(self.qweight.size(1) // 2)
+        out = self._out_cache.get(batch)
+        if out is None or out.device != self.qweight.device or out.size(1) != rows:
+            out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
+            self._out_cache[batch] = out
+        workspace_size = max(1, rows // 128 * 16)
+        if self._workspace is None or self._workspace.device != self.qweight.device or self._workspace.numel() < workspace_size:
+            self._workspace = torch.zeros((workspace_size,), device=self.qweight.device, dtype=torch.int32)
+        cuda_ops().lowbit_marlin_gemm_out(
             self.qweight,
             self.scales,
-            x.to(device=self.qweight.device, dtype=torch.float16).contiguous(),
+            x,
+            out,
+            self._workspace,
             self.cols,
             self.group_size,
         )
+        return out
 
     def row_dequant(self, row: int | torch.Tensor) -> torch.Tensor:
         raise RuntimeError("Marlin layout does not support row_dequant; keep embeddings in rowwise layout")

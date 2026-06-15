@@ -23,11 +23,14 @@ int marlin_cuda(
   int max_par = 16
 );
 
-torch::Tensor lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size) {
+static void run_lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, torch::Tensor out, torch::Tensor workspace, int64_t cols, int64_t group_size) {
   QB_CHECK_CUDA(qweight); QB_CHECK_CUDA(scales); QB_CHECK_CUDA(x);
-  QB_CHECK_CONTIGUOUS(qweight); QB_CHECK_CONTIGUOUS(scales); QB_CHECK_CONTIGUOUS(x);
+  QB_CHECK_CUDA(out); QB_CHECK_CUDA(workspace);
+  QB_CHECK_CONTIGUOUS(qweight); QB_CHECK_CONTIGUOUS(scales); QB_CHECK_CONTIGUOUS(x); QB_CHECK_CONTIGUOUS(out); QB_CHECK_CONTIGUOUS(workspace);
   TORCH_CHECK(qweight.scalar_type() == at::kInt, "marlin qweight must be int32");
   QB_CHECK_HALF(scales); QB_CHECK_HALF(x);
+  QB_CHECK_HALF(out);
+  TORCH_CHECK(workspace.scalar_type() == at::kInt, "marlin workspace must be int32");
   TORCH_CHECK(x.dim() == 2, "x must be [batch, cols]");
   TORCH_CHECK(x.size(1) == cols, "x cols mismatch");
   TORCH_CHECK(cols % 128 == 0, "Marlin requires K divisible by 128");
@@ -38,17 +41,17 @@ torch::Tensor lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, to
   const int prob_n = static_cast<int>(qweight.size(1) / 2);
   TORCH_CHECK(prob_n % 256 == 0, "Marlin requires N divisible by 256");
   TORCH_CHECK(scales.dim() == 2 && scales.size(1) == prob_n, "marlin scales must be [K/group, N]");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == prob_m && out.size(1) == prob_n, "marlin out shape mismatch");
   int groupsize = static_cast<int>(group_size);
   if (groupsize <= 0 || groupsize == prob_k) groupsize = -1;
   TORCH_CHECK(groupsize == -1 || (groupsize == 128 && scales.size(0) == prob_k / groupsize), "Marlin supports group_size -1 or 128");
-  auto y = torch::empty({prob_m, prob_n}, x.options());
   constexpr int max_par = 16;
-  auto workspace = torch::zeros({prob_n / 128 * max_par}, torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
+  TORCH_CHECK(workspace.numel() >= prob_n / 128 * max_par, "marlin workspace too small");
   const int dev = x.get_device();
   int err = marlin_cuda(
     x.data_ptr(),
     qweight.data_ptr(),
-    y.data_ptr(),
+    out.data_ptr(),
     scales.data_ptr(),
     prob_m,
     prob_n,
@@ -63,7 +66,20 @@ torch::Tensor lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, to
     max_par
   );
   TORCH_CHECK(err == 0, "Marlin kernel failed with code ", err);
+}
+
+torch::Tensor lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size) {
+  TORCH_CHECK(x.dim() == 2, "x must be [batch, cols]");
+  TORCH_CHECK(qweight.dim() == 2 && qweight.size(1) % 2 == 0, "marlin qweight must be [K/16, N*2]");
+  const int64_t prob_n = qweight.size(1) / 2;
+  auto y = torch::empty({x.size(0), prob_n}, x.options());
+  auto workspace = torch::zeros({prob_n / 128 * 16}, torch::TensorOptions().dtype(torch::kInt32).device(x.device()));
+  run_lowbit_marlin_gemm(qweight, scales, x, y, workspace, cols, group_size);
   return y;
+}
+
+void lowbit_marlin_gemm_out(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, torch::Tensor out, torch::Tensor workspace, int64_t cols, int64_t group_size) {
+  run_lowbit_marlin_gemm(qweight, scales, x, out, workspace, cols, group_size);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -104,6 +120,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("qweight"),
         py::arg("scales"),
         py::arg("x"),
+        py::arg("cols"),
+        py::arg("group_size"));
+  m.def("lowbit_marlin_gemm_out", &lowbit_marlin_gemm_out,
+        "Marlin W4A16 GEMM into preallocated output/workspace",
+        py::arg("qweight"),
+        py::arg("scales"),
+        py::arg("x"),
+        py::arg("out"),
+        py::arg("workspace"),
         py::arg("cols"),
         py::arg("group_size"));
   m.def("rmsnorm", &rmsnorm, "RMSNorm fp16");

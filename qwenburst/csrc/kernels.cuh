@@ -24,6 +24,7 @@
 torch::Tensor lowbit_gemv(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size, int64_t bits, int64_t rows_per_cta);
 torch::Tensor lowbit_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size, int64_t bits, int64_t rows_per_cta);
 torch::Tensor lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, int64_t cols, int64_t group_size);
+void lowbit_marlin_gemm_out(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, torch::Tensor out, torch::Tensor workspace, int64_t cols, int64_t group_size);
 std::vector<torch::Tensor> lowbit_gemv_pair(
     torch::Tensor qweight_a,
     torch::Tensor scales_a,

@@ -148,6 +148,14 @@ def linear_any(w: TensorLike, x: torch.Tensor) -> torch.Tensor:
     return torch.matmul(w.value.to(device=x.device, dtype=x.dtype), x)
 
 
+def tensor_rows(w: TensorLike) -> int:
+    if isinstance(w, LowBitMarlinTensor):
+        return int(w.qweight.size(1) // 2)
+    if isinstance(w, LowBitTensor):
+        return int(w.qweight.size(0))
+    return int(w.value.size(0))
+
+
 def embed_lookup(w: TensorLike, token: torch.Tensor) -> torch.Tensor:
     if isinstance(w, LowBitTensor):
         return w.row_dequant(token)
@@ -288,12 +296,17 @@ class QwenBurstMLP:
                 raise ValueError("either layer or prefix is required")
             prefix = f"model.layers.{layer}"
         p = f"{prefix}.mlp"
-        self.gate = w.any_linear(f"{p}.gate_proj.weight")
-        self.up = w.any_linear(f"{p}.up_proj.weight")
+        self.gate_up = w.optional(f"{p}.gate_up_proj.weight")
+        self.gate = None if self.gate_up is not None else w.any_linear(f"{p}.gate_proj.weight")
+        self.up = None if self.gate_up is not None else w.any_linear(f"{p}.up_proj.weight")
         self.down = w.any_linear(f"{p}.down_proj.weight")
+        self.intermediate_size = tensor_rows(self.gate_up) // 2 if self.gate_up is not None else tensor_rows(self.gate)  # type: ignore[arg-type]
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if isinstance(self.gate, LowBitTensor) and isinstance(self.up, LowBitTensor):
+        if self.gate_up is not None:
+            mixed = linear_any(self.gate_up, x)
+            gate, up = torch.split(mixed, [self.intermediate_size, self.intermediate_size], dim=-1)
+        elif isinstance(self.gate, LowBitTensor) and isinstance(self.up, LowBitTensor):
             gate, up = lowbit_linear_pair_on_device(self.gate, self.up, x, x.device)
         else:
             gate = linear_any(self.gate, x)
@@ -301,8 +314,12 @@ class QwenBurstMLP:
         return linear_any(self.down, F.silu(gate) * up)
 
     def forward_block(self, x: torch.Tensor) -> torch.Tensor:
-        gate = linear_any(self.gate, x)
-        up = linear_any(self.up, x)
+        if self.gate_up is not None:
+            mixed = linear_any(self.gate_up, x)
+            gate, up = torch.split(mixed, [self.intermediate_size, self.intermediate_size], dim=-1)
+        else:
+            gate = linear_any(self.gate, x)
+            up = linear_any(self.up, x)
         return linear_any(self.down, F.silu(gate) * up)
 
 
@@ -326,8 +343,8 @@ class QwenBurstGDNLayer:
         self.in_b = weights.optional(*(f"{la}.in_proj_b.weight" for la in la_candidates))
         if self.in_qkvz is None and self.in_qkv is None:
             raise KeyError(f"layer {layer}: missing GDN projections")
-        if self.in_qkvz is not None and self.in_ba is None:
-            raise KeyError(f"layer {layer}: fused qkvz requires in_proj_ba")
+        if self.in_qkvz is not None and self.in_ba is None and not all(t is not None for t in (self.in_a, self.in_b)):
+            raise KeyError(f"layer {layer}: fused qkvz requires in_proj_ba or in_proj_a/in_proj_b")
         if self.in_qkv is not None and not all(t is not None for t in (self.in_z, self.in_a, self.in_b)):
             raise KeyError(f"layer {layer}: split qkv requires in_proj_z/in_proj_a/in_proj_b")
 
@@ -342,12 +359,25 @@ class QwenBurstGDNLayer:
     def project(self, x: torch.Tensor):
         if self.in_qkvz is not None:
             mixed_qkvz = linear_any(self.in_qkvz, x)
-            mixed_ba = linear_any(self.in_ba, x)  # type: ignore[arg-type]
+            if self.in_ba is not None:
+                mixed_ba = linear_any(self.in_ba, x)
+            elif isinstance(self.in_a, LowBitTensor) and isinstance(self.in_b, LowBitTensor):
+                a, b = lowbit_linear_pair_on_device(self.in_a, self.in_b, x, x.device)
+                mixed_ba = torch.cat([b.reshape(-1), a.reshape(-1)], dim=0)
+            else:
+                b = linear_any(self.in_b, x)  # type: ignore[arg-type]
+                a = linear_any(self.in_a, x)  # type: ignore[arg-type]
+                mixed_ba = torch.cat([b.reshape(-1), a.reshape(-1)], dim=0)
             return split_gdn_fused_qkvz(self.cfg, mixed_qkvz, mixed_ba)
         q, k, v = split_gdn_qkv(self.cfg, linear_any(self.in_qkv, x))  # type: ignore[arg-type]
         z = linear_any(self.in_z, x).view(self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim)  # type: ignore[arg-type]
-        a = linear_any(self.in_a, x).reshape(self.cfg.linear_num_value_heads)  # type: ignore[arg-type]
-        b = linear_any(self.in_b, x).reshape(self.cfg.linear_num_value_heads)  # type: ignore[arg-type]
+        if isinstance(self.in_a, LowBitTensor) and isinstance(self.in_b, LowBitTensor):
+            a, b = lowbit_linear_pair_on_device(self.in_a, self.in_b, x, x.device)
+        else:
+            a = linear_any(self.in_a, x)  # type: ignore[arg-type]
+            b = linear_any(self.in_b, x)  # type: ignore[arg-type]
+        a = a.reshape(self.cfg.linear_num_value_heads)
+        b = b.reshape(self.cfg.linear_num_value_heads)
         return q.contiguous(), k.contiguous(), v.contiguous(), z.contiguous(), b.contiguous(), a.contiguous()
 
     def project_block(self, x: torch.Tensor):
@@ -356,15 +386,28 @@ class QwenBurstGDNLayer:
         value_dim = self.cfg.linear_value_head_dim * self.cfg.linear_num_value_heads
         if self.in_qkvz is not None:
             mixed_qkvz = linear_any(self.in_qkvz, x)
-            mixed_ba = linear_any(self.in_ba, x)  # type: ignore[arg-type]
+            if self.in_ba is not None:
+                mixed_ba = linear_any(self.in_ba, x)
+            elif x.size(0) == 1 and isinstance(self.in_a, LowBitTensor) and isinstance(self.in_b, LowBitTensor):
+                a1, b1 = lowbit_linear_pair_on_device(self.in_a, self.in_b, x.reshape(-1), x.device)
+                mixed_ba = torch.cat([b1.reshape(1, -1), a1.reshape(1, -1)], dim=-1)
+            else:
+                b = linear_any(self.in_b, x)  # type: ignore[arg-type]
+                a = linear_any(self.in_a, x)  # type: ignore[arg-type]
+                mixed_ba = torch.cat([b.reshape(x.size(0), -1), a.reshape(x.size(0), -1)], dim=-1)
             q, k, v, z = torch.split(mixed_qkvz, [key_dim, key_dim, value_dim, value_dim], dim=-1)
             b, a = torch.split(mixed_ba, [self.cfg.linear_num_value_heads, self.cfg.linear_num_value_heads], dim=-1)
         else:
             qkv = linear_any(self.in_qkv, x)  # type: ignore[arg-type]
             q, k, v = torch.split(qkv, [key_dim, key_dim, value_dim], dim=-1)
             z = linear_any(self.in_z, x)  # type: ignore[arg-type]
-            a = linear_any(self.in_a, x)  # type: ignore[arg-type]
-            b = linear_any(self.in_b, x)  # type: ignore[arg-type]
+            if x.size(0) == 1 and isinstance(self.in_a, LowBitTensor) and isinstance(self.in_b, LowBitTensor):
+                a1, b1 = lowbit_linear_pair_on_device(self.in_a, self.in_b, x.reshape(-1), x.device)
+                a = a1.reshape(1, -1)
+                b = b1.reshape(1, -1)
+            else:
+                a = linear_any(self.in_a, x)  # type: ignore[arg-type]
+                b = linear_any(self.in_b, x)  # type: ignore[arg-type]
         return (
             q.view(t, self.cfg.linear_num_key_heads, self.cfg.linear_key_head_dim).contiguous(),
             k.view(t, self.cfg.linear_num_key_heads, self.cfg.linear_key_head_dim).contiguous(),
@@ -435,9 +478,12 @@ class QwenBurstAttentionLayer:
         sa = f"{p}.self_attn"
         self.input_norm = weights.fp16(f"{p}.input_layernorm.weight", f"{p}.input_norm.weight")
         self.post_norm = weights.fp16(f"{p}.post_attention_layernorm.weight", f"{p}.post_norm.weight")
-        self.q_proj = weights.any_linear(f"{sa}.q_proj.weight")
-        self.k_proj = weights.any_linear(f"{sa}.k_proj.weight")
-        self.v_proj = weights.any_linear(f"{sa}.v_proj.weight")
+        self.qkv_proj = weights.optional(f"{sa}.qkv_proj.weight")
+        self.q_proj = None if self.qkv_proj is not None else weights.any_linear(f"{sa}.q_proj.weight")
+        self.k_proj = None if self.qkv_proj is not None else weights.any_linear(f"{sa}.k_proj.weight")
+        self.v_proj = None if self.qkv_proj is not None else weights.any_linear(f"{sa}.v_proj.weight")
+        kv_rows = self.cfg.num_key_value_heads * self.cfg.attention_head_dim
+        self.qkv_q_rows = tensor_rows(self.qkv_proj) - 2 * kv_rows if self.qkv_proj is not None else tensor_rows(self.q_proj)  # type: ignore[arg-type]
         self.o_proj = weights.any_linear(f"{sa}.o_proj.weight")
         self.q_norm = weights.optional_fp16(f"{sa}.q_norm.weight")
         self.k_norm = weights.optional_fp16(f"{sa}.k_norm.weight")
@@ -447,7 +493,14 @@ class QwenBurstAttentionLayer:
         ops = cuda_ops()
         residual = x
         x = qwen_rmsnorm(x.contiguous(), self.input_norm, self.cfg.rms_norm_eps)
-        q_all = linear_any(self.q_proj, x)
+        if self.qkv_proj is not None:
+            qkv_all = linear_any(self.qkv_proj, x)
+            kv_rows = self.cfg.num_key_value_heads * self.cfg.attention_head_dim
+            q_all, k_all, v_all = torch.split(qkv_all, [self.qkv_q_rows, kv_rows, kv_rows], dim=0)
+        else:
+            q_all = linear_any(self.q_proj, x)  # type: ignore[arg-type]
+            k_all = linear_any(self.k_proj, x)  # type: ignore[arg-type]
+            v_all = linear_any(self.v_proj, x)  # type: ignore[arg-type]
         q_dim = self.cfg.num_attention_heads * self.cfg.attention_head_dim
         if q_all.numel() == q_dim * 2:
             q_heads = q_all.view(self.cfg.num_attention_heads, self.cfg.attention_head_dim * 2)
@@ -457,8 +510,8 @@ class QwenBurstAttentionLayer:
         else:
             q = q_all.view(self.cfg.num_attention_heads, self.cfg.attention_head_dim)
             gate_flat = None
-        k = linear_any(self.k_proj, x).view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
-        v = linear_any(self.v_proj, x).view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
+        k = k_all.view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
+        v = v_all.view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
 
         if self.q_norm is not None:
             q = qwen_rmsnorm_torch(q, self.q_norm, self.cfg.rms_norm_eps)
@@ -486,7 +539,14 @@ class QwenBurstAttentionLayer:
             ops = cuda_ops()
             residual = row.contiguous()
             h = qwen_rmsnorm(residual, self.input_norm, self.cfg.rms_norm_eps)
-            q_all = linear_any(self.q_proj, h)
+            if self.qkv_proj is not None:
+                qkv_all = linear_any(self.qkv_proj, h)
+                kv_rows = self.cfg.num_key_value_heads * self.cfg.attention_head_dim
+                q_all, k_all, v_all = torch.split(qkv_all, [self.qkv_q_rows, kv_rows, kv_rows], dim=0)
+            else:
+                q_all = linear_any(self.q_proj, h)  # type: ignore[arg-type]
+                k_all = linear_any(self.k_proj, h)  # type: ignore[arg-type]
+                v_all = linear_any(self.v_proj, h)  # type: ignore[arg-type]
             q_dim = self.cfg.num_attention_heads * self.cfg.attention_head_dim
             if q_all.numel() == q_dim * 2:
                 q_heads = q_all.view(self.cfg.num_attention_heads, self.cfg.attention_head_dim * 2)
@@ -496,8 +556,8 @@ class QwenBurstAttentionLayer:
             else:
                 q = q_all.view(self.cfg.num_attention_heads, self.cfg.attention_head_dim)
                 gate_flat = None
-            k = linear_any(self.k_proj, h).view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
-            v = linear_any(self.v_proj, h).view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
+            k = k_all.view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
+            v = v_all.view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
             if self.q_norm is not None:
                 q = qwen_rmsnorm_torch(q, self.q_norm, self.cfg.rms_norm_eps)
             if self.k_norm is not None:
