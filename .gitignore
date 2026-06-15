@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+backups/
 neurova.egg-info/
 neurova_state/
 neurova_test_state/

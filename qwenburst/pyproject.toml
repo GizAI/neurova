@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69", "wheel", "torch>=2.4"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwenburst"
+version = "0.5.0"
+description = "Qwen3.6-27B 16GB inference runtime with flexible low-bit weights and Qwen Gated DeltaNet kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "QwenBurst contributors"}]
+dependencies = [
+  "torch>=2.4",
+  "safetensors>=0.4.5",
+  "numpy>=1.24",
+  "tqdm>=4.66",
+  "transformers>=4.56",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "pydantic>=2",
+]
+
+[project.scripts]
+qwenburst-bench-estimate = "qwenburst.bench_estimate:main"
+qwenburst-quantize = "qwenburst.quantize:main"
+qwenburst-smoke = "qwenburst.smoke:main"
+qwenburst-doctor = "qwenburst.doctor:main"
+qwenburst-infinite-demo = "qwenburst.infinite_demo:main"
+qwenburst-chat = "qwenburst.generate:main"
+qwenburst-audit = "qwenburst.audit:main"
+qwenburst-server = "qwenburst.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qwenburst*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
