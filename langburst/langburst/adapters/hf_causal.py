@@ -305,7 +305,7 @@ class HFAutoCausalAdapter:
         messages.append({"role": "user", "content": prompt})
         return self.encode_messages(tokenizer, messages)
 
-    def encode_messages(self, tokenizer: Any, messages: Sequence[dict[str, Any]]) -> list[int]:
+    def encode_messages(self, tokenizer: Any, messages: Sequence[dict[str, Any]], **_kwargs: Any) -> list[int]:
         payload = [{"role": m.get("role", "user"), "content": str(m.get("content", ""))} for m in messages]
         if hasattr(tokenizer, "apply_chat_template"):
             encoded = tokenizer.apply_chat_template(payload, tokenize=True, add_generation_prompt=True)

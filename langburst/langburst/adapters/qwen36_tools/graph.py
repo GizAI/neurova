@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from ..qwen36_impl.config import Qwen36_27B_TextConfig
-from ...engines.native_impl.runtime import GenerationConfig, sample_next_tensor
+from ...engines.native.runtime import GenerationConfig, sample_next_tensor
 from ...loader import LowBitMarlinTensor
 from ..qwen36_impl.state import DecodeState
 

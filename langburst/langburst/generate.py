@@ -3,59 +3,16 @@ from __future__ import annotations
 import argparse
 import time
 
-from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, runtime_features_from_args
+from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, engine_model_spec_from_args
 from .core.defaults import serving_recent_window_default
 from .engines import ensure_engines_loaded, engine_registry
-from .engines.base import EngineChatRequest, EngineFeatureRequest, EngineModelSpec, EngineSamplingParams
-
-
-def _feature_request_from_args(args: argparse.Namespace) -> EngineFeatureRequest:
-    features = runtime_features_from_args(args)
-    return EngineFeatureRequest.from_mapping(
-        {
-            **features.summary(),
-            "qwen36_lowbit": bool(args.qwen36_lowbit or args.qb_model),
-            "ring_kv": features.kv_window_policy == "ring",
-            "recurrent_state": bool(args.recurrent_state or args.qwen36_lowbit or args.qb_model),
-            "infinite_context": bool(features.infinite_streaming),
-        }
-    )
-
-
-def _model_spec_from_args(args: argparse.Namespace) -> EngineModelSpec:
-    model = args.model or (str(args.hf_model) if args.hf_model is not None else None)
-    if model is None:
-        raise ValueError("--model or --hf-model is required")
-    extra = {
-        "adapter": args.adapter,
-        "qb_model": str(args.qb_model) if args.qb_model is not None else None,
-        "device": args.device,
-        "recent_window": args.recent_window,
-        "weight_device": args.weight_device,
-        "cpu_embed": bool(args.cpu_embed),
-        "runtime_profile": args.runtime_profile,
-        "vllm_custom_model": args.vllm_custom_model,
-        "enable_mtp": bool(args.enable_mtp),
-        "mtp_speculative_tokens": args.mtp_speculative_tokens,
-    }
-    return EngineModelSpec(
-        model=model,
-        served_model_name=args.served_model_name,
-        tokenizer=args.tokenizer,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len or args.recent_window,
-        quantization=args.quantization,
-        trust_remote_code=not args.no_trust_remote_code,
-        features=_feature_request_from_args(args),
-        extra={k: v for k, v in extra.items() if v is not None},
-    )
+from .engines.base import EngineChatRequest, EngineSamplingParams
 
 
 def main() -> None:
     ensure_engines_loaded()
     ap = argparse.ArgumentParser(description="LangBurst engine-backed chat/generation runner")
-    ap.add_argument("--engine", choices=engine_registry.ids(), default=engine_registry.default_engine_id(), help="serving engine provider; vllm is the default")
+    ap.add_argument("--engine", choices=engine_registry.ids(), default=engine_registry.default_engine_id(), help="serving engine provider; native is the default")
     ap.add_argument("--model", default=None, help="engine model path/name; defaults to --hf-model")
     ap.add_argument("--tokenizer", default=None)
     ap.add_argument("--served-model-name", default=None)
@@ -86,7 +43,7 @@ def main() -> None:
     args = ap.parse_args()
 
     try:
-        spec = _model_spec_from_args(args)
+        spec = engine_model_spec_from_args(args)
         backend = engine_registry.create(spec, engine_id=args.engine)
         req = EngineChatRequest(
             request_id="cli",

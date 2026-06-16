@@ -12,11 +12,14 @@ from .config import Qwen36_27B_TextConfig
 from langburst.core.kv_cache import (
     KVCacheLayout,
     KVCacheSpec,
+    KVCacheTensors,
     allocate_kv_cache_tensors,
+    kv_buffer,
     hadamard_transform,
     pack_int4_rows,
     unpack_int4_rows,
 )
+from langburst.tuning import int4_kv_layout
 
 KVWindowPolicy = Literal["error", "shift", "ring"]
 
@@ -696,15 +699,41 @@ class DecodeStateArena:
         self.paged_attn_v_scale = None
         self.paged_attn_k_zero = None
         self.paged_attn_v_zero = None
+        self.paged_int4_tiled_layout = False
         self.paged_kv_pages_allocated = False
         if allocate_paged_shadow:
-            paged_kv = allocate_kv_cache_tensors(
-                self.kv_layout,
-                self.kv_cache_spec,
-                seq_len=self.kv_block_size,
-                device=self.device,
-                leading_shape=(self.kv_num_blocks,),
-            )
+            if self.kv_cache_spec.is_int4 and int4_kv_layout() == "tiled":
+                packed_dim = self.kv_cache_spec.storage_head_dim(self.cfg.attention_head_dim)
+                page_shape = (
+                    self.kv_num_blocks,
+                    self.cfg.num_key_value_heads,
+                    packed_dim,
+                    self.kv_block_size,
+                )
+                meta_shape = (self.kv_num_blocks, self.cfg.num_key_value_heads, self.kv_block_size)
+                paged_kv = KVCacheTensors(
+                    k={
+                        layer: kv_buffer(page_shape, device=self.device, dtype=self.kv_cache_spec.storage_dtype)
+                        for layer in self.kv_layout.layers
+                    },
+                    v={
+                        layer: kv_buffer(page_shape, device=self.device, dtype=self.kv_cache_spec.storage_dtype)
+                        for layer in self.kv_layout.layers
+                    },
+                    k_scale={layer: torch.ones(meta_shape, device=self.device, dtype=torch.float16) for layer in self.kv_layout.layers},
+                    v_scale={layer: torch.ones(meta_shape, device=self.device, dtype=torch.float16) for layer in self.kv_layout.layers},
+                    k_zero={layer: torch.zeros(meta_shape, device=self.device, dtype=torch.float16) for layer in self.kv_layout.layers},
+                    v_zero={layer: torch.zeros(meta_shape, device=self.device, dtype=torch.float16) for layer in self.kv_layout.layers},
+                )
+                self.paged_int4_tiled_layout = True
+            else:
+                paged_kv = allocate_kv_cache_tensors(
+                    self.kv_layout,
+                    self.kv_cache_spec,
+                    seq_len=self.kv_block_size,
+                    device=self.device,
+                    leading_shape=(self.kv_num_blocks,),
+                )
             self.paged_attn_k = paged_kv.k
             self.paged_attn_v = paged_kv.v
             self.paged_attn_k_scale = paged_kv.k_scale

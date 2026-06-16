@@ -8,8 +8,10 @@ from langburst.adapters.qwen36_impl.config import Qwen36_27B_TextConfig
 from langburst.adapters.qwen36 import Qwen36Adapter
 from langburst.core.features import RuntimeFeatures
 from langburst.core.kv_cache import KVCacheLayout, KVCacheSpec, allocate_kv_cache_tensors, hadamard_transform, pack_int4_rows, unpack_int4_rows
-from langburst.engines.native_impl.state_store import BatchStateStore
+from langburst.engines.native.state_store import BatchStateStore
 from langburst.adapters.qwen36_impl.state import DecodeStateArena
+from langburst.adapters.qwen36_impl.state import DecodeState
+from langburst.adapters.qwen36_impl.model import short_prefill_sdpa_staging
 
 
 def tiny_qwen_cfg() -> Qwen36_27B_TextConfig:
@@ -242,12 +244,27 @@ def test_decode_state_arena_can_allocate_int4_bdr_paged_kv_buffers():
     assert arena.paged_attn_k_zero is not None
     assert arena.paged_attn_v_zero is not None
     assert arena.paged_attn_k[1].dtype == torch.uint8
-    assert arena.paged_attn_k[1].shape == (8, 1, 4, 2)
+    assert arena.paged_attn_k[1].shape == (8, 1, 2, 4)
     assert arena.paged_attn_k_scale[1].shape == (8, 1, 4)
     assert arena.paged_attn_k_zero[1].shape == (8, 1, 4)
     assert arena.summary()["kv_cache_dtype"] == "int4_bdr"
     assert arena.summary()["kv_storage_head_dim"] == 2
     assert arena.summary()["paged_kv_enabled"] is True
+
+
+def test_int4_bdr_prefill_never_allocates_fp16_sdpa_staging(monkeypatch):
+    monkeypatch.setenv("LANGBURST_SHORT_PREFILL_SDPA_TOKENS", "8192")
+    state = DecodeState.allocate(
+        tiny_qwen_cfg(),
+        max_seq_len=16,
+        device="cpu",
+        dtype=torch.float16,
+        kv_window_policy="ring",
+        kv_cache_spec=KVCacheSpec.resolve("int4_bdr", hadamard_order=4),
+    )
+
+    assert short_prefill_sdpa_staging(state, layer=1, end_pos=8) is None
+    assert not hasattr(state, "_prefill_fp16_kv")
 
 
 def test_qwen_state_estimate_accounts_for_int4_scale_overhead():

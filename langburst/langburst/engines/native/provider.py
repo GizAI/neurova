@@ -7,20 +7,28 @@ from collections.abc import Sequence
 from typing import Any
 from typing import Iterable
 
-from .base import EngineBackend, EngineCapabilities, EngineChatChunk, EngineChatRequest, EngineChatResult, EngineDescriptor, EngineModelSpec, EngineProvider, EngineUsage, resolve_engine_feature_plan
+from ..base import EngineBackend, EngineCapabilities, EngineChatChunk, EngineChatRequest, EngineChatResult, EngineDescriptor, EngineModelSpec, EngineProvider, EngineUsage, resolve_engine_feature_plan
+from .batch_worker import BatchGenerationHandle, BatchGenerationWorker
+from .block_table import KVBlockTable
+from .manager import EngineManager, EngineResourcePolicy, ModelResourceSpec, load_model_specs
+from .model_runner import BatchedModelRunner
+from .runtime import GenerationConfig, RuntimeEngine, sample_next, sample_next_tensor
+from .scheduler import AdmissionController, ContinuousBatchScheduler
 
 
 class NativeBackend:
-    """Adapter around the legacy LangBurst in-process engine.
+    """Adapter around the primary LangBurst in-process engine.
 
-    The native engine remains a plugin because Qwen3.6/GDN custom kernels are
-    not yet a vLLM custom model. New generic serving work should target vLLM.
+    Native is the reference implementation for Qwen3.6/GDN low-bit serving.
+    Optional providers such as vLLM, SGLang, and EXL3 plug into the same host
+    contract when their execution substrate is a better fit.
     """
 
     descriptor = EngineDescriptor(
         engine_id="native",
         display_name="LangBurst Native",
         module="langburst.engines.native",
+        default=True,
         capabilities=EngineCapabilities(
             continuous_batching=True,
             paged_kv=True,
@@ -49,11 +57,9 @@ class NativeBackend:
             return
         from pathlib import Path
 
-        from ..adapters import ensure_adapters_loaded
-        from ..core.adapter import adapter_registry
-        from ..core.features import RuntimeFeatures
-        from .native_impl.runtime import RuntimeEngine
-
+        from ...adapters import ensure_adapters_loaded
+        from ...core.adapter import adapter_registry
+        from ...core.features import RuntimeFeatures
         ensure_adapters_loaded()
         adapter_id = str(self.spec.extra.get("adapter", "qwen36"))
         qb_model = self.spec.extra.get("qb_model")
@@ -182,8 +188,6 @@ class NativeBackend:
 
 
 def _native_generation_config(engine, request: EngineChatRequest):
-    from ..engines.native_impl.runtime import GenerationConfig
-
     eos = engine.eos_token_ids()
     return GenerationConfig(
         max_new_tokens=request.sampling.max_tokens,
@@ -282,3 +286,23 @@ class NativeProvider:
 
     def create(self, spec: EngineModelSpec) -> EngineBackend:
         return NativeBackend(spec)
+
+
+__all__ = [
+    "AdmissionController",
+    "BatchGenerationHandle",
+    "BatchGenerationWorker",
+    "BatchedModelRunner",
+    "ContinuousBatchScheduler",
+    "EngineManager",
+    "EngineResourcePolicy",
+    "GenerationConfig",
+    "KVBlockTable",
+    "ModelResourceSpec",
+    "NativeBackend",
+    "NativeProvider",
+    "RuntimeEngine",
+    "load_model_specs",
+    "sample_next",
+    "sample_next_tensor",
+]

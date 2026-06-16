@@ -31,7 +31,7 @@ vllm = "langburst.engines.vllm:VLLMProvider"
 native = "langburst.engines.native:NativeProvider"
 
 [project.entry-points."vllm.general_plugins"]
-langburst_lowbit = "langburst.engines.vllm_plugins:register"
+langburst_lowbit = "langburst.engines.vllm.plugins:register"
 
 [project.scripts]
 langburst-qwen-bench-estimate = "langburst.adapters.qwen36_tools.bench_estimate:main"

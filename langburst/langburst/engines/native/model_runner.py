@@ -102,6 +102,7 @@ class BatchedModelRunner:
         row = self.scheduler.finish_request(request_id)
         if row is not None:
             self.state_store.release(row.state_index)
+            self._trim_cuda_cache_after_request()
         return row
 
     @torch.no_grad()
@@ -117,8 +118,6 @@ class BatchedModelRunner:
         states = self.state_store.get_many(row.state_index for row in rows)
         spec_snapshots = self._snapshot_speculative_rows(batch, rows, states)
         logits_by_row = self.engine.forward_batch_logits(batch, states)
-        if any(was_prefilling):
-            self._trim_prefill_cuda_cache()
         sampled_token_ids: list[list[int]] = [[] for _ in rows]
         sampled_counts: list[int] = [0 for _ in rows]
         rejected_counts: list[int] = [0 for _ in rows]
@@ -173,8 +172,11 @@ class BatchedModelRunner:
             rejected_counts=rejected_counts,
         )
 
-    def _trim_prefill_cuda_cache(self) -> None:
-        raw = os.environ.get("LANGBURST_TRIM_CACHE_DURING_PREFILL", "1").strip().lower()
+    def _trim_cuda_cache_after_request(self) -> None:
+        raw = os.environ.get(
+            "LANGBURST_TRIM_CACHE_AFTER_REQUEST",
+            os.environ.get("LANGBURST_TRIM_CACHE_DURING_PREFILL", "1"),
+        ).strip().lower()
         if raw in {"0", "false", "off", "no"}:
             return
         if not torch.cuda.is_available():

@@ -428,6 +428,15 @@ class BatchGenerationWorker:
                     release_callback()
                 except RuntimeError:
                     pass
+            try:
+                self.runner.finish_request(handle.request_id)
+            except Exception:
+                pass
+            if exc.__class__.__module__ == "torch.cuda" and exc.__class__.__name__ == "OutOfMemoryError":
+                clear = getattr(self.runner, "clear", None)
+                if callable(clear):
+                    clear()
+                self._release_idle_cuda_cache()
             handle.fail(exc)
 
     def _finish_active(self, req_id: str, handle: BatchGenerationHandle) -> None:

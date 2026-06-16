@@ -321,6 +321,29 @@ class CPUFallbackOps:
         return torch.stack(outs, dim=0).contiguous()
 
     @staticmethod
+    def attention_paged_int4_flash(
+        q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        k_scales: torch.Tensor,
+        v_scales: torch.Tensor,
+        k_zeros: torch.Tensor,
+        v_zeros: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_size: int,
+        scale: float,
+        hadamard_order: int,
+        bdr_k: bool,
+        rotate_v: bool,
+        tiled_layout: bool = False,
+    ) -> torch.Tensor:
+        raise RuntimeError("INT4 paged attention requires the CUDA extension")
+
+    @staticmethod
     def attention_append_paged_int4(
         k_new: torch.Tensor,
         v_new: torch.Tensor,
@@ -335,6 +358,7 @@ class CPUFallbackOps:
         hadamard_order: int,
         bdr_k: bool,
         rotate_v: bool,
+        tiled_layout: bool = False,
     ) -> None:
         from .core.kv_cache import hadamard_transform, pack_int4_rows
 
@@ -346,8 +370,12 @@ class CPUFallbackOps:
             v_store = hadamard_transform(v_new[row], hadamard_order) if bdr_k and rotate_v else v_new[row]
             k_packed, k_scale, k_zero = pack_int4_rows(k_store)
             v_packed, v_scale, v_zero = pack_int4_rows(v_store)
-            k_pages[block, :, offset, :].copy_(k_packed)
-            v_pages[block, :, offset, :].copy_(v_packed)
+            if tiled_layout:
+                k_pages[block, :, :, offset].copy_(k_packed)
+                v_pages[block, :, :, offset].copy_(v_packed)
+            else:
+                k_pages[block, :, offset, :].copy_(k_packed)
+                v_pages[block, :, offset, :].copy_(v_packed)
             k_scales[block, :, offset].copy_(k_scale)
             v_scales[block, :, offset].copy_(v_scale)
             k_zeros[block, :, offset].copy_(k_zero)

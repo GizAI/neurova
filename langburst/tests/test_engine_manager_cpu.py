@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import langburst.adapters  # noqa: F401
+import torch
 from langburst.core.adapter import adapter_registry
-from langburst.engines.native_impl.manager import EngineManager, EngineResourcePolicy, ModelResourceSpec
-from langburst.engines.native_impl.runtime import GenerationConfig
+from langburst.engines.native.manager import EngineManager, EngineResourcePolicy, ModelResourceSpec
+from langburst.engines.native.runtime import GenerationConfig
 from langburst.server import create_app
 
 from test_adapter_runtime_cpu import ToyAdapter
@@ -493,6 +495,37 @@ def test_engine_manager_generation_admission_limits(tmp_path: Path):
         raise AssertionError("generation limit should fail")
     except ValueError as exc:
         assert "generation too long" in str(exc)
+
+
+def test_active_runtime_memory_reserve_is_not_a_request_rejection(monkeypatch, tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cuda", weight_device="cpu")],
+        policy=EngineResourcePolicy(reserve_free_vram_mib=512),
+    )
+    engine = SimpleNamespace(
+        device="cuda",
+        model_name="toy-a",
+        adapter=SimpleNamespace(estimate_arena_state_bytes=None),
+        cfg=object(),
+        features=object(),
+        estimated_weight_bytes=lambda: 0,
+        estimated_state_bytes=lambda: 0,
+    )
+    manager._engines["toy-a"] = engine
+    manager._batch_runners[("toy-a", ())] = object()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args, **kwargs: (19 * 1024 * 1024, 16 * 1024 * 1024 * 1024))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args, **kwargs: SimpleNamespace(total_memory=16 * 1024 * 1024 * 1024))
+
+    manager.validate_runtime_memory(engine)
 
 
 def test_resource_policy_validates_limits():

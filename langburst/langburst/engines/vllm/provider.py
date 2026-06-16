@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from .base import (
+from ..base import (
     EngineBackend,
     EngineCapabilities,
     EngineChatChunk,
@@ -10,12 +10,16 @@ from .base import (
     EngineChatResult,
     EngineDescriptor,
     EngineModelSpec,
-    EngineProvider,
     EngineSamplingParams,
     EngineUsage,
     resolve_engine_feature_plan,
 )
-from .vllm_bridge import VLLMConversationStore, build_vllm_bridge_config, vllm_engine_extra_kwargs
+from .bridge import (
+    VLLMConversationStore,
+    build_vllm_bridge_config,
+    resolve_lowbit_max_num_batched_tokens,
+    vllm_engine_extra_kwargs,
+)
 
 
 def _content_to_text(content: Any) -> str:
@@ -33,11 +37,6 @@ def _content_to_text(content: Any) -> str:
 
 
 def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
-    try:
-        from transformers import AutoTokenizer
-    except Exception:
-        AutoTokenizer = None  # type: ignore[assignment]
-    del AutoTokenizer
     lines: list[str] = []
     for msg in messages:
         role = str(msg.get("role", "user"))
@@ -68,7 +67,7 @@ def _sampling_kwargs(params: EngineSamplingParams) -> dict[str, Any]:
 
 
 def _chat_template_kwargs(request: EngineChatRequest, spec: EngineModelSpec) -> dict[str, Any]:
-    out: dict[str, Any] = {"enable_thinking": False}
+    out: dict[str, Any] = {"enable_thinking": True}
     configured = spec.extra.get("chat_template_kwargs")
     if isinstance(configured, dict):
         out.update(configured)
@@ -78,9 +77,9 @@ def _chat_template_kwargs(request: EngineChatRequest, spec: EngineModelSpec) -> 
         out.update(request_kwargs)
     reasoning_effort = getattr(raw, "reasoning_effort", None) if raw is not None else None
     if reasoning_effort == "none":
-        out.setdefault("enable_thinking", False)
+        out["enable_thinking"] = False
     elif reasoning_effort is not None:
-        out.setdefault("enable_thinking", True)
+        out["enable_thinking"] = True
     return out
 
 
@@ -89,7 +88,6 @@ class VLLMBackend:
         engine_id="vllm",
         display_name="vLLM",
         module="langburst.engines.vllm",
-        default=True,
         capabilities=EngineCapabilities(
             continuous_batching=True,
             paged_kv=True,
@@ -123,7 +121,7 @@ class VLLMBackend:
                 "Install langburst with the vllm dependency or choose --engine native|sglang|exl3."
             ) from exc
         if self.spec.features.qwen36_lowbit:
-            from .vllm_plugins import register as register_vllm_plugins
+            from .plugins import register as register_vllm_plugins
 
             register_vllm_plugins()
         kwargs: dict[str, Any] = {
@@ -146,8 +144,11 @@ class VLLMBackend:
             kwargs["quantization"] = self.spec.quantization
         kwargs.update(vllm_engine_extra_kwargs(self.spec.extra))
         if self.spec.features.qwen36_lowbit and self.spec.features.recurrent_state:
-            min_batched_tokens = 1600 if bool(self.spec.extra.get("enable_mtp", False)) else 1568
-            kwargs["max_num_batched_tokens"] = max(min_batched_tokens, int(kwargs.get("max_num_batched_tokens", 0) or 0))
+            enable_mtp = bool(self.spec.extra.get("enable_mtp", False))
+            kwargs["max_num_batched_tokens"] = max(
+                resolve_lowbit_max_num_batched_tokens(self.spec, enable_mtp=enable_mtp),
+                int(kwargs.get("max_num_batched_tokens", 0) or 0),
+            )
         self._llm = LLM(**kwargs)
 
     def shutdown(self) -> None:

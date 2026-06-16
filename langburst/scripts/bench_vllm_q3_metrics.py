@@ -10,6 +10,7 @@ from langburst.engines.base import (
     EngineModelSpec,
     EngineSamplingParams,
 )
+from langburst.engines.vllm.bridge import resolve_mtp_kv_cache_memory_bytes
 
 
 def _args() -> argparse.Namespace:
@@ -63,7 +64,7 @@ def main() -> None:
     if args.enable_mtp:
         spec.extra["enable_mtp"] = True
         spec.extra["mtp_speculative_tokens"] = args.mtp_speculative_tokens
-        spec.extra.setdefault("kv_cache_memory_bytes", int(os.environ.get("LANGBURST_VLLM_MTP_KV_CACHE_MEMORY_BYTES", "760000000")))
+        spec.extra.setdefault("kv_cache_memory_bytes", resolve_mtp_kv_cache_memory_bytes(spec.extra))
     backend = engine_registry.create(spec, engine_id="vllm")
     req = EngineChatRequest(
         request_id="bench",

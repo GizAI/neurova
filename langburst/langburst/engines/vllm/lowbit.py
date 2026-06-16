@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -10,7 +11,61 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..loader import FP16Tensor, LowBitMarlinTensor, LowBitTensor, QuantizedStore
+from ...loader import FP16Tensor, LowBitMarlinTensor, LowBitTensor, QuantizedStore
+
+
+DEFAULT_AUX_REGEX = r"^(lm_head|model\.language_model\.embed_tokens|model\.language_model\.layers\.(0|1)\.mlp\.gate_up_proj)\.weight$"
+DEFAULT_MTP_AUX_REGEX = (
+    r"^(lm_head|model\.language_model\.embed_tokens|"
+    r"model\.language_model\.layers\.([0-9]|1[0-1])\.mlp\.gate_up_proj|"
+    r"mtp\.layers\.0\.(mlp\.(gate_up_proj|down_proj)|self_attn\.(qkv_proj|o_proj)))\.weight$"
+)
+
+
+@dataclass(frozen=True)
+class LowBitRuntimeOptions:
+    """Resolved process-local knobs for LangBurst low-bit vLLM integration."""
+
+    aux_device: str | None
+    aux_regex: str
+    preload_mtp: bool
+    preload_visual: bool
+    preload_exclude_regex: str | None
+
+    @classmethod
+    def from_env(cls) -> "LowBitRuntimeOptions":
+        preload_mtp = _env_enabled("LANGBURST_VLLM_LOWBIT_PRELOAD_MTP")
+        default_aux_regex = DEFAULT_MTP_AUX_REGEX if preload_mtp else DEFAULT_AUX_REGEX
+        return cls(
+            aux_device=os.environ.get("LANGBURST_VLLM_LOWBIT_AUX_DEVICE"),
+            aux_regex=os.environ.get("LANGBURST_VLLM_LOWBIT_AUX_REGEX", default_aux_regex),
+            preload_mtp=preload_mtp,
+            preload_visual=_env_enabled("LANGBURST_VLLM_LOWBIT_PRELOAD_VISUAL"),
+            preload_exclude_regex=os.environ.get("LANGBURST_VLLM_LOWBIT_PRELOAD_EXCLUDE_REGEX"),
+        )
+
+    def aux_device_for_tensor(self, name: str) -> torch.device | None:
+        if not self.aux_device or not self.aux_regex or not re.search(self.aux_regex, name):
+            return None
+        return torch.device(self.aux_device)
+
+    def preload_name_allowed(self, name: str, *, device: torch.device | None = None) -> bool:
+        aux_device = self.aux_device_for_tensor(name)
+        if aux_device is not None and device is not None and str(aux_device) != str(device):
+            return False
+        if aux_device is None and device is not None and self.aux_device and str(device) == self.aux_device:
+            return False
+        if self.preload_exclude_regex and re.search(self.preload_exclude_regex, name):
+            return False
+        if name.startswith("visual.") or name.startswith("model.visual."):
+            return self.preload_visual
+        if name.startswith("mtp.") or ".mtp." in name:
+            return self.preload_mtp
+        return True
+
+
+def _runtime_options() -> LowBitRuntimeOptions:
+    return LowBitRuntimeOptions.from_env()
 
 
 def _tensor_nbytes(tensor: LowBitTensor | LowBitMarlinTensor | FP16Tensor) -> int:
@@ -53,21 +108,7 @@ def _preload_enabled() -> bool:
 
 
 def _aux_device_for_tensor(name: str) -> torch.device | None:
-    raw_device = os.environ.get("LANGBURST_VLLM_LOWBIT_AUX_DEVICE")
-    default_regex = r"^(lm_head|model\.language_model\.embed_tokens|model\.language_model\.layers\.(0|1)\.mlp\.gate_up_proj)\.weight$"
-    if _env_enabled("LANGBURST_VLLM_LOWBIT_PRELOAD_MTP"):
-        default_regex = (
-            r"^(lm_head|model\.language_model\.embed_tokens|"
-            r"model\.language_model\.layers\.([0-9]|1[0-1])\.mlp\.gate_up_proj|"
-            r"mtp\.layers\.0\.(mlp\.(gate_up_proj|down_proj)|self_attn\.(qkv_proj|o_proj)))\.weight$"
-        )
-    raw_regex = os.environ.get(
-        "LANGBURST_VLLM_LOWBIT_AUX_REGEX",
-        default_regex,
-    )
-    if not raw_device or not raw_regex or not re.search(raw_regex, name):
-        return None
-    return torch.device(raw_device)
+    return _runtime_options().aux_device_for_tensor(name)
 
 
 def _return_to_original_device(tensor: torch.Tensor, original_device: torch.device) -> torch.Tensor:
@@ -79,19 +120,7 @@ def _return_to_original_device(tensor: torch.Tensor, original_device: torch.devi
 
 
 def _preload_name_allowed(name: str, *, device: torch.device | None = None) -> bool:
-    aux_device = _aux_device_for_tensor(name)
-    if aux_device is not None and device is not None and str(aux_device) != str(device):
-        return False
-    if aux_device is None and device is not None and os.environ.get("LANGBURST_VLLM_LOWBIT_AUX_DEVICE") and str(device) == os.environ.get("LANGBURST_VLLM_LOWBIT_AUX_DEVICE"):
-        return False
-    exclude = os.environ.get("LANGBURST_VLLM_LOWBIT_PRELOAD_EXCLUDE_REGEX")
-    if exclude and re.search(exclude, name):
-        return False
-    if name.startswith("visual.") or name.startswith("model.visual."):
-        return _env_enabled("LANGBURST_VLLM_LOWBIT_PRELOAD_VISUAL")
-    if name.startswith("mtp.") or ".mtp." in name:
-        return _env_enabled("LANGBURST_VLLM_LOWBIT_PRELOAD_MTP")
-    return True
+    return _runtime_options().preload_name_allowed(name, device=device)
 
 
 class _LangBurstLowBitRuntimeCache:
@@ -554,13 +583,13 @@ class LangBurstLowBitModelLoader:
                     device = param.device
                     break
             _runtime_cache(self.qb_model, device, preload=True)
+            options = _runtime_options()
             aux_devices = {
-                _aux_device_for_tensor(name)
+                aux_device
                 for name in self.store.index.get("tensors", {})
-                if _aux_device_for_tensor(name) is not None
+                if (aux_device := options.aux_device_for_tensor(name)) is not None
             }
             for aux_device in aux_devices:
-                assert aux_device is not None
                 _runtime_cache(self.qb_model, aux_device, preload=True)
 
     def _iter_fp16_weights(self) -> Iterable[tuple[str, torch.Tensor]]:

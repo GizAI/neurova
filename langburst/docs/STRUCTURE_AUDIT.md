@@ -116,7 +116,7 @@ Allowed only in:
 
 - `cli_features.create_runtime_engine_from_args`: single-engine CLI factory.
 - `EngineManager`: multi-model lifecycle owner.
-- `engines/native_impl/conformance.py`: native adapter conformance fixture.
+- `engines/native/conformance.py`: native adapter conformance fixture.
 - `research/qwen_nextn_bench.py`: Qwen-specific speculative research harness.
 
 ### Qwen-specific code

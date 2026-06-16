@@ -4,7 +4,12 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from .base import EngineFeaturePlan, EngineModelSpec
+from ..base import EngineFeaturePlan, EngineModelSpec
+
+
+LOWBIT_MAMBA_MIN_BATCHED_TOKENS = 1568
+LOWBIT_MTP_MIN_BATCHED_TOKENS = 1600
+DEFAULT_MTP_KV_CACHE_MEMORY_BYTES = 760_000_000
 
 
 VLLM_OWNED_FEATURES: tuple[str, ...] = (
@@ -75,6 +80,28 @@ VLLM_EXTRA_KWARGS: frozenset[str] = frozenset(
 )
 
 
+def lowbit_min_batched_tokens(*, enable_mtp: bool) -> int:
+    return LOWBIT_MTP_MIN_BATCHED_TOKENS if enable_mtp else LOWBIT_MAMBA_MIN_BATCHED_TOKENS
+
+
+def resolve_lowbit_max_num_batched_tokens(spec: EngineModelSpec, *, enable_mtp: bool) -> int:
+    import os
+
+    floor = lowbit_min_batched_tokens(enable_mtp=enable_mtp)
+    configured = spec.extra.get("max_num_batched_tokens")
+    if configured is None:
+        configured = os.environ.get("LANGBURST_VLLM_MAX_NUM_BATCHED_TOKENS")
+    if configured is None:
+        configured = spec.max_model_len or 0
+    return max(floor, int(configured or 0))
+
+
+def resolve_mtp_kv_cache_memory_bytes(extra: dict[str, Any]) -> int:
+    import os
+
+    return int(extra.get("kv_cache_memory_bytes") or os.environ.get("LANGBURST_VLLM_MTP_KV_CACHE_MEMORY_BYTES") or DEFAULT_MTP_KV_CACHE_MEMORY_BYTES)
+
+
 @dataclass(frozen=True)
 class VLLMBridgeConfig:
     """Single translation point from LangBurst features to vLLM engine kwargs."""
@@ -127,33 +154,17 @@ def build_vllm_bridge_config(spec: EngineModelSpec, feature_plan: EngineFeatureP
         kwargs["dtype"] = str(spec.extra.get("dtype", "float16"))
         kwargs["language_model_only"] = True
         kwargs["load_format"] = "langburst_lowbit"
-        # vLLM's Qwen3.5/GDN path raises the effective Mamba-align block size
-        # to 784 tokens, so keep the low-bit default above that even for small
-        # smoke-test context windows. The low-bit adapter owns GPU weight-cache
-        # pressure separately.
-        env_batched_tokens = spec.extra.get("max_num_batched_tokens")
-        if env_batched_tokens is None:
-            import os
-
-            env_batched_tokens = os.environ.get("LANGBURST_VLLM_MAX_NUM_BATCHED_TOKENS")
+        enable_mtp = bool(spec.extra.get("enable_mtp", False))
         # Qwen3.5/GDN + Mamba align mode raises vLLM's attention block size
         # above the user context length. MTP pads it slightly higher again.
-        # Keep scheduler capacity above that floor, otherwise vLLM rejects the
-        # engine after profiling.
-        min_batched_tokens = 1600 if bool(spec.extra.get("enable_mtp", False)) else 1568
-        default_batched_tokens = max(min_batched_tokens, int(spec.max_model_len or 0))
-        kwargs["max_num_batched_tokens"] = int(spec.extra.get("max_num_batched_tokens", default_batched_tokens))
-        if env_batched_tokens is not None:
-            kwargs["max_num_batched_tokens"] = int(env_batched_tokens)
-        if requested.recurrent_state:
-            kwargs["max_num_batched_tokens"] = max(min_batched_tokens, int(kwargs["max_num_batched_tokens"]))
+        kwargs["max_num_batched_tokens"] = resolve_lowbit_max_num_batched_tokens(spec, enable_mtp=enable_mtp)
         kwargs["max_num_seqs"] = int(spec.extra.get("max_num_seqs", 1))
         kwargs["kv_cache_dtype"] = str(spec.extra.get("kv_cache_dtype", "fp8"))
         if kv_cache_memory_bytes := spec.extra.get("kv_cache_memory_bytes"):
             kwargs["kv_cache_memory_bytes"] = int(kv_cache_memory_bytes)
         kwargs["quantization"] = "langburst_lowbit"
         kwargs["reasoning_parser"] = str(spec.extra.get("reasoning_parser", "qwen3"))
-        if bool(spec.extra.get("enable_mtp", False)) and "speculative_config" not in spec.extra:
+        if enable_mtp and "speculative_config" not in spec.extra:
             kwargs["speculative_config"] = {
                 "method": "mtp",
                 "num_speculative_tokens": int(spec.extra.get("mtp_speculative_tokens", 2)),

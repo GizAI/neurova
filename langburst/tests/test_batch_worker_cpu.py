@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from langburst.engines.native_impl.batch_worker import BatchGenerationWorker
-from langburst.engines.native_impl.model_runner import BatchedModelRunner
-from langburst.engines.native_impl.runtime import GenerationConfig, RuntimeEngine
-from langburst.engines.native_impl.scheduler import ContinuousBatchScheduler
+from langburst.engines.native.batch_worker import BatchGenerationWorker
+from langburst.engines.native.model_runner import BatchedModelRunner
+from langburst.engines.native.runtime import GenerationConfig, RuntimeEngine
+from langburst.engines.native.scheduler import ContinuousBatchScheduler
 
 from test_adapter_runtime_cpu import ToyAdapter
 

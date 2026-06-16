@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from langburst.engines.native_impl.block_table import KVBlockTable
-from langburst.engines.native_impl.cuda_graph import CudaGraphBucketPlanner
-from langburst.engines.native_impl.scheduler import AdmissionController, ContinuousBatchScheduler
+from langburst.engines.native.block_table import KVBlockTable
+from langburst.engines.native.cuda_graph import CudaGraphBucketPlanner
+from langburst.engines.native.scheduler import AdmissionController, ContinuousBatchScheduler
 
 
 def test_admission_controller_tracks_stats():

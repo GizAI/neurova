@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from langburst.engines.native_impl.prefix_cache import RadixPrefixCache
+from langburst.engines.native.prefix_cache import RadixPrefixCache
 
 
 def test_radix_prefix_cache_returns_longest_bounded_hit():

@@ -13,11 +13,11 @@ def register() -> None:
     from vllm.model_executor.model_loader import register_model_loader
     from vllm.model_executor.models import ModelRegistry
 
-    from .vllm_lowbit import LangBurstLowBitConfig, LangBurstLowBitModelLoader
+    from .lowbit import LangBurstLowBitConfig, LangBurstLowBitModelLoader
 
     register_quantization_config("langburst_lowbit")(LangBurstLowBitConfig)
     register_model_loader("langburst_lowbit")(LangBurstLowBitModelLoader)
     ModelRegistry.register_model(
         "Qwen3_5MTP",
-        "langburst.engines.vllm_qwen36:LangBurstQwen36MTP",
+        "langburst.engines.vllm.qwen36:LangBurstQwen36MTP",
     )

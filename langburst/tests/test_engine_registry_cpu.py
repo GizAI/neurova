@@ -4,19 +4,19 @@ import pytest
 
 from langburst.engines import ensure_engines_loaded, engine_registry
 from langburst.engines.base import EngineFeatureRequest, EngineModelSpec
-from langburst.engines.vllm_bridge import vllm_engine_extra_kwargs
+from langburst.engines.vllm.bridge import vllm_engine_extra_kwargs
 
 
-def test_default_engine_is_vllm():
+def test_default_engine_is_native():
     ensure_engines_loaded()
-    assert engine_registry.default_engine_id() == "vllm"
+    assert engine_registry.default_engine_id() == "native"
     assert {"vllm", "sglang", "exl3", "native"}.issubset(set(engine_registry.ids()))
 
 
 def test_engine_descriptors_have_capabilities():
     ensure_engines_loaded()
     rows = {descriptor.engine_id: descriptor for descriptor in engine_registry.list()}
-    assert rows["vllm"].default
+    assert rows["native"].default
     assert rows["vllm"].capabilities.continuous_batching
     assert rows["vllm"].capabilities.paged_kv
     assert rows["sglang"].capabilities.structured_output

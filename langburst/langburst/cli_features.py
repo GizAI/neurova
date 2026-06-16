@@ -17,6 +17,7 @@ from .core.features import (
 )
 from .core.defaults import kv_cache_dtype_default
 from .core.platform import ENV_PREFIX, env
+from .engines.base import EngineFeatureRequest, EngineModelSpec
 
 
 def add_adapter_arg(
@@ -104,6 +105,50 @@ def runtime_features_from_args(args: argparse.Namespace) -> RuntimeFeatures:
     return RuntimeFeatures.from_profile(args.runtime_profile).with_overrides(runtime_feature_override_from_args(args))
 
 
+def engine_feature_request_from_args(args: argparse.Namespace) -> EngineFeatureRequest:
+    features = runtime_features_from_args(args)
+    return EngineFeatureRequest.from_mapping(
+        {
+            **features.summary(),
+            "qwen36_lowbit": bool(args.qwen36_lowbit or args.qb_model),
+            "ring_kv": features.kv_window_policy == "ring",
+            "recurrent_state": bool(args.recurrent_state or args.qwen36_lowbit or args.qb_model),
+            "infinite_context": bool(features.infinite_streaming),
+        }
+    )
+
+
+def engine_model_spec_from_args(args: argparse.Namespace, *, served_model_name: str | None = None) -> EngineModelSpec:
+    model = args.model or (str(args.hf_model) if args.hf_model is not None else None)
+    if model is None:
+        raise ValueError("--model or --hf-model is required")
+    extra = {
+        "adapter": args.adapter,
+        "qb_model": str(args.qb_model) if args.qb_model is not None else None,
+        "device": args.device,
+        "recent_window": args.recent_window,
+        "weight_device": args.weight_device,
+        "cpu_embed": bool(args.cpu_embed),
+        "runtime_profile": args.runtime_profile,
+        "vllm_custom_model": args.vllm_custom_model,
+        "enable_mtp": bool(args.enable_mtp),
+        "mtp_speculative_tokens": args.mtp_speculative_tokens,
+    }
+    return EngineModelSpec(
+        model=model,
+        served_model_name=served_model_name or args.served_model_name,
+        tokenizer=args.tokenizer,
+        dtype=env("DTYPE", "auto"),
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len or args.recent_window,
+        quantization=args.quantization,
+        trust_remote_code=not args.no_trust_remote_code,
+        features=engine_feature_request_from_args(args),
+        extra={k: v for k, v in extra.items() if v is not None},
+    )
+
+
 def create_runtime_engine_from_args(
     args: argparse.Namespace,
     *,
@@ -119,7 +164,7 @@ def create_runtime_engine_from_args(
     should come through this factory.
     """
 
-    from .engines.native_impl.runtime import RuntimeEngine
+    from .engines.native import RuntimeEngine
 
     return RuntimeEngine(
         adapter=adapter_registry.get(args.adapter),

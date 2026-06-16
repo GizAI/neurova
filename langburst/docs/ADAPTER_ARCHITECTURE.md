@@ -2,8 +2,8 @@
 
 LangBurst now follows a provider-host shape inspired by VS Code's extension
 host: a small core owns policy and routing, while engine providers own actual
-serving execution. The default provider is vLLM. SGLang, EXL3, and the legacy
-LangBurst native runtime use the same provider seam.
+serving execution. The default provider is LangBurst Native. vLLM, SGLang, and
+EXL3 use the same provider seam as optional engines.
 
 ## Canonical Shape
 
@@ -12,10 +12,20 @@ langburst/
   engines/
     base.py       # EngineDescriptor, EngineCapabilities, EngineBackend protocol
     registry.py   # EngineRegistry, the single extension seam
-    vllm.py       # default provider
-    vllm_bridge.py# LangBurst feature requests -> vLLM kwargs/metadata/session bridge
-    native.py     # legacy LangBurst runtime wrapped as a provider
-    native_impl/  # native runtime/scheduler/KV/batch implementation
+    native/       # default provider, public facade, native runtime implementation
+      __init__.py # public native facade
+      provider.py # NativeBackend / NativeProvider
+      runtime.py
+      manager.py
+      scheduler.py
+      ...
+    vllm/         # optional vLLM provider and bridge implementation
+      __init__.py # VLLMProvider facade
+      provider.py
+      bridge.py
+      lowbit.py
+      plugins.py
+      qwen36.py
     unavailable.py# registered SGLang/EXL3 placeholders until their packages are wired
 
   core/
@@ -57,9 +67,25 @@ branch on vLLM, SGLang, EXL3, or native execution details.
 
 ## Engine Providers
 
+### Native
+
+`native` is the default engine and the reference implementation for the current
+Qwen3.6/GDN low-bit path:
+
+- Qwen3.6 hybrid GDN state
+- LangBurst q3/q4 low-bit checkpoint format
+- GDN recurrence CUDA op
+- native continuous batching / paged KV / prefix cache
+- native MTP/NEXTN experiments and production gates
+
+Server, correctness, and benchmark surfaces import native runtime types from
+`engines/native/__init__.py` via `langburst.engines.native`. Runtime-specific
+tests may target native submodules, but product surfaces should not depend on
+the internal file layout.
+
 ### vLLM
 
-`vllm` is the default engine. It owns standard serving machinery:
+`vllm` is an optional engine. It owns its own standard serving machinery:
 
 - OpenAI-compatible chat semantics
 - continuous batching
@@ -71,10 +97,11 @@ branch on vLLM, SGLang, EXL3, or native execution details.
 - speculative decoding
 - LangBurst feature bridge for Qwen3.6/GDN custom-model integration
 
-LangBurst should not reimplement these generic serving features.
+The vLLM provider should not call or wrap LangBurst's native runtime. It should
+use vLLM modules directly where vLLM already provides the capability.
 
 LangBurst-only features are resolved once into `EngineFeaturePlan` and then
-translated by `engines/vllm_bridge.py`:
+translated by `engines/vllm/bridge.py`:
 
 - `stateful_sessions`: host-side conversation state for vLLM's stateless
   request model.
@@ -88,7 +115,7 @@ translated by `engines/vllm_bridge.py`:
 - `episodic_memory` and `ttt_sidecar`: exposed as sidecar metadata so request
   processors or custom model code can consume the same feature request.
 
-This keeps the server and CLI out of feature-specific branches. vLLM owns the
+This keeps the server and CLI out of vLLM-specific branches. vLLM owns its
 generic execution substrate; LangBurst owns only the bridge contract for
 features that vLLM does not provide natively.
 
@@ -111,8 +138,9 @@ semantics and checkpoint/kernel pieces that vLLM cannot replace:
 - `gdn_recurrent` custom kernel bridge
 - episodic memory / TTT sidecar metadata
 
-Everything else goes through vLLM: request serving, scheduling, batching, paged
-KV, prefix caching, sampling, and standard HF loading.
+Everything else in the vLLM provider goes through vLLM: request serving,
+scheduling, batching, paged KV, prefix caching, sampling, and standard HF
+loading.
 
 ### SGLang
 
@@ -127,16 +155,8 @@ local EXL3 deployments. It should stay behind the same `EngineBackend` contract.
 
 ### Native
 
-`native` wraps the existing LangBurst in-process engine. It exists only for
-Qwen3.6/GDN custom-kernel work and for validating the same semantics before or
-beside their vLLM bridge:
-
-- Qwen3.6 hybrid GDN state
-- LangBurst low-bit checkpoint format
-- GDN recurrence CUDA op
-- native Qwen NEXTN/MTP experiments
-
-Generic HF/Gemma/Llama serving should use vLLM instead of the native runtime.
+`native` remains the default unless the operator explicitly chooses another
+engine.
 
 ## Adapter Contract In Native
 
@@ -149,8 +169,8 @@ The old adapter contract remains inside the native provider boundary:
 - decode state allocation
 - native runtime capability declaration
 
-This is no longer the top-level LangBurst serving architecture. It is a plugin
-implementation detail of `--engine native`.
+This is the top-level LangBurst serving architecture for the native default.
+External engines implement the same `EngineBackend` contract beside it.
 
 ## Extension Seam
 

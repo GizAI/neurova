@@ -347,8 +347,23 @@ class RuntimeEngine:
     def encode_prompt(self, prompt: str, system: str | None = None) -> list[int]:
         return self.adapter.encode_prompt(self.tokenizer, prompt, system)
 
-    def encode_messages(self, messages: Sequence[dict[str, Any]]) -> list[int]:
-        return self.adapter.encode_messages(self.tokenizer, messages)
+    def encode_messages(self, messages: Sequence[dict[str, Any]], **kwargs: Any) -> list[int]:
+        if not kwargs:
+            return self.adapter.encode_messages(self.tokenizer, messages)
+        encoder = self.adapter.encode_messages
+        try:
+            signature = inspect.signature(encoder)
+        except (TypeError, ValueError):  # pragma: no cover - builtins / C funcs
+            signature = None
+        if signature is None:
+            return encoder(self.tokenizer, messages, **kwargs)
+        parameters = signature.parameters
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+            return encoder(self.tokenizer, messages, **kwargs)
+        supported = {key: value for key, value in kwargs.items() if key in parameters}
+        if supported:
+            return encoder(self.tokenizer, messages, **supported)
+        return encoder(self.tokenizer, messages)
 
     def eos_token_ids(self) -> tuple[int, ...]:
         return self.adapter.eos_token_ids(self.tokenizer)

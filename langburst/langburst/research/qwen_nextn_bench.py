@@ -11,8 +11,8 @@ import torch
 
 from ..adapters import ensure_adapters_loaded
 from ..core.adapter import adapter_registry
-from ..engines.native_impl.policy import RuntimePolicyResolver
-from ..engines.native_impl.runtime import GenerationConfig, RuntimeEngine, sample_next_tensor
+from ..engines.native.policy import RuntimePolicyResolver
+from ..engines.native.runtime import GenerationConfig, RuntimeEngine, sample_next_tensor
 from ..adapters.qwen36_impl.model import Qwen36Model
 from ..adapters.qwen36_mtp import QwenNativeMTP1, QwenNativeMTP1Proposer
 from ..speculation import (

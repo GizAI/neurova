@@ -1,41 +1,39 @@
 # LangBurst
 
-LangBurst is a serving-engine extension layer. It does not try to reimplement
-vLLM as the default path. The default engine is vLLM; optional providers can
-plug in SGLang, EXL3/ExLlamaV3, or the legacy LangBurst native engine through
-one `EngineRegistry`.
+LangBurst is a native-first low-bit serving runtime with an engine extension
+layer. The default engine is the LangBurst native runtime. Optional providers
+can plug in vLLM, SGLang, or EXL3/ExLlamaV3 through one `EngineRegistry`.
 
 The goal is:
 
 ```text
 LangBurst policy/API/stateful extensions
   -> EngineRegistry
-     -> vllm    # default
+     -> native  # default Qwen3.6/GDN custom runtime
+     -> vllm    # optional provider target
      -> sglang  # optional provider target
      -> exl3    # optional provider target
-     -> native  # legacy Qwen3.6/GDN custom runtime
 ```
 
-vLLM owns generic serving machinery such as continuous batching, paged KV,
-prefix caching, standard quantization, CUDA graph, speculative decoding, and
-OpenAI-compatible serving semantics. LangBurst keeps one bridge contract for
-the parts that are not generic vLLM work: low-resource policy,
-stateful/session state, ring/infinite context policy, episodic/TTT sidecars,
-and Qwen3.6/GDN low-bit custom-model metadata.
+Native owns the reference Qwen3.6/GDN low-bit execution path, including the
+custom checkpoint format, recurrent state, native MTP/NEXTN, and low-resource
+serving policy. Optional external engines can be used when their substrate is a
+better fit for a deployment.
 
-The existing Qwen3.6 native runtime is now treated as a native engine plugin.
-It remains useful for the current Qwen3.6/GDN low-bit checkpoint path, but
-the same feature request is also accepted by the vLLM provider and routed
-through `engines/vllm_bridge.py`.
+The vLLM provider is an optional bridge target. When `--engine vllm` is used
+with Qwen3.6 features, LangBurst does not wrap the native runtime. vLLM owns
+its own server/scheduler/batching/paged-KV/sampling substrate, and LangBurst
+forwards only the pieces that vLLM cannot replace: the converted low-bit
+checkpoint location, Qwen3.6 GDN/recurrent-state intent, ring/infinite policy
+metadata, and sidecar flags.
 
-When `--engine vllm` is used with Qwen3.6 features, LangBurst does not wrap the
-native runtime. vLLM still owns server, scheduler, batching, paged KV/prefix
-cache, sampling, and standard HF loading. LangBurst forwards only the pieces
-that vLLM cannot replace: the converted low-bit checkpoint location, Qwen3.6
-GDN/recurrent-state intent, ring/infinite policy metadata, and sidecar flags.
+Native internals are exposed to server, correctness, and benchmark tools only
+through `langburst.engines.native`. Product surfaces should not import native
+submodules directly unless they are runtime-specific tests or tools.
 
 The engine split is documented in `docs/ADAPTER_ARCHITECTURE.md`.
 Runtime feature profiles are documented in `docs/RUNTIME_FEATURES.md`.
+Qwen GDN/recurrent-state semantics are documented in `docs/QWEN_GDN_STATE_KO.md`.
 Current duplicate/fragmentation boundaries are documented in `docs/STRUCTURE_AUDIT.md`.
 
 ## Environment
@@ -78,24 +76,10 @@ langburst-qwen-audit /path/to/converted-runtime-model --hf-model /path/to/hf-mod
 
 ## Chat
 
-Default engine path:
+Default native engine path:
 
 ```bash
 langburst-chat \
-  --engine vllm \
-  --model /path/or/hf-name \
-  --prompt "안녕. 너는 누구야?" \
-  --max-new-tokens 96 \
-  --temperature 0 \
-  --stream \
-  --stats
-```
-
-Legacy native Qwen3.6/GDN path:
-
-```bash
-langburst-chat \
-  --engine native \
   --adapter qwen36 \
   --runtime-profile stateful \
   --block-prefill on \
@@ -110,7 +94,20 @@ langburst-chat \
   --stats
 ```
 
-Force the legacy native GPU-resident path:
+Optional vLLM provider path:
+
+```bash
+langburst-chat \
+  --engine vllm \
+  --model /path/or/hf-name \
+  --prompt "안녕. 너는 누구야?" \
+  --max-new-tokens 96 \
+  --temperature 0 \
+  --stream \
+  --stats
+```
+
+Force the native GPU-resident path:
 
 ```bash
 langburst-chat \
@@ -128,23 +125,7 @@ langburst-chat \
 
 ## OpenAI-Compatible Server
 
-Default vLLM-backed server:
-
-```bash
-langburst-server \
-  --engine vllm \
-  --model /path/or/hf-name \
-  --qb-model /path/to/converted-runtime-model \
-  --qwen36-lowbit \
-  --kv-window-policy ring \
-  --stateful-chat on \
-  --infinite-streaming on \
-  --served-model-name langburst-vllm-model \
-  --host 0.0.0.0 \
-  --port 8008
-```
-
-Legacy native Qwen3.6/GDN server:
+Default native Qwen3.6/GDN server:
 
 ```bash
 LANGBURST_LOWBIT_ROWS_PER_CTA=8 \
@@ -158,6 +139,22 @@ langburst-server \
   --host 0.0.0.0 \
   --port 8008 \
   --recent-window "$LANGBURST_CONTEXT_WINDOW"
+```
+
+Optional vLLM-backed server:
+
+```bash
+langburst-server \
+  --engine vllm \
+  --model /path/or/hf-name \
+  --qb-model /path/to/converted-runtime-model \
+  --qwen36-lowbit \
+  --kv-window-policy ring \
+  --stateful-chat on \
+  --infinite-streaming on \
+  --served-model-name langburst-vllm-model \
+  --host 0.0.0.0 \
+  --port 8008
 ```
 
 Smoke:
@@ -180,11 +177,11 @@ curl http://127.0.0.1:8008/v1/langburst/engines
 ```
 
 The response reports the selected engine descriptor, `EngineFeaturePlan`, and
-vLLM bridge metadata. Native runtime feature overrides such as
+provider-specific bridge metadata when present. Native runtime feature overrides such as
 `kv_window_policy`, `stateful_chat`, `infinite_streaming`, `episodic_memory`,
-and `ttt_sidecar` are also accepted by the vLLM provider. vLLM handles the
-generic substrate; LangBurst forwards Qwen3.6/GDN, ring/infinite, recurrent,
-episodic, and TTT intent through host state and custom-model metadata.
+and `ttt_sidecar` are first-class native controls. The vLLM provider can also
+accept the same feature request through host state and custom-model metadata
+where implemented.
 
 The chat endpoint accepts common modern LLM API controls. These are wired into
 the shared generation contract:

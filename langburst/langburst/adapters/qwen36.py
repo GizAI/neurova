@@ -194,11 +194,18 @@ class Qwen36Adapter:
         messages.append({"role": "user", "content": prompt})
         return self.encode_messages(tokenizer, messages)
 
-    def encode_messages(self, tokenizer, messages: Sequence[dict[str, Any]]) -> list[int]:
+    def encode_messages(self, tokenizer, messages: Sequence[dict[str, Any]], **kwargs: Any) -> list[int]:
         payload = [{"role": m.get("role", "user"), "content": _content_to_text(m.get("content", ""))} for m in messages]
         if hasattr(tokenizer, "apply_chat_template"):
+            chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+            chat_template_kwargs.setdefault("enable_thinking", True)
             try:
-                encoded = tokenizer.apply_chat_template(payload, tokenize=True, add_generation_prompt=True, enable_thinking=False)
+                encoded = tokenizer.apply_chat_template(
+                    payload,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    **chat_template_kwargs,
+                )
             except TypeError:
                 encoded = tokenizer.apply_chat_template(payload, tokenize=True, add_generation_prompt=True)
             if isinstance(encoded, dict):

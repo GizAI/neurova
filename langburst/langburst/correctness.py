@@ -17,9 +17,7 @@ from .cli_features import (
 )
 from .core.defaults import serving_recent_window_default
 from .core.features import RuntimeFeatures
-from .engines.native_impl.model_runner import BatchedModelRunner
-from .engines.native_impl.runtime import RuntimeEngine, sample_next
-from .engines.native_impl.scheduler import ContinuousBatchScheduler
+from .engines.native import BatchedModelRunner, ContinuousBatchScheduler, GenerationConfig, RuntimeEngine, sample_next
 
 
 @dataclass(frozen=True)
@@ -203,8 +201,6 @@ def run_path_parity(
 
 
 def engine_generation_greedy():
-    from .engines.native_impl.runtime import GenerationConfig
-
     return GenerationConfig.greedy(max_new_tokens=1)
 
 
@@ -257,8 +253,6 @@ def run_batch_path_parity(
     features: RuntimeFeatures,
     max_new_tokens: int,
 ) -> BatchPathParityResult:
-    from .engines.native_impl.runtime import GenerationConfig
-
     gen_cfg = GenerationConfig.greedy(max_new_tokens=max_new_tokens, eos_token_ids=engine.eos_token_ids())
     target_features = features.with_overrides(speculative_decoding=False, prefix_cache=False)
     direct_target = engine.generate_ids_greedy_gpu(prompt_ids, gen_cfg, features=target_features)

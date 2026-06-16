@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from langburst.engines.native_impl.model_runner import BatchedModelRunner
+from langburst.engines.native.model_runner import BatchedModelRunner
 from langburst.correctness import run_batch_path_parity
 from langburst.core.features import RuntimeFeatures
-from langburst.engines.native_impl.runtime import RuntimeEngine
-from langburst.engines.native_impl.scheduler import ContinuousBatchScheduler
+from langburst.engines.native.runtime import RuntimeEngine
+from langburst.engines.native.scheduler import ContinuousBatchScheduler
 
 from test_adapter_runtime_cpu import ToyAdapter
 

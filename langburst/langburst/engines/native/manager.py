@@ -527,6 +527,9 @@ class EngineManager:
     def validate_runtime_memory(self, engine: RuntimeEngine) -> None:
         if not str(engine.device).startswith("cuda") or not torch.cuda.is_available():
             return
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         props = torch.cuda.get_device_properties(torch.device(engine.device))
         total_mib = props.total_memory // (1024 * 1024)
         free_bytes, _ = torch.cuda.mem_get_info()
@@ -547,13 +550,16 @@ class EngineManager:
         loaded_weight = engine.model_name in self._engines
         arena_allocated = any(key[0] == engine.model_name for key in self._batch_runners)
         if arena_allocated:
-            required_mib = self.policy.reserve_free_vram_mib
-            if required_mib > free_mib:
-                raise RuntimeError(
-                    f"insufficient free GPU memory for active runtime: free={free_mib} MiB "
-                    f"required={required_mib} MiB reserve={self.policy.reserve_free_vram_mib} MiB. "
-                    "Wait for current requests or lower LANGBURST_CONTEXT_WINDOW."
-                )
+            # Once the model and runtime arena are already allocated, low free
+            # VRAM is expected on 16GB cards.  Do not reject a request merely
+            # because the reserve watermark is below target; the admission
+            # controller already serializes active requests and the paged/ring
+            # KV contract bounds per-request memory.  Real OOMs are handled at
+            # execution time where the runtime can clear pools and recover.
+            if self.policy.reserve_free_vram_mib > 0 and free_mib < self.policy.reserve_free_vram_mib:
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
             return
         if loaded_weight:
             required_mib = state_mib + self.policy.runtime_overhead_mib + self.policy.reserve_free_vram_mib

@@ -13,7 +13,7 @@ import torch
 from pydantic import BaseModel
 from starlette.requests import Request
 
-from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, runtime_features_from_args
+from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, engine_model_spec_from_args, runtime_features_from_args
 from .core.defaults import (
     DEFAULT_MAX_BATCHED_TOKENS,
     DEFAULT_MAX_GENERATION_TOKENS,
@@ -30,9 +30,8 @@ from .core.platform import PLATFORM_NAME
 from .core.text_stream import StreamingTextDecoder
 from .core.usage import RequestUsage
 from .engines import ensure_engines_loaded, engine_registry
-from .engines.base import EngineBackend, EngineChatRequest, EngineFeatureRequest, EngineModelSpec, EngineSamplingParams
-from .engines.native_impl.manager import EngineManager, EngineResourcePolicy, ModelResourceSpec, load_model_specs
-from .engines.native_impl.runtime import GenerationConfig
+from .engines.base import EngineBackend, EngineChatRequest, EngineSamplingParams
+from .engines.native import EngineManager, EngineResourcePolicy, GenerationConfig, ModelResourceSpec, load_model_specs
 
 
 class StreamOptions(BaseModel):
@@ -86,6 +85,9 @@ class ChatCompletionRequest(BaseModel):
     prompt_cache_key: str | None = None
     user: str | None = None
     metadata: dict[str, Any] | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
+    enable_thinking: bool | None = None
+    reasoning_effort: str | None = None
     runtime_profile: Literal["original", "stateful", "research"] | None = None
     kv_window_policy: Literal["error", "shift", "ring"] | None = None
     stateful_chat: bool | None = None
@@ -116,12 +118,71 @@ def _requested_generation_tokens(req: ChatCompletionRequest) -> int:
     return req.max_new_tokens or req.max_completion_tokens or req.max_tokens or fallback
 
 
+def _default_min_generation_tokens(max_tokens: int) -> int:
+    configured = int(os.environ.get("LANGBURST_DEFAULT_MIN_NEW_TOKENS", "0"))
+    if configured < 0:
+        raise ValueError("LANGBURST_DEFAULT_MIN_NEW_TOKENS must be >= 0")
+    return min(int(max_tokens), configured)
+
+
 def _requested_min_generation_tokens(req: ChatCompletionRequest) -> int:
-    return int(req.min_new_tokens if req.min_new_tokens is not None else req.min_tokens or 0)
+    if req.min_new_tokens is not None:
+        return int(req.min_new_tokens)
+    if req.min_tokens is not None:
+        return int(req.min_tokens)
+    return _default_min_generation_tokens(_requested_generation_tokens(req))
+
+
+def _default_suppress_tokens(engine) -> tuple[int, ...]:
+    if os.environ.get("LANGBURST_SUPPRESS_THINK_TOKENS", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return ()
+    out: list[int] = []
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        return ()
+    for text in ("<think>", "</think>"):
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            ids = tokenizer.encode(text)
+        if len(ids) == 1:
+            out.append(int(ids[0]))
+    return tuple(dict.fromkeys(out))
 
 
 def _request_messages(req: ChatCompletionRequest) -> list[dict[str, Any]]:
     return [{"role": m.role, "content": m.content} for m in req.messages]
+
+
+def _chat_template_kwargs(req: ChatCompletionRequest) -> dict[str, Any]:
+    out: dict[str, Any] = {"enable_thinking": True}
+    if isinstance(req.chat_template_kwargs, dict):
+        out.update(req.chat_template_kwargs)
+    if req.enable_thinking is not None:
+        out["enable_thinking"] = bool(req.enable_thinking)
+    if req.reasoning_effort == "none":
+        out["enable_thinking"] = False
+    elif req.reasoning_effort is not None:
+        out["enable_thinking"] = True
+    return out
+
+
+def _model_uses_visible_thinking(model_name: str | None) -> bool:
+    return "qwen" in str(model_name or "").lower()
+
+
+def _thinking_visible_prefix(req: ChatCompletionRequest, model_name: str | None = None) -> str:
+    if _model_uses_visible_thinking(model_name or req.model) and bool(_chat_template_kwargs(req).get("enable_thinking", True)):
+        return "<think>\n"
+    return ""
+
+
+def _with_visible_prefix_once(text: str, prefix: str, *, emitted: bool) -> tuple[str, bool]:
+    if emitted or not prefix or not text:
+        return text, emitted
+    if text.startswith(prefix) or text.startswith("<think>"):
+        return text, True
+    return prefix + text, True
 
 
 def _stop_strings(req: ChatCompletionRequest) -> list[str]:
@@ -214,6 +275,9 @@ def _request_feature_overrides(req: ChatCompletionRequest, base: RuntimeFeatures
 
 
 def _native_generation_config(engine, req: ChatCompletionRequest) -> GenerationConfig:
+    request_suppress = tuple(int(t) for t in (req.suppress_tokens or []) + (req.begin_suppress_tokens or []))
+    template_kwargs = _chat_template_kwargs(req)
+    default_suppress = () if bool(template_kwargs.get("enable_thinking", True)) else _default_suppress_tokens(engine)
     return GenerationConfig(
         max_new_tokens=_requested_generation_tokens(req),
         min_new_tokens=_requested_min_generation_tokens(req),
@@ -227,7 +291,7 @@ def _native_generation_config(engine, req: ChatCompletionRequest) -> GenerationC
         no_repeat_ngram_size=int(req.no_repeat_ngram_size),
         logit_bias=_logit_bias(req),
         bad_token_ids=_flat_token_ids(req.bad_words_ids),
-        suppress_tokens=tuple(int(t) for t in (req.suppress_tokens or []) + (req.begin_suppress_tokens or [])),
+        suppress_tokens=tuple(dict.fromkeys(request_suppress + default_suppress)),
         seed=req.seed,
         eos_token_ids=engine.eos_token_ids(),
         stop_token_ids=tuple(int(t) for t in (req.stop_token_ids or [])),
@@ -251,8 +315,9 @@ def _uses_native_session(req: ChatCompletionRequest) -> bool:
 def create_app(manager: EngineManager):
     """Native LangBurst server surface backed by the in-process EngineManager.
 
-    This is intentionally kept beside the provider router. vLLM is the default
-    engine provider, but native remains independently runnable without vLLM.
+    This is intentionally kept beside the provider router. Native is the
+    default engine provider and remains independently runnable without any
+    optional external engine package.
     """
 
     try:
@@ -296,9 +361,10 @@ def create_app(manager: EngineManager):
         try:
             engine = manager.get(req.model)
             features = _request_feature_overrides(req, engine.features)
-            prompt_ids = engine.encode_messages(_request_messages(req))
+            prompt_ids = engine.encode_messages(_request_messages(req), chat_template_kwargs=_chat_template_kwargs(req))
             generation_tokens = _requested_generation_tokens(req)
             manager.validate_generation_request(prompt_tokens=len(prompt_ids), generation_tokens=generation_tokens)
+            manager.validate_runtime_memory(engine)
             gen_cfg = _native_generation_config(engine, req)
             session_id = req.session_id or (manager.create_session() if req.stateful_session else None)
             session_record = (
@@ -319,7 +385,14 @@ def create_app(manager: EngineManager):
 
         if req.stream:
             async def events():
+                lease = manager.acquire_request()
+                acquired = False
+                handle = None
+                visible_prefix = _thinking_visible_prefix(req, engine.model_name)
+                visible_prefix_emitted = False
                 try:
+                    await asyncio.to_thread(lease.__enter__)
+                    acquired = True
                     usage = RequestUsage(prompt_tokens=len(prompt_ids))
                     handle = worker.submit(
                         prompt_ids,
@@ -344,6 +417,11 @@ def create_app(manager: EngineManager):
                             continue
                         text = decoder.push(token_id)
                         if text:
+                            text, visible_prefix_emitted = _with_visible_prefix_once(
+                                text,
+                                visible_prefix,
+                                emitted=visible_prefix_emitted,
+                            )
                             yield _sse_payload(
                                 {
                                     "id": request_id,
@@ -368,6 +446,11 @@ def create_app(manager: EngineManager):
                         request_id=request_id,
                     )
                     if tail:
+                        tail, visible_prefix_emitted = _with_visible_prefix_once(
+                            tail,
+                            visible_prefix,
+                            emitted=visible_prefix_emitted,
+                        )
                         yield _sse_payload(
                             {
                                 "id": request_id,
@@ -390,8 +473,13 @@ def create_app(manager: EngineManager):
                     yield _sse_payload(done)
                     yield "data: [DONE]\n\n"
                 except BaseException as exc:
+                    if handle is not None:
+                        handle.cancel()
                     yield _sse_payload({"error": {"message": str(exc), "type": type(exc).__name__}})
                     yield "data: [DONE]\n\n"
+                finally:
+                    if acquired:
+                        lease.__exit__(None, None, None)
 
             return StreamingResponse(
                 events(),
@@ -438,7 +526,14 @@ def create_app(manager: EngineManager):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": engine.tokenizer.decode(ids, skip_special_tokens=True)},
+                        "message": {
+                            "role": "assistant",
+                            "content": _with_visible_prefix_once(
+                                engine.tokenizer.decode(ids, skip_special_tokens=True),
+                                _thinking_visible_prefix(req, engine.model_name),
+                                emitted=False,
+                            )[0],
+                        },
                         "finish_reason": handle.finish_reason,
                     }
                 ],
@@ -469,19 +564,6 @@ def _engine_sampling(req: ChatCompletionRequest) -> EngineSamplingParams:
         stop_token_ids=tuple(int(t) for t in (req.stop_token_ids or [])),
         seed=req.seed,
         ignore_eos=bool(req.ignore_eos),
-    )
-
-
-def _engine_feature_request_from_args(args: argparse.Namespace) -> EngineFeatureRequest:
-    features = runtime_features_from_args(args)
-    return EngineFeatureRequest.from_mapping(
-        {
-            **features.summary(),
-            "qwen36_lowbit": bool(args.qwen36_lowbit or args.qb_model),
-            "ring_kv": features.kv_window_policy == "ring",
-            "recurrent_state": bool(args.recurrent_state or args.qwen36_lowbit or args.qb_model),
-            "infinite_context": bool(features.infinite_streaming),
-        }
     )
 
 
@@ -540,18 +622,27 @@ def create_engine_app(backend: EngineBackend):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if req.stream:
             async def events():
+                visible_prefix = _thinking_visible_prefix(req, engine_req.model)
+                visible_prefix_emitted = False
                 try:
                     for chunk in backend.stream_chat(engine_req):
                         if await request.is_disconnected():
                             break
                         if chunk.text:
+                            if not visible_prefix and not visible_prefix_emitted:
+                                visible_prefix = _thinking_visible_prefix(req, chunk.model)
+                            text, visible_prefix_emitted = _with_visible_prefix_once(
+                                chunk.text,
+                                visible_prefix,
+                                emitted=visible_prefix_emitted,
+                            )
                             yield _sse_payload(
                                 {
                                     "id": engine_req.request_id,
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
                                     "model": chunk.model,
-                                    "choices": [{"index": 0, "delta": {"content": chunk.text}, "finish_reason": None}],
+                                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                                 }
                             )
                         if chunk.finish_reason:
@@ -591,7 +682,14 @@ def create_engine_app(backend: EngineBackend):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": result.text},
+                        "message": {
+                            "role": "assistant",
+                            "content": _with_visible_prefix_once(
+                                result.text,
+                                _thinking_visible_prefix(req, result.model),
+                                emitted=False,
+                            )[0],
+                        },
                         "finish_reason": result.finish_reason,
                     }
                 ],
@@ -602,41 +700,10 @@ def create_engine_app(backend: EngineBackend):
     return app
 
 
-def _model_spec_from_args(args: argparse.Namespace) -> EngineModelSpec:
-    model = args.model or (str(args.hf_model) if args.hf_model is not None else None)
-    if model is None:
-        raise ValueError("--model or --hf-model is required")
-    extra = {
-        "adapter": args.adapter,
-        "qb_model": str(args.qb_model) if args.qb_model is not None else None,
-        "device": args.device,
-        "recent_window": args.recent_window,
-        "weight_device": args.weight_device,
-        "cpu_embed": bool(args.cpu_embed),
-        "runtime_profile": args.runtime_profile,
-        "vllm_custom_model": args.vllm_custom_model,
-        "enable_mtp": bool(args.enable_mtp),
-        "mtp_speculative_tokens": args.mtp_speculative_tokens,
-    }
-    return EngineModelSpec(
-        model=model,
-        served_model_name=args.served_model_name or args.model_name,
-        tokenizer=args.tokenizer,
-        dtype=str(os.environ.get("LANGBURST_DTYPE", "auto")),
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len or args.recent_window,
-        quantization=args.quantization,
-        trust_remote_code=not args.no_trust_remote_code,
-        features=_engine_feature_request_from_args(args),
-        extra={k: v for k, v in extra.items() if v is not None},
-    )
-
-
 def main() -> None:
     ensure_engines_loaded()
     ap = argparse.ArgumentParser(description="OpenAI-compatible LangBurst engine router")
-    ap.add_argument("--engine", choices=engine_registry.ids(), default=engine_registry.default_engine_id(), help="serving engine provider; vllm is the default")
+    ap.add_argument("--engine", choices=engine_registry.ids(), default=engine_registry.default_engine_id(), help="serving engine provider; native is the default")
     ap.add_argument("--model", default=None, help="engine model path/name; defaults to --hf-model")
     ap.add_argument("--tokenizer", default=None)
     ap.add_argument("--served-model-name", default=None)
@@ -709,7 +776,8 @@ def main() -> None:
             )
             app = create_app(manager)
         else:
-            backend = engine_registry.create(_model_spec_from_args(args), engine_id=args.engine)
+            spec = engine_model_spec_from_args(args, served_model_name=args.served_model_name or args.model_name)
+            backend = engine_registry.create(spec, engine_id=args.engine)
             app = create_engine_app(backend)
     except ValueError as exc:
         ap.error(str(exc))

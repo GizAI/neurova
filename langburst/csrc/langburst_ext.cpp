@@ -226,7 +226,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("block_size"),
         py::arg("hadamard_order"),
         py::arg("bdr_k"),
-        py::arg("rotate_v"));
+        py::arg("rotate_v"),
+        py::arg("tiled_layout") = false);
   m.def("attention_decode_paged_int4", &attention_decode_paged_int4,
         "Batched INT4/BDR decode attention over paged KV block table",
         py::arg("q"),
@@ -245,7 +246,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("softmax_scale"),
         py::arg("hadamard_order"),
         py::arg("bdr_k"),
-        py::arg("rotate_v"));
+        py::arg("rotate_v"),
+        py::arg("tiled_layout") = false);
+  m.def("attention_paged_int4_flash", &attention_paged_int4_flash,
+        "FlashAttention-style INT4/BDR attention over paged KV block table",
+        py::arg("q"),
+        py::arg("k_new"),
+        py::arg("v_new"),
+        py::arg("k_pages"),
+        py::arg("v_pages"),
+        py::arg("k_scales"),
+        py::arg("v_scales"),
+        py::arg("k_zeros"),
+        py::arg("v_zeros"),
+        py::arg("slot_mapping"),
+        py::arg("block_tables"),
+        py::arg("seq_lens"),
+        py::arg("block_size"),
+        py::arg("softmax_scale"),
+        py::arg("hadamard_order"),
+        py::arg("bdr_k"),
+        py::arg("rotate_v"),
+        py::arg("tiled_layout") = false);
   m.def("argmax", &argmax, "GPU argmax over a 1D fp16/fp32 logits tensor");
   m.def("argmax_many", &argmax_many, "GPU argmax over [rows, vocab] fp16/fp32 logits");
   m.def("argmax_many_out", &argmax_many_out, "Graph-capturable GPU argmax_many into preallocated int64 output");

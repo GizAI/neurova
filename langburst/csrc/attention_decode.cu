@@ -82,6 +82,21 @@ __device__ __forceinline__ float qb_unpack_uint4(uint8_t packed, bool high_half,
   return (static_cast<float>(nibble) - zero) * scale;
 }
 
+__device__ __forceinline__ int64_t qb_int4_paged_offset(
+    int block,
+    int kvh,
+    int kv_heads,
+    int block_size,
+    int packed_dim_count,
+    int offset,
+    int packed_dim,
+    bool tiled_layout) {
+  if (tiled_layout) {
+    return (((static_cast<int64_t>(block) * kv_heads + kvh) * packed_dim_count + packed_dim) * block_size) + offset;
+  }
+  return (((static_cast<int64_t>(block) * kv_heads + kvh) * block_size + offset) * packed_dim_count) + packed_dim;
+}
+
 template<int D>
 __global__ void attention_decode_kernel(
     const half* __restrict__ q,
@@ -633,7 +648,8 @@ __global__ void attention_kv_append_paged_int4_kernel(
     int kv_heads,
     int block_size,
     int hadamard_order,
-    bool bdr_k) {
+    bool bdr_k,
+    bool tiled_layout) {
   int row = blockIdx.x;
   int kvh = blockIdx.y;
   int d = threadIdx.x;
@@ -685,7 +701,8 @@ __global__ void attention_kv_append_paged_int4_kernel(
     int q1k = static_cast<int>(nearbyintf(k_vals[d + D / 2] / k_scale + k_zero));
     int q0v = static_cast<int>(nearbyintf(v_vals[d] / v_scale + v_zero));
     int q1v = static_cast<int>(nearbyintf(v_vals[d + D / 2] / v_scale + v_zero));
-    int64_t dst = (((static_cast<int64_t>(block) * kv_heads + kvh) * block_size + offset) * (D / 2)) + d;
+    int64_t dst = qb_int4_paged_offset(
+        static_cast<int>(block), kvh, kv_heads, block_size, D / 2, offset, d, tiled_layout);
     k_pages[dst] = qb_pack_uint4_pair(q0k, q1k);
     v_pages[dst] = qb_pack_uint4_pair(q0v, q1v);
   }
@@ -710,7 +727,8 @@ __global__ void attention_decode_paged_int4_kernel(
     int block_size,
     float softmax_scale,
     int hadamard_order,
-    bool bdr_k) {
+    bool bdr_k,
+    bool tiled_layout) {
   int qh = blockIdx.x;
   int row = blockIdx.y;
   int dim = threadIdx.x;
@@ -731,12 +749,13 @@ __global__ void attention_decode_paged_int4_kernel(
     int block_idx = t / block_size;
     int offset = t - block_idx * block_size;
     int block_id = block_tables[static_cast<int64_t>(row) * max_blocks_per_row + block_idx];
-    int64_t packed_base = ((static_cast<int64_t>(block_id) * kv_heads + kvh) * block_size + offset) * (D / 2);
     int64_t scale_idx = (static_cast<int64_t>(block_id) * kv_heads + kvh) * block_size + offset;
     bool high_half = dim >= (D / 2);
     int packed_dim = high_half ? dim - D / 2 : dim;
-    uint8_t kpack = k_pages[packed_base + packed_dim];
-    uint8_t vpack = v_pages[packed_base + packed_dim];
+    int64_t packed_idx = qb_int4_paged_offset(
+        block_id, kvh, kv_heads, block_size, D / 2, offset, packed_dim, tiled_layout);
+    uint8_t kpack = k_pages[packed_idx];
+    uint8_t vpack = v_pages[packed_idx];
     float kval = qb_unpack_uint4(kpack, high_half, __half2float(k_scales[scale_idx]), __half2float(k_zeros[scale_idx]));
     float prod = qval * kval;
     qk[dim] = prod;
@@ -774,7 +793,8 @@ torch::Tensor attention_decode_paged_int4(
     double softmax_scale,
     int64_t hadamard_order_i,
     bool bdr_k,
-    bool rotate_v) {
+    bool rotate_v,
+    bool tiled_layout) {
   QB_CHECK_CUDA(q); QB_CHECK_CUDA(k_new); QB_CHECK_CUDA(v_new); QB_CHECK_CUDA(k_pages); QB_CHECK_CUDA(v_pages);
   QB_CHECK_CUDA(k_scales); QB_CHECK_CUDA(v_scales); QB_CHECK_CUDA(k_zeros); QB_CHECK_CUDA(v_zeros);
   QB_CHECK_CUDA(slot_mapping); QB_CHECK_CUDA(block_tables); QB_CHECK_CUDA(seq_lens);
@@ -788,7 +808,8 @@ torch::Tensor attention_decode_paged_int4(
   TORCH_CHECK(seq_lens.scalar_type() == at::kInt, "seq_lens must be int32");
   TORCH_CHECK(q.dim() == 3, "q must be [batch, q_heads, head_dim]");
   TORCH_CHECK(k_new.dim() == 3 && v_new.dim() == 3, "k_new/v_new must be [batch, kv_heads, head_dim]");
-  TORCH_CHECK(k_pages.dim() == 4 && v_pages.dim() == 4, "paged cache must be [num_blocks, kv_heads, block_size, packed_head_dim]");
+  TORCH_CHECK(k_pages.dim() == 4 && v_pages.dim() == 4,
+              "paged cache must be [num_blocks, kv_heads, block_size, packed_head_dim] or [num_blocks, kv_heads, packed_head_dim, block_size]");
   TORCH_CHECK(k_scales.dim() == 3 && v_scales.dim() == 3, "int4 scales must be [num_blocks, kv_heads, block_size]");
   TORCH_CHECK(k_zeros.dim() == 3 && v_zeros.dim() == 3, "int4 zero points must be [num_blocks, kv_heads, block_size]");
   int batch = static_cast<int>(q.size(0));
@@ -803,11 +824,17 @@ torch::Tensor attention_decode_paged_int4(
   TORCH_CHECK((head_dim % 2) == 0, "INT4 KV requires even head_dim");
   TORCH_CHECK(!bdr_k || (hadamard_order > 0 && (hadamard_order & (hadamard_order - 1)) == 0 && head_dim % hadamard_order == 0),
               "BDR hadamard_order must be a power-of-two divisor of head_dim");
-  TORCH_CHECK(block_size > 0 && k_pages.size(2) == block_size, "block_size mismatch");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
   TORCH_CHECK(k_new.size(0) == batch && v_new.size(0) == batch, "k_new/v_new batch mismatch");
   TORCH_CHECK(k_new.size(2) == head_dim && v_new.size(2) == head_dim, "k_new/v_new dim mismatch");
   TORCH_CHECK(k_pages.size(1) == kv_heads && v_pages.size(1) == kv_heads, "arena kv_heads mismatch");
-  TORCH_CHECK(k_pages.size(3) == head_dim / 2 && v_pages.size(3) == head_dim / 2, "int4 packed head_dim mismatch");
+  if (tiled_layout) {
+    TORCH_CHECK(k_pages.size(2) == head_dim / 2 && v_pages.size(2) == head_dim / 2, "tiled int4 packed head_dim mismatch");
+    TORCH_CHECK(k_pages.size(3) == block_size && v_pages.size(3) == block_size, "tiled block_size mismatch");
+  } else {
+    TORCH_CHECK(k_pages.size(2) == block_size && v_pages.size(2) == block_size, "block_size mismatch");
+    TORCH_CHECK(k_pages.size(3) == head_dim / 2 && v_pages.size(3) == head_dim / 2, "int4 packed head_dim mismatch");
+  }
   TORCH_CHECK(k_scales.size(0) == num_blocks && k_scales.size(1) == kv_heads && k_scales.size(2) == block_size, "k_scales shape mismatch");
   TORCH_CHECK(v_scales.sizes() == k_scales.sizes(), "v_scales shape mismatch");
   TORCH_CHECK(k_zeros.sizes() == k_scales.sizes(), "k_zeros shape mismatch");
@@ -829,7 +856,7 @@ torch::Tensor attention_decode_paged_int4(
       reinterpret_cast<half*>(k_zeros.data_ptr<at::Half>()),
       reinterpret_cast<half*>(v_zeros.data_ptr<at::Half>()),
       slot_mapping.data_ptr<int64_t>(),
-      batch, num_blocks, kv_heads, block_size, hadamard_order, bdr_k);
+      batch, num_blocks, kv_heads, block_size, hadamard_order, bdr_k, tiled_layout);
   QB_CUDA_CHECK(cudaGetLastError());
   dim3 grid(q_heads, batch);
   attention_decode_paged_int4_kernel<256><<<grid, QB_ATT_BLOCK, 0, stream>>>(
@@ -843,9 +870,57 @@ torch::Tensor attention_decode_paged_int4(
       block_tables.data_ptr<int32_t>(),
       seq_lens.data_ptr<int32_t>(),
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-      batch, q_heads, kv_heads, max_blocks_per_row, block_size, static_cast<float>(softmax_scale), hadamard_order, bdr_k);
+      batch, q_heads, kv_heads, max_blocks_per_row, block_size, static_cast<float>(softmax_scale), hadamard_order, bdr_k, tiled_layout);
   QB_CUDA_CHECK(cudaGetLastError());
   return out;
+}
+
+torch::Tensor attention_paged_int4_flash(
+    torch::Tensor q,
+    torch::Tensor k_new,
+    torch::Tensor v_new,
+    torch::Tensor k_pages,
+    torch::Tensor v_pages,
+    torch::Tensor k_scales,
+    torch::Tensor v_scales,
+    torch::Tensor k_zeros,
+    torch::Tensor v_zeros,
+    torch::Tensor slot_mapping,
+    torch::Tensor block_tables,
+    torch::Tensor seq_lens,
+    int64_t block_size_i,
+    double softmax_scale,
+    int64_t hadamard_order_i,
+    bool bdr_k,
+    bool rotate_v,
+    bool tiled_layout) {
+  // FlashAttention-style contract:
+  //   - direct paged INT4/BDR K/V read,
+  //   - no full fp16 KV staging,
+  //   - online softmax over the global prefix.
+  //
+  // This kernel owns the INT4 paged-flash contract. Faster implementations
+  // must keep this state/shape contract and replace only the internals after
+  // parity passes.
+  return attention_decode_paged_int4(
+      q,
+      k_new,
+      v_new,
+      k_pages,
+      v_pages,
+      k_scales,
+      v_scales,
+      k_zeros,
+      v_zeros,
+      slot_mapping,
+      block_tables,
+      seq_lens,
+      block_size_i,
+      softmax_scale,
+      hadamard_order_i,
+      bdr_k,
+      rotate_v,
+      tiled_layout);
 }
 
 void attention_append_paged_int4(
@@ -861,7 +936,8 @@ void attention_append_paged_int4(
     int64_t block_size_i,
     int64_t hadamard_order_i,
     bool bdr_k,
-    bool rotate_v) {
+    bool rotate_v,
+    bool tiled_layout) {
   QB_CHECK_CUDA(k_new); QB_CHECK_CUDA(v_new); QB_CHECK_CUDA(k_pages); QB_CHECK_CUDA(v_pages);
   QB_CHECK_CUDA(k_scales); QB_CHECK_CUDA(v_scales); QB_CHECK_CUDA(k_zeros); QB_CHECK_CUDA(v_zeros);
   QB_CHECK_CUDA(slot_mapping);
@@ -872,7 +948,8 @@ void attention_append_paged_int4(
   QB_CHECK_HALF(k_scales); QB_CHECK_HALF(v_scales); QB_CHECK_HALF(k_zeros); QB_CHECK_HALF(v_zeros); QB_CHECK_INT64(slot_mapping);
   TORCH_CHECK(!rotate_v, "INT4 BDR rotate_v is not implemented in LangBurst; use K-only BDR");
   TORCH_CHECK(k_new.dim() == 3 && v_new.dim() == 3, "k_new/v_new must be [batch, kv_heads, head_dim]");
-  TORCH_CHECK(k_pages.dim() == 4 && v_pages.dim() == 4, "paged cache must be [num_blocks, kv_heads, block_size, packed_head_dim]");
+  TORCH_CHECK(k_pages.dim() == 4 && v_pages.dim() == 4,
+              "paged cache must be [num_blocks, kv_heads, block_size, packed_head_dim] or [num_blocks, kv_heads, packed_head_dim, block_size]");
   TORCH_CHECK(k_scales.dim() == 3 && v_scales.dim() == 3, "int4 scales must be [num_blocks, kv_heads, block_size]");
   TORCH_CHECK(k_zeros.dim() == 3 && v_zeros.dim() == 3, "int4 zero points must be [num_blocks, kv_heads, block_size]");
   int batch = static_cast<int>(k_new.size(0));
@@ -885,10 +962,16 @@ void attention_append_paged_int4(
   TORCH_CHECK((head_dim % 2) == 0, "INT4 KV requires even head_dim");
   TORCH_CHECK(!bdr_k || (hadamard_order > 0 && (hadamard_order & (hadamard_order - 1)) == 0 && head_dim % hadamard_order == 0),
               "BDR hadamard_order must be a power-of-two divisor of head_dim");
-  TORCH_CHECK(block_size > 0 && k_pages.size(2) == block_size, "block_size mismatch");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
   TORCH_CHECK(v_new.size(0) == batch && v_new.size(1) == kv_heads && v_new.size(2) == head_dim, "v_new shape mismatch");
   TORCH_CHECK(k_pages.size(1) == kv_heads && v_pages.size(1) == kv_heads, "arena kv_heads mismatch");
-  TORCH_CHECK(k_pages.size(3) == head_dim / 2 && v_pages.size(3) == head_dim / 2, "int4 packed head_dim mismatch");
+  if (tiled_layout) {
+    TORCH_CHECK(k_pages.size(2) == head_dim / 2 && v_pages.size(2) == head_dim / 2, "tiled int4 packed head_dim mismatch");
+    TORCH_CHECK(k_pages.size(3) == block_size && v_pages.size(3) == block_size, "tiled block_size mismatch");
+  } else {
+    TORCH_CHECK(k_pages.size(2) == block_size && v_pages.size(2) == block_size, "block_size mismatch");
+    TORCH_CHECK(k_pages.size(3) == head_dim / 2 && v_pages.size(3) == head_dim / 2, "int4 packed head_dim mismatch");
+  }
   TORCH_CHECK(k_scales.size(0) == num_blocks && k_scales.size(1) == kv_heads && k_scales.size(2) == block_size, "k_scales shape mismatch");
   TORCH_CHECK(v_scales.sizes() == k_scales.sizes(), "v_scales shape mismatch");
   TORCH_CHECK(k_zeros.sizes() == k_scales.sizes(), "k_zeros shape mismatch");
@@ -907,6 +990,6 @@ void attention_append_paged_int4(
       reinterpret_cast<half*>(k_zeros.data_ptr<at::Half>()),
       reinterpret_cast<half*>(v_zeros.data_ptr<at::Half>()),
       slot_mapping.data_ptr<int64_t>(),
-      batch, num_blocks, kv_heads, block_size, hadamard_order, bdr_k);
+      batch, num_blocks, kv_heads, block_size, hadamard_order, bdr_k, tiled_layout);
   QB_CUDA_CHECK(cudaGetLastError());
 }

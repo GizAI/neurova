@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from langburst.engines.native_impl.block_table import KVBlockTable
+from langburst.engines.native.block_table import KVBlockTable
 
 
 def test_kv_block_table_allocates_logical_positions():

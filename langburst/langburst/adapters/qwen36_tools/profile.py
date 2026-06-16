@@ -17,7 +17,7 @@ from ...cli_features import (
     create_runtime_engine_from_args,
     runtime_features_from_args,
 )
-from ...engines.native_impl.runtime import GenerationConfig, sample_next_tensor
+from ...engines.native.runtime import GenerationConfig, sample_next_tensor
 from ...loader import LowBitMarlinTensor, LowBitTensor
 from ...ops import cuda_ops
 from langburst.adapters.qwen36_impl import model as model_mod

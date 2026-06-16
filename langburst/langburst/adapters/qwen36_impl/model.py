@@ -14,18 +14,52 @@ from ...ops import cuda_ops
 from .state import DecodeState
 from ...speculative_batch import DecodeBatchPlan
 from ...tuning import (
+    attention_recent_tokens,
     batch_conv_kernels_enabled,
     batch_gdn_kernels_enabled,
     batch_prefill_steps_enabled,
     fast_raw_block_enabled,
     lowbit_rows_per_cta,
+    paged_attention_backend,
     paged_attention_kernels_enabled,
     paged_prefill_block_enabled,
     raw_prefill_block_tokens,
+    short_prefill_sdpa_min_free_mib,
+    short_prefill_sdpa_tokens,
     verify_nextn_mode,
 )
 
 TensorLike = LowBitTensor | LowBitMarlinTensor | FP16Tensor
+
+
+def _paged_int4_tiled_layout(arena: object) -> bool:
+    return bool(getattr(arena, "paged_int4_tiled_layout", False))
+
+
+def _copy_paged_int4_rows(
+    page: torch.Tensor,
+    block: int,
+    offset: int,
+    rows: torch.Tensor,
+    *,
+    tiled_layout: bool,
+) -> None:
+    if tiled_layout:
+        page[block, :, :, offset].copy_(rows)
+    else:
+        page[block, :, offset, :].copy_(rows)
+
+
+def _read_paged_int4_rows(
+    page: torch.Tensor,
+    block: int,
+    offset: int,
+    *,
+    tiled_layout: bool,
+) -> torch.Tensor:
+    if tiled_layout:
+        return page[block, :, :, offset]
+    return page[block, :, offset, :]
 
 
 @dataclass
@@ -401,6 +435,20 @@ def attention_decode_paged_batch(
     slot_mapping = plan.slot_mapping.to(device=q.device, dtype=torch.long).contiguous()
     block_tables = plan.block_tables.to(device=q.device, dtype=torch.int32).contiguous()
     seq_lens = plan.seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
+    recent_tokens = attention_recent_tokens()
+    if recent_tokens > 0 and int(seq_lens.numel()) > 0 and int(block_tables.size(1)) > 0:
+        start_blocks = torch.div(
+            torch.clamp(seq_lens - int(recent_tokens), min=0),
+            int(block_size),
+            rounding_mode="floor",
+        ).to(dtype=torch.int64)
+        cols = torch.arange(block_tables.size(1), device=block_tables.device, dtype=torch.int64).unsqueeze(0)
+        gather_idx = cols + start_blocks.to(device=block_tables.device).unsqueeze(1)
+        valid = gather_idx < int(block_tables.size(1))
+        gather_idx = torch.clamp(gather_idx, max=max(0, int(block_tables.size(1)) - 1))
+        shifted = torch.gather(block_tables, 1, gather_idx)
+        block_tables = torch.where(valid, shifted, torch.zeros((), device=block_tables.device, dtype=block_tables.dtype)).contiguous()
+        seq_lens = (seq_lens - start_blocks.to(device=seq_lens.device, dtype=seq_lens.dtype) * int(block_size)).contiguous()
     if not paged_attention_kernels_enabled():
         return attention_decode_paged_reference(
             arena,
@@ -423,7 +471,22 @@ def attention_decode_paged_batch(
         v_zeros = getattr(arena, "paged_attn_v_zero", None)
         if k_scales is None or v_scales is None or k_zeros is None or v_zeros is None:
             raise RuntimeError("INT4 paged attention requires paged scale/zero tensors")
-        out = cuda_ops().attention_decode_paged_int4(
+        ops = cuda_ops()
+        backend = paged_attention_backend()
+        if backend == "auto":
+            if hasattr(ops, "attention_paged_int4_flash"):
+                op = ops.attention_paged_int4_flash
+            else:
+                op = ops.attention_decode_paged_int4
+        elif backend == "direct":
+            op = ops.attention_decode_paged_int4
+        elif backend == "flash":
+            if not hasattr(ops, "attention_paged_int4_flash"):
+                raise RuntimeError("LANGBURST_PAGED_ATTENTION_BACKEND=flash requires attention_paged_int4_flash")
+            op = ops.attention_paged_int4_flash
+        else:  # pragma: no cover - paged_attention_backend validates this.
+            raise ValueError(f"unknown paged attention backend: {backend}")
+        out = op(
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),
@@ -441,6 +504,7 @@ def attention_decode_paged_batch(
             int(kv_spec.hadamard_order),
             bool(kv_spec.uses_bdr),
             bool(kv_spec.rotate_v),
+            _paged_int4_tiled_layout(arena),
         )
     elif kv_spec.is_fp8:
         out = cuda_ops().attention_decode_paged_fp8_e4m3(
@@ -536,8 +600,9 @@ def write_paged_kv_row(
         v_store = hadamard_transform(v, kv_spec.hadamard_order) if kv_spec.uses_bdr and kv_spec.rotate_v else v
         k_packed, k_scale, k_zero = pack_int4_rows(k_store)
         v_packed, v_scale, v_zero = pack_int4_rows(v_store)
-        k_pages[layer][block, :, offset, :].copy_(k_packed)
-        v_pages[layer][block, :, offset, :].copy_(v_packed)
+        tiled_layout = _paged_int4_tiled_layout(arena)
+        _copy_paged_int4_rows(k_pages[layer], block, offset, k_packed, tiled_layout=tiled_layout)
+        _copy_paged_int4_rows(v_pages[layer], block, offset, v_packed, tiled_layout=tiled_layout)
         getattr(arena, "paged_attn_k_scale")[layer][block, :, offset].copy_(k_scale)
         getattr(arena, "paged_attn_v_scale")[layer][block, :, offset].copy_(v_scale)
         getattr(arena, "paged_attn_k_zero")[layer][block, :, offset].copy_(k_zero)
@@ -577,20 +642,50 @@ def append_paged_int4_block(
         int(kv_spec.hadamard_order),
         bool(kv_spec.uses_bdr),
         bool(kv_spec.rotate_v),
+        _paged_int4_tiled_layout(arena),
     )
 
 
-def prefill_fp16_staging(state: DecodeState, layer: int, end_pos: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _short_prefill_sdpa_has_free_vram(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    min_free_mib = short_prefill_sdpa_min_free_mib()
+    if min_free_mib <= 0:
+        return True
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    return free_bytes >= min_free_mib * 1024 * 1024
+
+
+def short_prefill_sdpa_staging(
+    state: DecodeState,
+    layer: int,
+    end_pos: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    kv_spec = getattr(state, "kv_cache_spec", None)
+    if kv_spec is not None and getattr(kv_spec, "is_int4", False):
+        cache = getattr(state, "_prefill_fp16_kv", None)
+        if cache is not None:
+            cache.pop(layer, None)
+        return None
+    max_tokens = short_prefill_sdpa_tokens()
     cache = getattr(state, "_prefill_fp16_kv", None)
+    if max_tokens <= 0 or int(end_pos) > max_tokens:
+        if cache is not None:
+            cache.pop(layer, None)
+        return None
+    device = next(iter(state.gdn_states.values())).device
+    if not _short_prefill_sdpa_has_free_vram(device):
+        if cache is not None:
+            cache.pop(layer, None)
+        return None
     if cache is None:
         cache = {}
         setattr(state, "_prefill_fp16_kv", cache)
     current = cache.get(layer)
     kv_heads = state.cfg.num_key_value_heads
     head_dim = state.cfg.attention_head_dim
-    device = next(iter(state.gdn_states.values())).device
+    cap = max(64, min(max_tokens, max(int(end_pos), 1)))
     if current is None:
-        cap = max(64, int(end_pos))
         k_buf = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
         v_buf = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
         cache[layer] = (k_buf, v_buf)
@@ -598,19 +693,13 @@ def prefill_fp16_staging(state: DecodeState, layer: int, end_pos: int) -> tuple[
     k_buf, v_buf = current
     if k_buf.size(1) >= int(end_pos):
         return k_buf, v_buf
-    cap = max(int(end_pos), int(k_buf.size(1)) * 2)
-    new_k = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
-    new_v = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
-    new_k[:, : k_buf.size(1), :].copy_(k_buf)
-    new_v[:, : v_buf.size(1), :].copy_(v_buf)
-    cache[layer] = (new_k, new_v)
-    return new_k, new_v
-
-
-def clear_prefill_fp16_staging(state: DecodeState) -> None:
-    cache = getattr(state, "_prefill_fp16_kv", None)
-    if cache is not None:
-        cache.clear()
+    cap = min(max_tokens, max(int(end_pos), int(k_buf.size(1)) * 2))
+    k_new = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
+    v_new = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
+    k_new[:, : k_buf.size(1), :].copy_(k_buf)
+    v_new[:, : v_buf.size(1), :].copy_(v_buf)
+    cache[layer] = (k_new, v_new)
+    return k_new, v_new
 
 
 def attention_decode_paged_reference(
@@ -661,8 +750,9 @@ def attention_decode_paged_reference(
             )
             k_packed, k_scale, k_zero = pack_int4_rows(k_store)
             v_packed, v_scale, v_zero = pack_int4_rows(v_store)
-            k_pages[block, :, offset, :].copy_(k_packed)
-            v_pages[block, :, offset, :].copy_(v_packed)
+            tiled_layout = _paged_int4_tiled_layout(arena)
+            _copy_paged_int4_rows(k_pages, block, offset, k_packed, tiled_layout=tiled_layout)
+            _copy_paged_int4_rows(v_pages, block, offset, v_packed, tiled_layout=tiled_layout)
             getattr(arena, "paged_attn_k_scale")[layer][block, :, offset].copy_(k_scale)
             getattr(arena, "paged_attn_v_scale")[layer][block, :, offset].copy_(v_scale)
             getattr(arena, "paged_attn_k_zero")[layer][block, :, offset].copy_(k_zero)
@@ -699,11 +789,12 @@ def attention_decode_paged_reference(
         k_zero_rows: list[torch.Tensor] = []
         v_zero_rows: list[torch.Tensor] = []
         row_blocks = block_tables[row]
+        tiled_layout = _paged_int4_tiled_layout(arena)
         for pos in range(live):
             block_index, block_offset = divmod(pos, int(block_size))
             block_id = int(row_blocks[block_index].detach().cpu().item())
-            k_rows.append(k_pages[block_id, :, block_offset, :])
-            v_rows.append(v_pages[block_id, :, block_offset, :])
+            k_rows.append(_read_paged_int4_rows(k_pages, block_id, block_offset, tiled_layout=tiled_layout))
+            v_rows.append(_read_paged_int4_rows(v_pages, block_id, block_offset, tiled_layout=tiled_layout))
             if kv_spec.is_int4:
                 k_scale_rows.append(getattr(arena, "paged_attn_k_scale")[layer][block_id, :, block_offset])
                 v_scale_rows.append(getattr(arena, "paged_attn_v_scale")[layer][block_id, :, block_offset])
@@ -771,9 +862,14 @@ def sync_state_kv_to_paged(
             src = logical_pos
         else:
             src = state.max_seq_len - 1
+        tiled_layout = _paged_int4_tiled_layout(arena)
         for layer in state.cfg.attention_layers:
-            paged_k[layer][block_id, :, offset, :].copy_(state.attn_k[layer][:, src, :])
-            paged_v[layer][block_id, :, offset, :].copy_(state.attn_v[layer][:, src, :])
+            if state.kv_cache_spec.is_int4 and tiled_layout:
+                paged_k[layer][block_id, :, :, offset].copy_(state.attn_k[layer][:, src, :])
+                paged_v[layer][block_id, :, :, offset].copy_(state.attn_v[layer][:, src, :])
+            else:
+                paged_k[layer][block_id, :, offset, :].copy_(state.attn_k[layer][:, src, :])
+                paged_v[layer][block_id, :, offset, :].copy_(state.attn_v[layer][:, src, :])
             if (
                 state.attn_k_scale is not None
                 and state.attn_v_scale is not None
@@ -1439,35 +1535,36 @@ class Qwen36AttentionLayer:
         block_slots = slot_mapping[int(start) : int(start) + x.size(0)].contiguous()
         if kv_spec.is_int4 and x.device.type == "cuda":
             append_paged_int4_block(arena, self.layer, k_rope, v, block_slots)
-            end_pos = int(block_positions[-1].detach().cpu().item()) + 1
-            k_stage, v_stage = prefill_fp16_staging(state, self.layer, end_pos)
-            write_start = int(block_positions[0].detach().cpu().item())
+            write_start = int(getattr(state, "pos", 0))
             write_end = write_start + x.size(0)
-            k_stage[:, write_start:write_end, :].copy_(k_rope.permute(1, 0, 2).contiguous())
-            v_stage[:, write_start:write_end, :].copy_(v.permute(1, 0, 2).contiguous())
-            k_live = k_stage[:, :end_pos, :].contiguous()
-            v_live = v_stage[:, :end_pos, :].contiguous()
-            prefix_len = max(0, end_pos - x.size(0))
-            causal = torch.ones((x.size(0), end_pos), device=x.device, dtype=torch.bool)
-            causal[:, prefix_len:] = torch.tril(
-                torch.ones((x.size(0), x.size(0)), device=x.device, dtype=torch.bool)
-            )
-            att = F.scaled_dot_product_attention(
-                q_rope.permute(1, 0, 2).unsqueeze(0).contiguous(),
-                k_live.unsqueeze(0),
-                v_live.unsqueeze(0),
-                attn_mask=causal,
-                dropout_p=0.0,
-                scale=self.cfg.attention_head_dim ** -0.5,
-                enable_gqa=(self.cfg.num_attention_heads != self.cfg.num_key_value_heads),
-            )
-            att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
-            if gate_flat is not None:
-                att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
-            h = residual + linear_any(self.o_proj, att_block)
-            residual = h
-            h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
-            return residual + self.mlp.forward_block(h)
+            staging = short_prefill_sdpa_staging(state, self.layer, write_end)
+            if staging is not None:
+                k_stage, v_stage = staging
+                k_stage[:, write_start:write_end, :].copy_(k_rope.permute(1, 0, 2).contiguous())
+                v_stage[:, write_start:write_end, :].copy_(v.permute(1, 0, 2).contiguous())
+                k_live = k_stage[:, :write_end, :]
+                v_live = v_stage[:, :write_end, :]
+                prefix_len = max(0, write_end - x.size(0))
+                causal = torch.ones((x.size(0), write_end), device=x.device, dtype=torch.bool)
+                causal[:, prefix_len:] = torch.tril(
+                    torch.ones((x.size(0), x.size(0)), device=x.device, dtype=torch.bool)
+                )
+                att = F.scaled_dot_product_attention(
+                    q_rope.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                    k_live.unsqueeze(0),
+                    v_live.unsqueeze(0),
+                    attn_mask=causal,
+                    dropout_p=0.0,
+                    scale=self.cfg.attention_head_dim ** -0.5,
+                    enable_gqa=(self.cfg.num_attention_heads != self.cfg.num_key_value_heads),
+                )
+                att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
+                if gate_flat is not None:
+                    att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                h = residual + linear_any(self.o_proj, att_block)
+                residual = h
+                h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+                return residual + self.mlp.forward_block(h)
         seq_lens = (block_positions + 1).to(dtype=torch.int32).contiguous()
         block_size = x.size(0)
         subplan = SimpleNamespace(
@@ -1791,7 +1888,6 @@ class Qwen36Model:
             and all(int(v) == 0 for v in draft_counts)
             and any((end - start) > 1 for start, end in row_spans)
             and num_requests == 1
-            and not canonical_prefill_kv
             and paged_prefill_block_enabled()
             and paged_attention_kernels_enabled()
         ):

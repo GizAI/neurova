@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from langburst.engines.native_impl.cuda_graph import CudaGraphBucketPlanner
+from langburst.engines.native.cuda_graph import CudaGraphBucketPlanner
 
 
 def test_cuda_graph_bucket_planner_selects_next_static_shape():

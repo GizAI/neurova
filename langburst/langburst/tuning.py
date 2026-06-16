@@ -11,6 +11,13 @@ DEFAULT_BATCH_PREFILL_STEPS = True
 DEFAULT_RAW_PREFILL_BLOCK_TOKENS = 16
 DEFAULT_PAGED_PREFILL_BLOCK = True
 DEFAULT_PAGED_ATTENTION_KERNELS = False
+DEFAULT_SHORT_PREFILL_SDPA_TOKENS = 0
+DEFAULT_SHORT_PREFILL_SDPA_MIN_FREE_MIB = 384
+DEFAULT_ATTENTION_RECENT_TOKENS = 128
+DEFAULT_PAGED_ATTENTION_BACKEND = "auto"
+PAGED_ATTENTION_BACKEND_CHOICES = ("auto", "direct", "flash")
+DEFAULT_INT4_KV_LAYOUT = "tiled"
+INT4_KV_LAYOUT_CHOICES = ("token", "tiled")
 DEFAULT_VERIFY_NEXTN_MODE = "fused"
 VERIFY_NEXTN_MODE_CHOICES = ("sequential", "block", "fused")
 
@@ -107,6 +114,58 @@ def paged_attention_kernels_enabled(value: str | int | bool | None = None) -> bo
     if raw is None:
         return DEFAULT_PAGED_ATTENTION_KERNELS
     return _parse_env_bool(raw, "LANGBURST_PAGED_ATTENTION_KERNELS")
+
+
+def short_prefill_sdpa_tokens(value: int | str | None = None) -> int:
+    raw = value if value is not None else os.environ.get("LANGBURST_SHORT_PREFILL_SDPA_TOKENS")
+    if raw is None or raw == "":
+        return DEFAULT_SHORT_PREFILL_SDPA_TOKENS
+    tokens = int(raw)
+    if tokens < 0:
+        raise ValueError("LANGBURST_SHORT_PREFILL_SDPA_TOKENS must be >= 0")
+    return tokens
+
+
+def short_prefill_sdpa_min_free_mib(value: int | str | None = None) -> int:
+    raw = value if value is not None else os.environ.get("LANGBURST_SHORT_PREFILL_SDPA_MIN_FREE_MIB")
+    if raw is None or raw == "":
+        return DEFAULT_SHORT_PREFILL_SDPA_MIN_FREE_MIB
+    mib = int(raw)
+    if mib < 0:
+        raise ValueError("LANGBURST_SHORT_PREFILL_SDPA_MIN_FREE_MIB must be >= 0")
+    return mib
+
+
+def attention_recent_tokens(value: int | str | None = None) -> int:
+    raw = value if value is not None else os.environ.get("LANGBURST_ATTENTION_RECENT_TOKENS")
+    if raw is None or raw == "":
+        return DEFAULT_ATTENTION_RECENT_TOKENS
+    tokens = int(raw)
+    if tokens < 0:
+        raise ValueError("LANGBURST_ATTENTION_RECENT_TOKENS must be >= 0")
+    return tokens
+
+
+def paged_attention_backend(value: str | None = None) -> str:
+    raw = value if value is not None else os.environ.get("LANGBURST_PAGED_ATTENTION_BACKEND")
+    if raw is None or raw == "":
+        return DEFAULT_PAGED_ATTENTION_BACKEND
+    mode = str(raw).strip().lower().replace("-", "_")
+    if mode not in PAGED_ATTENTION_BACKEND_CHOICES:
+        choices = ", ".join(PAGED_ATTENTION_BACKEND_CHOICES)
+        raise ValueError(f"LANGBURST_PAGED_ATTENTION_BACKEND must be one of: {choices}")
+    return mode
+
+
+def int4_kv_layout(value: str | None = None) -> str:
+    raw = value if value is not None else os.environ.get("LANGBURST_INT4_KV_LAYOUT")
+    if raw is None or raw == "":
+        return DEFAULT_INT4_KV_LAYOUT
+    layout = str(raw).strip().lower().replace("-", "_")
+    if layout not in INT4_KV_LAYOUT_CHOICES:
+        choices = ", ".join(INT4_KV_LAYOUT_CHOICES)
+        raise ValueError(f"LANGBURST_INT4_KV_LAYOUT must be one of: {choices}")
+    return layout
 
 
 def _parse_env_bool(raw: str | int | bool, name: str) -> bool:

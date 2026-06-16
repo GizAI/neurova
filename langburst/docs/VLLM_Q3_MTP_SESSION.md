@@ -5,26 +5,26 @@
 주요 원격 호스트: `ml-dmc9`  
 주요 모델: `Qwen3.6-27B-langburst-q3`
 
-이 문서는 이번 세션에서 LangBurst를 vLLM 기반 기본 엔진 구조로 전환하면서
+이 문서는 이번 세션에서 LangBurst의 vLLM optional provider 경로를 확장하면서
 실제로 결정하고 구현하고 검증한 내용을 빠짐없이 남기기 위한 기록이다. 기존
 소스는 git에 남아 있으므로, 여기서는 최종 방향과 도중의 실패/수정/성공 조건을
 명시한다.
 
 ## 1. 세션의 최종 방향
 
-LangBurst의 메인 방향은 자체 단일 런타임이 아니라 vLLM 같은 범용 서빙 엔진을
-기본으로 삼는 구조다. 단, LangBurst 고유 기능은 버리지 않는다. 최종 구조는
-다음과 같다.
+현재 정정된 기준은 native가 메인/기본 엔진이고 vLLM은 optional provider라는
+구조다. vLLM 경로는 native 구현을 감싸지 않고, vLLM이 가진 기능을 직접 쓰는
+선택 실행 경로로 둔다. 최종 구조는 다음과 같다.
 
 ```text
 LangBurst host
   engine registry / feature policy / request facade
 
 Engine providers
-  vllm     기본 엔진
+  native   기본 엔진, LangBurst 자체 구현
+  vllm     선택 엔진
   sglang   선택 엔진
   exl3     선택 엔진
-  native   LangBurst 자체 구현 엔진
 ```
 
 핵심 원칙은 다음이다.
@@ -64,7 +64,7 @@ qwen36_tools/quantize.py, audit.py           현재 q3/q4 자체 checkpoint form
 loader.py 일부                               LangBurst low-bit checkpoint loader 필요
 RuntimeFeatures의 LangBurst-only 항목        stateful/session/episodic/TTT/ring 정책 표현
 research 일부                                실험 가치는 있으나 serving hot path와 분리
-native_impl 전체                             vLLM 없는 자체 구현 실행/검증 경로
+native 전체                             vLLM 없는 자체 구현 실행/검증 경로
 ```
 
 즉, vLLM 경로는 vLLM을 최대한 직접 사용한다. 다만 q3/q4 자체 포맷, low-bit
@@ -75,7 +75,7 @@ LangBurst bridge가 담당한다.
 
 이번 작업 이전에 이미 다음 문서들이 있었다.
 
-- `docs/ADAPTER_ARCHITECTURE.md`: provider-host 구조, vLLM 기본 엔진, SGLang/EXL3/native optional provider 구조.
+- `docs/ADAPTER_ARCHITECTURE.md`: provider-host 구조, native 기본 엔진, vLLM/SGLang/EXL3 optional provider 구조.
 - `docs/SERVING_ENGINE_TODO.md`: native serving backlog, paged KV, native MTP, CUDA graph, native scheduler 작업 목록.
 - `docs/SPECULATIVE_RESEARCH.md`: native MTP/NEXTN 연구와 dmc8 측정값.
 
@@ -91,13 +91,20 @@ LangBurst bridge가 담당한다.
 langburst/langburst/engines/
   base.py
   registry.py
-  vllm.py
-  vllm_bridge.py
-  vllm_lowbit.py
-  vllm_plugins.py
-  vllm_qwen36.py
-  native.py
-  native_impl/
+  native/
+    __init__.py
+    provider.py
+    runtime.py
+    manager.py
+    scheduler.py
+    ...
+  vllm/
+    __init__.py
+    provider.py
+    bridge.py
+    lowbit.py
+    plugins.py
+    qwen36.py
 
 langburst/langburst/loader.py
 langburst/scripts/bench_vllm_q3_metrics.py
@@ -107,15 +114,15 @@ langburst/tests/test_engine_registry_cpu.py
 
 역할은 다음과 같이 정리했다.
 
-- `engines/vllm.py`: vLLM provider 본체. 최종 vLLM kwargs를 구성하고, feature
+- `engines/vllm/provider.py`: vLLM provider 본체. 최종 vLLM kwargs를 구성하고, feature
   bridge가 만든 설정을 실제 vLLM engine에 전달한다.
-- `engines/vllm_bridge.py`: LangBurst feature request를 vLLM kwargs와 metadata로
+- `engines/vllm/bridge.py`: LangBurst feature request를 vLLM kwargs와 metadata로
   변환한다.
-- `engines/vllm_lowbit.py`: LangBurst q3/q4 low-bit checkpoint를 vLLM loader,
+- `engines/vllm/lowbit.py`: LangBurst q3/q4 low-bit checkpoint를 vLLM loader,
   quantization method, GPU cache 형태로 연결한다.
-- `engines/vllm_plugins.py`: vLLM plugin registration. `langburst_lowbit`
+- `engines/vllm/plugins.py`: vLLM plugin registration. `langburst_lowbit`
   quantization/load format과 `Qwen3_5MTP` override를 등록한다.
-- `engines/vllm_qwen36.py`: Qwen3.5/Qwen3.6 vLLM 경로에서 low-bit MTP를 올리기
+- `engines/vllm/qwen36.py`: Qwen3.5/Qwen3.6 vLLM 경로에서 low-bit MTP를 올리기
   위한 custom MTP predictor/model 연결.
 - `loader.py`: LangBurst low-bit CUDA kernel/Marlin wrapper. aux GPU weight
   실행과 output cache 정책을 수정했다.
@@ -125,7 +132,7 @@ langburst/tests/test_engine_registry_cpu.py
 
 ## 5. vLLM bridge 변경 내용
 
-`vllm_bridge.py`에서 qwen36 low-bit 모델은 다음 기본값을 갖도록 정리했다.
+`vllm/bridge.py`에서 qwen36 low-bit 모델은 다음 기본값을 갖도록 정리했다.
 
 ```text
 load_format = "langburst_lowbit"
@@ -150,7 +157,7 @@ kv_cache_dtype = "fp8"    명시 override가 없으면 기본 적용
 
 ## 6. low-bit vLLM loader/cache 구현
 
-`vllm_lowbit.py`는 이번 세션에서 가장 많이 손본 부분이다.
+`vllm/lowbit.py`는 이번 세션에서 가장 많이 손본 부분이다.
 
 ### 6.1 q3 index와 vLLM layer prefix mapping
 
@@ -363,7 +370,7 @@ GPU1: RTX 4070 Ti SUPER 16GB
 바로 아래에 생성되었다.
 
 ```text
-vllm_lowbit.py
+vllm/lowbit.py
 bench_vllm_q3_metrics.py
 loader.py
 ...
@@ -794,8 +801,8 @@ smoke 성공 지점이다.
 
 이번 세션의 결론은 다음이다.
 
-- LangBurst의 기본 엔진은 vLLM으로 두는 구조가 맞다.
-- native 구현은 삭제하지 않고 독립 provider로 유지하는 것이 맞다.
+- LangBurst의 기본 엔진은 native로 두는 구조가 맞다.
+- vLLM 구현은 삭제하지 않고 독립 optional provider로 유지하는 것이 맞다.
 - vLLM이 대체 가능한 generic serving 기능은 vLLM에 맡기는 것이 맞다.
 - LangBurst q3 low-bit checkpoint는 format 변경 없이 vLLM 경로에서 실행 가능해졌다.
 - CPU weight reload 없이 GPU-only hot path로 `Qwen3.6-27B-langburst-q3` smoke가
@@ -805,4 +812,3 @@ smoke 성공 지점이다.
 - MTP도 vLLM 경로에서 올라갔고, 짧은 smoke 기준 decode 구간은 약 1.6배 빨라졌다.
 - 다만 MTP 성능 주장은 긴 출력 benchmark와 acceptance metric이 붙은 뒤에 확정해야
   한다.
-

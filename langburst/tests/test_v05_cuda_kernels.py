@@ -386,3 +386,61 @@ def test_attention_decode_paged_int4_bdr_is_finite_and_updates_pages():
         offset = int(slot) % block_size
         assert not torch.equal(k_pages[block, :, offset, :], before_k[block, :, offset, :])
         assert not torch.equal(v_pages[block, :, offset, :], before_v[block, :, offset, :])
+
+
+def test_attention_decode_paged_int4_tiled_layout_is_finite_and_updates_pages():
+    import langburst_cuda
+
+    torch.manual_seed(4)
+    batch = 2
+    q_heads = 4
+    kv_heads = 2
+    head_dim = 256
+    block_size = 16
+    num_blocks = 4
+    packed_dim = head_dim // 2
+    q = (torch.randn(batch, q_heads, head_dim, device="cuda", dtype=torch.float16) * 0.04).contiguous()
+    k_new = (torch.randn(batch, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.04).contiguous()
+    v_new = (torch.randn(batch, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.04).contiguous()
+    k_pages = torch.zeros((num_blocks, kv_heads, packed_dim, block_size), device="cuda", dtype=torch.uint8)
+    v_pages = torch.zeros_like(k_pages)
+    before_k = k_pages.clone()
+    before_v = v_pages.clone()
+    k_scales = torch.ones((num_blocks, kv_heads, block_size), device="cuda", dtype=torch.float16)
+    v_scales = torch.ones_like(k_scales)
+    k_zeros = torch.zeros_like(k_scales)
+    v_zeros = torch.zeros_like(k_scales)
+    block_tables = torch.tensor([[0, 3], [1, 2]], device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor([12, 21], device="cuda", dtype=torch.int32)
+    slot_mapping = torch.tensor([11, 20], device="cuda", dtype=torch.long)
+
+    y = langburst_cuda.attention_decode_paged_int4(
+        q,
+        k_new,
+        v_new,
+        k_pages,
+        v_pages,
+        k_scales,
+        v_scales,
+        k_zeros,
+        v_zeros,
+        slot_mapping,
+        block_tables,
+        seq_lens,
+        block_size,
+        head_dim ** -0.5,
+        128,
+        False,
+        False,
+        True,
+    )
+    torch.cuda.synchronize()
+
+    assert y.shape == (batch, q_heads, head_dim)
+    assert y.dtype == torch.float16
+    assert torch.isfinite(y.float()).all()
+    for slot in slot_mapping.detach().cpu().tolist():
+        block = int(slot) // block_size
+        offset = int(slot) % block_size
+        assert not torch.equal(k_pages[block, :, :, offset], before_k[block, :, :, offset])
+        assert not torch.equal(v_pages[block, :, :, offset], before_v[block, :, :, offset])

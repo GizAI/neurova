@@ -16,12 +16,15 @@ plan instead of re-deciding adapter policy.
 | Profile | Intent | KV policy | Stateful chat | State pool | GPU sampling | Block prefill | Prefix cache | Snapshots | Speculative / Graph |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `original` | Run closest to ordinary adapter decode. No stateful extras. | `error` | off | on | on | on | off | off | native MTP/NEXTN off, graph off |
-| `stateful` | Default runtime. Bounded exact KV plus recurrent state. | `ring` | on | on | on | on | on | off | native MTP/NEXTN on, graph off |
+| `stateful` | Default runtime. Bounded exact KV plus recurrent state. | `ring` | on | on | on | on | feature-gated | off | native MTP/NEXTN on, graph off |
 | `research` | Production runtime profile with snapshots enabled for experiments. | `ring` | on | on | on | on | on | on | native MTP/NEXTN on, graph off |
 
-`state_pool`, `gpu_sampling`, public `block_prefill`, automatic prefix cache,
-and native MTP/NEXTN with adaptive fallback are accepted runtime optimizations
-in the default stateful profile. Infinite streaming, episodic memory, and TTT sidecar are common
+`state_pool`, `gpu_sampling`, public `block_prefill`, and native MTP/NEXTN with
+adaptive fallback are accepted runtime optimizations in the default stateful
+profile. Prefix cache is accepted by the feature contract, but the 16GB
+`int4_bdr` OpenWebUI deployment keeps it off until the cache uses KV page
+refcount / copy-on-write instead of GPU state cloning. Infinite streaming,
+episodic memory, and TTT sidecar are common
 runtime feature gates now; adapters decide support through `RuntimeCapabilities`
 and the actual implementations can still live under `langburst.research` until
 they graduate. Fast raw block internals remain explicit research toggles until
@@ -153,7 +156,7 @@ not scattered server flags:
 | VRAM load admission reserve | accepted | `EngineManager` | host policy |
 | Prompt / generation token admission | accepted | `EngineManager` | host policy |
 | Health / OOM pool cleanup | accepted | `EngineManager` + server boundary | on |
-| Automatic prefix cache / Radix-style trie | accepted | `RadixPrefixCache` + `BatchedModelRunner` + `KVBlockTable` | on for stateful adapters |
+| Automatic prefix cache / Radix-style trie | accepted, host-gated | `RadixPrefixCache` + `BatchedModelRunner` + `KVBlockTable` | off in the 16GB int4_bdr OpenWebUI script |
 | OpenAI-style usage / cached-token accounting | accepted | `RequestUsage` + `BatchGenerationHandle.metrics` + server response builder | on |
 | OpenAI/HF-style generation options | accepted | `GenerationConfig` + `sample_next` + `BatchGenerationWorker` | on |
 | Explicit stateful sessions in continuous batching | accepted | `SessionStateStore` + `BatchGenerationWorker` external state attach | opt-in per request |
