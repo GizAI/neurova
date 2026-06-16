@@ -14,7 +14,7 @@ from .cli_features import (
     runtime_feature_override_from_args,
 )
 from .core.features import RuntimeFeatureOverride, RuntimeFeatures, RuntimeProfile
-from .core.runtime import GenerationConfig, RuntimeEngine
+from .engines.native_impl.runtime import GenerationConfig, RuntimeEngine
 
 
 @dataclass(frozen=True)

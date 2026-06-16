@@ -10,13 +10,13 @@ from typing import Sequence
 import torch
 
 from .cli_features import add_adapter_arg, add_model_path_args, create_runtime_engine_from_args
-from .core.batch_worker import BatchGenerationWorker, BatchGenerationHandle
-from .core.block_table import KVBlockTable
+from .engines.native_impl.batch_worker import BatchGenerationWorker, BatchGenerationHandle
+from .engines.native_impl.block_table import KVBlockTable
 from .core.defaults import kv_block_size_default, kv_blocks_default, serving_recent_window_default
 from .core.features import RuntimeFeatures
-from .core.model_runner import BatchedModelRunner
-from .core.runtime import GenerationConfig, RuntimeEngine
-from .core.scheduler import ContinuousBatchScheduler
+from .engines.native_impl.model_runner import BatchedModelRunner
+from .engines.native_impl.runtime import GenerationConfig, RuntimeEngine
+from .engines.native_impl.scheduler import ContinuousBatchScheduler
 
 
 @dataclass(frozen=True)

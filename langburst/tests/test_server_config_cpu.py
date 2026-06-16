@@ -5,7 +5,7 @@ from pathlib import Path
 
 from langburst.core.defaults import DEFAULT_SERVING_RECENT_WINDOW
 from langburst.core.features import RuntimeFeatures
-from langburst.core.manager import load_model_specs
+from langburst.engines.native_impl.manager import load_model_specs
 
 
 def test_load_model_specs_from_json(tmp_path: Path):

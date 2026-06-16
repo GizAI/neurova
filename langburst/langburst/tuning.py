@@ -4,10 +4,12 @@ import os
 
 LOWBIT_ROWS_PER_CTA_CHOICES = (4, 8, 16)
 DEFAULT_LOWBIT_ROWS_PER_CTA = 8
-DEFAULT_MARLIN_DIRECT_MAX_BATCH = 4
+DEFAULT_MARLIN_DIRECT_MAX_BATCH = 64
 DEFAULT_FAST_RAW_BLOCK = True
 DEFAULT_BATCH_STATE_KERNELS = True
 DEFAULT_BATCH_PREFILL_STEPS = True
+DEFAULT_RAW_PREFILL_BLOCK_TOKENS = 16
+DEFAULT_PAGED_PREFILL_BLOCK = True
 DEFAULT_PAGED_ATTENTION_KERNELS = False
 DEFAULT_VERIFY_NEXTN_MODE = "fused"
 VERIFY_NEXTN_MODE_CHOICES = ("sequential", "block", "fused")
@@ -81,6 +83,23 @@ def batch_prefill_steps_enabled(value: str | int | bool | None = None) -> bool:
     if raw is None:
         return DEFAULT_BATCH_PREFILL_STEPS
     return _parse_env_bool(raw, "LANGBURST_BATCH_PREFILL_STEPS")
+
+
+def raw_prefill_block_tokens(value: int | str | None = None) -> int:
+    raw = value if value is not None else os.environ.get("LANGBURST_RAW_PREFILL_BLOCK_TOKENS")
+    if raw is None or raw == "":
+        return DEFAULT_RAW_PREFILL_BLOCK_TOKENS
+    tokens = int(raw)
+    if tokens < 1:
+        raise ValueError("LANGBURST_RAW_PREFILL_BLOCK_TOKENS must be >= 1")
+    return tokens
+
+
+def paged_prefill_block_enabled(value: str | int | bool | None = None) -> bool:
+    raw = value if value is not None else os.environ.get("LANGBURST_PAGED_PREFILL_BLOCK")
+    if raw is None:
+        return DEFAULT_PAGED_PREFILL_BLOCK
+    return _parse_env_bool(raw, "LANGBURST_PAGED_PREFILL_BLOCK")
 
 
 def paged_attention_kernels_enabled(value: str | int | bool | None = None) -> bool:

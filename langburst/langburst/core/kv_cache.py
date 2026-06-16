@@ -50,9 +50,11 @@ class KVCacheSpec:
         hadamard_order: int | None = None,
         rotate_v: bool = False,
     ) -> "KVCacheSpec":
-        raw = (value or "fp16").strip().lower().replace("-", "_")
+        from .defaults import DEFAULT_KV_CACHE_DTYPE
+
+        raw = (value or DEFAULT_KV_CACHE_DTYPE).strip().lower().replace("-", "_")
         aliases = {
-            "auto": "fp16",
+            "auto": DEFAULT_KV_CACHE_DTYPE,
             "float16": "fp16",
             "half": "fp16",
             "fp8": "fp8_e4m3",

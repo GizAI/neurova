@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import os
 from typing import Any, Iterable
 
-from .features import RuntimeFeatures
+from ...core.features import RuntimeFeatures
 
 
 @dataclass(frozen=True)

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gc
+import os
 from typing import Any, Sequence
 
 import torch
 
 from .runtime import GenerationConfig, RuntimeEngine, sample_next
 from .scheduler import ContinuousBatchScheduler
-from .features import RuntimeFeatures
+from ...core.features import RuntimeFeatures
 from .prefix_cache import RadixPrefixCache
 from .state_store import BatchStateStore
-from ..speculation import DraftRequest
-from ..ops import cuda_ops
-from ..speculative_batch import DecodeBatchPlan, DecodeRequestState, apply_decode_post_update
+from ...speculation import DraftRequest
+from ...ops import cuda_ops
+from ...speculative_batch import DecodeBatchPlan, DecodeRequestState, apply_decode_post_update
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,8 @@ class BatchedModelRunner:
         states = self.state_store.get_many(row.state_index for row in rows)
         spec_snapshots = self._snapshot_speculative_rows(batch, rows, states)
         logits_by_row = self.engine.forward_batch_logits(batch, states)
+        if any(was_prefilling):
+            self._trim_prefill_cuda_cache()
         sampled_token_ids: list[list[int]] = [[] for _ in rows]
         sampled_counts: list[int] = [0 for _ in rows]
         rejected_counts: list[int] = [0 for _ in rows]
@@ -156,6 +160,11 @@ class BatchedModelRunner:
             rejected_counts=rejected_counts,
         )
         self._prepare_native_nextn_drafts(rows, states, sampled_counts, rejected_counts)
+        for row, state, did_prefill in zip(rows, states, was_prefilling, strict=True):
+            if did_prefill and not row.is_prefilling:
+                cache = getattr(state, "_prefill_fp16_kv", None)
+                if cache is not None:
+                    cache.clear()
         self._store_prefix_cache_rows(rows, states, was_prefilling)
         return BatchedStepOutput(
             batch=batch,
@@ -163,6 +172,25 @@ class BatchedModelRunner:
             sampled_counts=sampled_counts,
             rejected_counts=rejected_counts,
         )
+
+    def _trim_prefill_cuda_cache(self) -> None:
+        raw = os.environ.get("LANGBURST_TRIM_CACHE_DURING_PREFILL", "1").strip().lower()
+        if raw in {"0", "false", "off", "no"}:
+            return
+        if not torch.cuda.is_available():
+            return
+        threshold_raw = os.environ.get("LANGBURST_TRIM_CACHE_FREE_BELOW_MIB", "768").strip()
+        try:
+            free_below_mib = int(threshold_raw)
+        except ValueError as exc:
+            raise ValueError("LANGBURST_TRIM_CACHE_FREE_BELOW_MIB must be an integer MiB value") from exc
+        if free_below_mib > 0:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info()
+            if free_bytes >= free_below_mib * 1024 * 1024:
+                return
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _row(self, request_id: str) -> DecodeRequestState:
         row = self.scheduler.get_request(request_id)

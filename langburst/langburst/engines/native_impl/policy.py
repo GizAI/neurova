@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .features import RuntimeFeatures, RuntimePlan
-from ..speculation import SpeculativeDecodePolicy
+from ...core.features import RuntimeFeatures, RuntimePlan
+from ...speculation import SpeculativeDecodePolicy
 
 DEFAULT_SPECULATIVE_VERIFIER = "transaction_block"
 SPECULATIVE_VERIFIER_CHOICES = ("sequential", "transaction_block")

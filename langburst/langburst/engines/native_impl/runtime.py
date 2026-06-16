@@ -10,15 +10,16 @@ from typing import Any, Iterable, Iterator, Sequence
 
 import torch
 
-from .adapter import ModelAdapter
-from .features import RuntimeFeatures, RuntimePlan, resolve_runtime_plan
-from .platform import resolve_index_file
+from ...core.adapter import ModelAdapter
+from ...core.features import RuntimeFeatures, RuntimePlan, resolve_runtime_plan
+from ...core.platform import resolve_index_file
 from .policy import ExecutionPolicy
-from .text_stream import StreamingTextDecoder
-from ..speculative_batch import DecodeBatchPlan
-from ..ops import cuda_ops
-from ..speculation import SpeculativeDecodePolicy, SpeculativeDecodeResult, SpeculativeDecodeStats, SpeculativeProposer
-from ..speculative_verifier import NativeNextNVerifier, TargetVerification
+from ...core.text_stream import StreamingTextDecoder
+from ...speculative_batch import DecodeBatchPlan
+from ...ops import cuda_ops
+from ...speculation import SpeculativeDecodePolicy, SpeculativeDecodeResult, SpeculativeDecodeStats, SpeculativeProposer
+from ...speculative_verifier import NativeNextNVerifier, TargetVerification
+from ...tuning import marlin_direct_max_batch
 
 
 @dataclass
@@ -462,7 +463,7 @@ class RuntimeEngine:
         if forward_block is None:
             return self._prefill_token_loop(ids, state)
         logits: torch.Tensor | None = None
-        chunk_size = max(1, int(features.prefill_chunk_size))
+        chunk_size = max(1, min(int(features.prefill_chunk_size), marlin_direct_max_batch()))
         for start in range(0, len(ids), chunk_size):
             chunk = ids[start : start + chunk_size]
             is_last = start + chunk_size >= len(ids)
@@ -660,7 +661,7 @@ class RuntimeEngine:
         if forward_block is not None and self._forward_block_supports_logits_mode:
             logits: torch.Tensor | None = None
             raw_hidden: torch.Tensor | None = None
-            chunk_size = max(1, int(features.prefill_chunk_size))
+            chunk_size = max(1, min(int(features.prefill_chunk_size), marlin_direct_max_batch()))
             for start in range(0, len(ids), chunk_size):
                 chunk = ids[start : start + chunk_size]
                 is_last = start + chunk_size >= len(ids)

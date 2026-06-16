@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
+from .defaults import DEFAULT_KV_CACHE_DTYPE
 from .kv_cache import KVCacheDType, SUPPORTED_KV_CACHE_DTYPES
 
 RuntimeProfile = Literal["original", "stateful", "research"]
@@ -77,7 +78,7 @@ class RuntimeFeatures:
 
     profile: RuntimeProfile = "stateful"
     kv_window_policy: KVPolicy = "ring"
-    kv_cache_dtype: KVCacheDType = "fp16"
+    kv_cache_dtype: KVCacheDType = DEFAULT_KV_CACHE_DTYPE  # type: ignore[assignment]
     stateful_chat: bool = True
     state_pool: bool = True
     snapshots: bool = False

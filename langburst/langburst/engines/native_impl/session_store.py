@@ -6,7 +6,7 @@ import threading
 import uuid
 from typing import Any
 
-from .features import RuntimeFeatures
+from ...core.features import RuntimeFeatures
 
 
 def _features_key(features: RuntimeFeatures) -> tuple[tuple[str, object], ...]:

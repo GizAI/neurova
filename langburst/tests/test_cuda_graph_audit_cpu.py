@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from langburst.adapters.qwen36_impl.config import Qwen36_27B_TextConfig
-from langburst.core.runtime import GenerationConfig, sample_next_tensor
+from langburst.engines.native_impl.runtime import GenerationConfig, sample_next_tensor
 from langburst.adapters.qwen36_tools.graph import inspect_decode1_graph_safety, verify_graph_safe_argmax
 from langburst.adapters.qwen36_impl.state import DecodeState
 

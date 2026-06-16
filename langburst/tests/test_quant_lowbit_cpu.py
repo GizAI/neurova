@@ -61,4 +61,4 @@ def test_lowbit_tensor_supports_q3_without_model_code_changes():
 
 
 def test_marlin_direct_batch_default_matches_t4_gate():
-    assert MARLIN_DIRECT_MAX_BATCH == 4
+    assert MARLIN_DIRECT_MAX_BATCH == 64

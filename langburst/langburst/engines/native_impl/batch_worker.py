@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import statistics
+import os
 import queue
 import threading
 import time
@@ -13,6 +14,32 @@ from .runtime import GenerationConfig
 
 
 _STOP = object()
+
+
+def _detached_exception(exc: BaseException) -> BaseException:
+    """Return a lightweight exception that cannot retain CUDA tensor frames.
+
+    CUDA OOM tracebacks often include model-forward frames whose locals still
+    reference large tensors. Keeping the original exception on a request handle
+    can therefore keep the whole runtime resident after recovery. Preserve the
+    exception type for upstream handlers, but intentionally drop traceback,
+    cause, and context.
+    """
+
+    message = str(exc)
+    if exc.__class__.__module__ == "torch.cuda" and exc.__class__.__name__ == "OutOfMemoryError":
+        try:
+            import torch
+
+            out: BaseException = torch.cuda.OutOfMemoryError(message)
+        except Exception:
+            out = RuntimeError(message)
+    else:
+        out = RuntimeError(message)
+    out.__traceback__ = None
+    out.__cause__ = None
+    out.__context__ = None
+    return out
 
 
 @dataclass
@@ -39,26 +66,32 @@ class BatchGenerationHandle:
     cached_input_tokens: int = 0
     accepted_prediction_tokens: int = 0
     rejected_prediction_tokens: int = 0
+    finish_reason: str = "stop"
 
     def push_tokens(self, token_ids: Sequence[int]) -> bool:
         should_finish = False
         if self.cancelled.is_set():
+            self.finish_reason = "cancelled"
             return True
         eos = set(int(t) for t in self.eos_token_ids)
         for token in token_ids:
             if self.cancelled.is_set():
+                self.finish_reason = "cancelled"
                 should_finish = True
                 break
             if len(self.generated) >= self.max_new_tokens:
+                self.finish_reason = "length"
                 should_finish = True
                 break
             token_id = int(token)
             cfg = self.generation_config
             can_stop = len(self.generated) >= int(cfg.min_new_tokens)
             if can_stop and not cfg.ignore_eos and token_id in eos:
+                self.finish_reason = "stop"
                 should_finish = True
                 break
             if can_stop and token_id in set(int(t) for t in cfg.stop_token_ids):
+                self.finish_reason = "stop"
                 should_finish = True
                 break
             now = time.monotonic()
@@ -69,6 +102,7 @@ class BatchGenerationHandle:
             self.output_queue.put(token_id)
             matched_stop = self._matched_stop_sequence()
             if can_stop and matched_stop:
+                self.finish_reason = "stop"
                 if not self.include_stop_str_in_output:
                     remove_n = len(matched_stop)
                     if remove_n:
@@ -80,6 +114,7 @@ class BatchGenerationHandle:
                 should_finish = True
                 break
             if len(self.generated) >= self.max_new_tokens:
+                self.finish_reason = "length"
                 should_finish = True
                 break
         return should_finish
@@ -105,7 +140,7 @@ class BatchGenerationHandle:
             self.output_queue.put(_STOP)
 
     def fail(self, exc: BaseException) -> None:
-        self.error = exc
+        self.error = _detached_exception(exc)
         self.finished_monotonic = time.monotonic()
         self.done.set()
         self.output_queue.put(_STOP)
@@ -242,6 +277,19 @@ class BatchGenerationWorker:
 
     def shutdown(self, timeout: float | None = 2.0) -> None:
         self._stop.set()
+        for req_id, handle in list(self._active.items()):
+            handle.cancel()
+            try:
+                self.runner.finish_request(req_id)
+            except Exception:
+                pass
+        self._active.clear()
+        while True:
+            try:
+                handle, _prompt_ids = self._pending.get_nowait()
+            except queue.Empty:
+                break
+            handle.cancel()
         self._thread.join(timeout=timeout)
 
     def stats(self) -> dict[str, object]:
@@ -293,13 +341,25 @@ class BatchGenerationWorker:
                         self._release_cancelled_active()
                     continue
             except BaseException as exc:
+                detached = _detached_exception(exc)
                 for req_id, handle in list(self._active.items()):
-                    handle.fail(exc)
+                    handle.fail(detached)
                     self.runner.finish_request(req_id)
                 self._active.clear()
                 clear = getattr(self.runner, "clear", None)
                 if callable(clear):
                     clear()
+                try:
+                    import gc
+                    import torch
+
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
+                except Exception:
+                    pass
 
     def _drain_pending(self, *, wait_for_first: bool) -> None:
         scheduler = getattr(self.runner, "scheduler", None)
@@ -384,17 +444,36 @@ class BatchGenerationWorker:
         self._active.pop(req_id, None)
         handle.finish()
         self._completed.append(handle.metrics())
+        self._release_idle_cuda_cache()
 
     def _cancel_active(self, req_id: str, handle: BatchGenerationHandle) -> None:
         self.runner.finish_request(req_id)
         self._active.pop(req_id, None)
         handle.finish()
         self._completed.append(handle.metrics())
+        self._release_idle_cuda_cache()
 
     def _release_cancelled_active(self) -> None:
         for req_id, handle in list(self._active.items()):
             if handle.cancelled.is_set():
                 self._cancel_active(req_id, handle)
+
+    def _release_idle_cuda_cache(self) -> None:
+        if self._active:
+            return
+        if os.environ.get("LANGBURST_EMPTY_CACHE_AFTER_REQUEST", "1").strip().lower() in {"0", "false", "off", "no"}:
+            return
+        try:
+            import gc
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
 
 def _mean_metric(rows: Sequence[dict[str, object]], key: str) -> float | None:

@@ -15,6 +15,8 @@ class RequestUsage:
     reasoning_tokens: int = 0
     accepted_prediction_tokens: int = 0
     rejected_prediction_tokens: int = 0
+    requested_completion_tokens: int | None = None
+    finish_reason: str | None = None
     queue_wait_s: float | None = None
     ttft_s: float | None = None
     e2e_s: float | None = None
@@ -77,4 +79,6 @@ class RequestUsage:
             "e2e_tok_s": self.e2e_tok_s,
             "decode_tok_s": self.decode_tok_s,
             "mean_itl_s": self.mean_itl_s,
+            "requested_completion_tokens": self.requested_completion_tokens,
+            "finish_reason": self.finish_reason,
         }

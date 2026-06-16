@@ -25,39 +25,40 @@ Neurova는 하나의 모델만 담은 저장소가 아니다. 저사양 GPU부�
 
 ## `langburst/`: 메인 서빙 엔진
 
-LangBurst는 이 저장소의 중심 프로젝트다. 목표는 16GB RTX 4080/4090급
-GPU 하나에 갇힌 특화 런타임이 아니라, external serving engine처럼 여러 모델 family를 같은
-서버/스케줄러/런타임 계약 위에서 서빙하는 범용 엔진이다. 다만 방향은
-“대형 서버 GPU 전용”이 아니라 저사양 GPU에서도 쓸 수 있는 저비트,
-stateful, 긴 문맥, 멀티 요청 엔진이다.
+LangBurst는 이 저장소의 중심 프로젝트다. 이제 목표는 vLLM을 다시 만드는
+것이 아니라, vLLM을 기본 엔진으로 쓰면서 SGLang, EXL3, 자체 native 엔진을
+같은 계약으로 교체할 수 있는 서빙 extension layer가 되는 것이다. 방향은
+“대형 서버 GPU 전용”이 아니라 저사양 GPU에서도 쓸 수 있는 정책, stateful
+확장, custom model 실험을 얹는 것이다.
 
-핵심 아이디어는 “모델별 수학은 adapter가 담당하고, 서버와 디코드 루프는
-공통 런타임이 담당한다”는 것이다. Qwen 전용 스크립트 더미가 아니라,
-adapter registry, runtime engine, engine manager, request scheduler,
-CUDA kernel, OpenAI-compatible server를 갖춘 제품형 런타임으로 정리되고
-있다.
+핵심 아이디어는 “서빙 엔진은 provider가 담당하고, LangBurst는 엔진 선택,
+정책, stateful/session 확장, custom model 실험 경계를 담당한다”는 것이다.
+기본 provider는 `vllm`이고, `sglang`, `exl3`, `native`가 같은
+`EngineRegistry`에 등록된다.
 
-Qwen3.6-27B Q4 Marlin 경로는 현재 champion adapter이자 실측 기준일 뿐,
-LangBurst의 정체성 자체가 Qwen 전용 또는 16GB 전용이라는 뜻은 아니다.
-`hf-auto`/Gemma 계열 conformance path처럼 새 모델 family를 붙이는 경계가
-이미 분리돼 있고, production adapter는 같은 `RuntimeEngine`과
-`EngineManager`를 재사용해야 한다.
+Qwen3.6-27B Q4 Marlin 경로는 이제 LangBurst native engine plugin의
+실험/레거시 경로다. Qwen3.6 GDN custom model이 vLLM custom model로
+이식되기 전까지 보존하지만, 일반 HF/Gemma/Llama 계열 serving은 vLLM
+provider로 보내는 것이 기준이다.
 
 LangBurst가 실제로 담고 있는 것:
 
 ```text
+langburst/langburst/engines/
+  EngineDescriptor: 엔진 identity와 capability
+  EngineModelSpec: 모델 경로/이름/dtype/quantization 등 공통 모델 선언
+  EngineBackend: list_models, health, generate_chat, stream_chat 계약
+  EngineRegistry: vllm, sglang, exl3, native provider의 단일 등록 지점
+  vllm.py: 기본 실행 provider
+  native.py: 기존 LangBurst 자체 런타임 wrapper
+
 langburst/langburst/core/
-  RuntimeEngine: prefill, decode, sampling, state pool, generation contract
-  EngineManager: lazy model load, LRU unload, model residency, health/status
-  AdmissionController: active/queued request 제한과 timeout/reject 카운터
-  ContinuousBatchScheduler: continuous-serving batching으로 가기 위한 scheduler 경계
-  RuntimeFeatures/RuntimePlan: 기능 요청과 adapter capability를 합쳐 실행 계획 결정
-  KVBlockTable / BatchStateStore: paged KV와 state arena를 위한 자원 경계
+  RuntimeFeatures/RuntimePlan: LangBurst-only stateful/research feature vocabulary
+  adapter.py: native engine 내부에서 쓰는 legacy adapter registry
 
 langburst/langburst/adapters/
-  qwen36: Qwen3.6 hybrid GDN 모델 adapter
+  qwen36: native engine의 Qwen3.6 hybrid GDN 모델 adapter
   qwen36-a3b: Qwen3.6 A3B 계열 adapter
-  hf-auto / gemma4: 새 모델 family를 붙이기 위한 Transformers-backed conformance path
   qwen36_impl/: Qwen 전용 config/model/state 구현
 
 langburst/csrc/
@@ -65,38 +66,37 @@ langburst/csrc/
   rowwise low-bit GEMV fallback
   RMSNorm
   Qwen Gated DeltaNet recurrence
-  attention decode
-  GPU sampling helpers
+  native engine 전용 attention/sampling helper
 
 langburst/server.py
   OpenAI-compatible /v1/chat/completions
-  SSE streaming
-  /v1/langburst/health, /v1/langburst/models, /v1/langburst/features
+  EngineBackend 기반 라우팅
+  /v1/langburst/health, /v1/langburst/features, /v1/langburst/engines
 
 langburst/tests/
-  adapter/runtime/server/scheduler/state/cuda/speculation 단위 검증
+  engine registry/server/native/cuda 단위 검증
 ```
 
 LangBurst의 주요 기능 축:
 
 ```text
-범용 서빙 구조
-  adapter registry
-  model-independent RuntimeEngine
-  lazy multi-model load
-  LRU unload
-  declarative models-json
+엔진 교체 구조
+  EngineRegistry
+  vllm 기본 provider
+  sglang optional provider target
+  exl3 optional provider target
+  native provider for Qwen3.6/GDN
   OpenAI-compatible API
 
 저사양 GPU / 메모리 스케일링
+  vLLM quantization/offload 활용
   low-bit checkpoint format
   Q4 Marlin fused projection path
   rowwise 2-8bit groupwise weights
-  CPU/offload fallback for non-fitting checkpoints
-  VRAM reserve based load admission
-  prompt/generation token admission
+  native engine fallback for custom checkpoints
 
 stateful / 긴 문맥 기능
+  engine capability 기반 기능 노출
   kv_window_policy: error, shift, ring
   ring KV
   pooled DecodeState
@@ -107,29 +107,20 @@ stateful / 긴 문맥 기능
   TTT sidecar gate
 
 서빙 성능 기능
-  chunked block prefill
-  GPU greedy sampling
-  request admission and queue limits
-  continuous batching baseline
-  slot-indexed state arena
-  paged KV / block table
-  batch-state CUDA kernels
-  native MTP/NEXTN speculative decoding with adaptive fallback
-  CUDA Graph bucket scaffold
+  vLLM continuous batching
+  vLLM paged KV / prefix cache
+  vLLM CUDA graph / speculative decoding
+  native batch-state CUDA kernels only for Qwen3.6/GDN
 
 운영 안정성
   health/status endpoints
-  model runtime status
-  OOM 시 runtime pool cleanup
-  request cancellation cleanup
-  queue timeout/reject counters
+  engine capability introspection
+  backend별 교체 가능 배포
 ```
 
-아직 external serving engine급 완성품이라고 말하면 안 된다. 현재 정체성은 “production-class를
-목표로 하는 범용 저비트/stateful 서빙 엔진”이다. Qwen3.6은 첫 번째 강한
-adapter이고, continuous batching, paged/ring KV, state arena, speculative
-decode, multi-model residency, 저사양 GPU 대응은 모두 LangBurst 본체의
-핵심 방향이다.
+현재 정체성은 “vLLM 기본의 교체형 서빙 extension layer”다. 자체 native
+엔진은 Qwen3.6/GDN custom kernel을 위한 plugin이고, generic serving 기능은
+vLLM/SGLang/EXL3 provider가 맡는다.
 
 대표 명령:
 
@@ -139,9 +130,10 @@ LANGBURST_SKIP_CUDA_EXT=1 python -m pip install -e .
 ./scripts/cuda_compile_and_test.sh
 langburst-qwen-quantize /path/to/hf-model /path/to/converted-runtime-model --bits 4 --group-size 128
 langburst-qwen-audit /path/to/converted-runtime-model --hf-model /path/to/hf-model
-langburst-chat --adapter qwen36 --hf-model /path/to/hf-model --qb-model /path/to/qb-model --prompt "안녕"
-langburst-server --adapter qwen36 --hf-model /path/to/hf-model --qb-model /path/to/qb-model --port 8008
-./neurova.sh langburst server --adapter qwen36 --hf-model /path/to/hf-model --qb-model /path/to/qb-model --port 8008
+langburst-chat --engine vllm --model /path/or/hf-name --prompt "안녕"
+langburst-server --engine vllm --model /path/or/hf-name --port 8008
+langburst-chat --engine native --adapter qwen36 --hf-model /path/to/hf-model --qb-model /path/to/qb-model --prompt "안녕"
+./neurova.sh langburst server --engine vllm --model /path/or/hf-name --port 8008
 ```
 
 먼저 읽을 문서:

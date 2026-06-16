@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +18,10 @@ from .tuning import DEFAULT_MARLIN_DIRECT_MAX_BATCH, lowbit_rows_per_cta, marlin
 MARLIN_DIRECT_MAX_BATCH = DEFAULT_MARLIN_DIRECT_MAX_BATCH
 
 
+def _marlin_out_cache_policy() -> str:
+    return os.environ.get("LANGBURST_MARLIN_OUT_CACHE_POLICY", "all").strip().lower()
+
+
 @dataclass
 class LowBitTensor:
     name: str
@@ -29,15 +34,16 @@ class LowBitTensor:
     def gemv(self, x: torch.Tensor) -> torch.Tensor:
         if self.qweight.device.type == "cuda":
             ops = cuda_ops()
-            return ops.lowbit_gemv(
-                self.qweight,
-                self.scales,
-                x.contiguous(),
-                self.cols,
-                self.group_size,
-                self.bits,
-                lowbit_rows_per_cta(),
-            )
+            with torch.cuda.device(self.qweight.device):
+                return ops.lowbit_gemv(
+                    self.qweight,
+                    self.scales,
+                    x.contiguous(),
+                    self.cols,
+                    self.group_size,
+                    self.bits,
+                    lowbit_rows_per_cta(),
+                )
         dense = dequantize_lowbit_rows(self.qweight, self.scales, self.cols, self.group_size, self.bits)
         return torch.matmul(dense.to(device=x.device, dtype=x.dtype), x.contiguous())
 
@@ -50,22 +56,24 @@ class LowBitTensor:
             row = torch.tensor(int(row), device=self.qweight.device, dtype=torch.long)
         else:
             row = row.to(device=self.qweight.device, dtype=torch.long).reshape(())
-        return ops.lowbit_row_dequant(self.qweight, self.scales, row, self.cols, self.group_size, self.bits)
+        with torch.cuda.device(self.qweight.device):
+            return ops.lowbit_row_dequant(self.qweight, self.scales, row, self.cols, self.group_size, self.bits)
 
     def gemm(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 2:
             raise ValueError("gemm expects x [batch, cols]")
         if self.qweight.device.type == "cuda":
             ops = cuda_ops()
-            return ops.lowbit_gemm(
-                self.qweight,
-                self.scales,
-                x.contiguous(),
-                self.cols,
-                self.group_size,
-                self.bits,
-                lowbit_rows_per_cta(),
-            )
+            with torch.cuda.device(self.qweight.device):
+                return ops.lowbit_gemm(
+                    self.qweight,
+                    self.scales,
+                    x.contiguous(),
+                    self.cols,
+                    self.group_size,
+                    self.bits,
+                    lowbit_rows_per_cta(),
+                )
         dense = dequantize_lowbit_rows(self.qweight, self.scales, self.cols, self.group_size, self.bits)
         return torch.matmul(x.contiguous().to(device=dense.device, dtype=dense.dtype), dense.t()).to(x.device)
 
@@ -99,24 +107,30 @@ class LowBitMarlinTensor:
             rows = [self.gemm(row.reshape(1, -1)).reshape(-1).clone() for row in x]
             return torch.stack(rows, dim=0).contiguous()
         rows = int(self.qweight.size(1) // 2)
-        out = self._out_cache.get(batch)
+        cache_policy = _marlin_out_cache_policy()
+        cache_out = cache_policy not in {"0", "false", "off", "none", "no_cache"} and (
+            cache_policy != "decode_only" or batch == 1
+        )
+        out = self._out_cache.get(batch) if cache_out else None
         if out is None or out.device != self.qweight.device or out.size(1) != rows:
             out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
-            self._out_cache[batch] = out
+            if cache_out:
+                self._out_cache[batch] = out
         workspace_size = max(1, rows // 128 * 16)
         if self._workspace is None or self._workspace.device != self.qweight.device or self._workspace.numel() < workspace_size:
             self._workspace = torch.zeros((workspace_size,), device=self.qweight.device, dtype=torch.int32)
         else:
             self._workspace[:workspace_size].zero_()
-        cuda_ops().lowbit_marlin_gemm_out(
-            self.qweight,
-            self.scales,
-            x,
-            out,
-            self._workspace,
-            self.cols,
-            self.group_size,
-        )
+        with torch.cuda.device(self.qweight.device):
+            cuda_ops().lowbit_marlin_gemm_out(
+                self.qweight,
+                self.scales,
+                x,
+                out,
+                self._workspace,
+                self.cols,
+                self.group_size,
+            )
         return out
 
     def row_dequant(self, row: int | torch.Tensor) -> torch.Tensor:

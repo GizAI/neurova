@@ -15,6 +15,7 @@ from .core.features import (
     RuntimeFeatureOverride,
     RuntimeFeatures,
 )
+from .core.defaults import kv_cache_dtype_default
 from .core.platform import ENV_PREFIX, env
 
 
@@ -72,7 +73,7 @@ def add_runtime_feature_args(parser: argparse.ArgumentParser, *, include_profile
             help="feature preset: original disables stateful extras; stateful is the default streaming-state runtime",
         )
     parser.add_argument("--kv-window-policy", choices=KV_POLICIES, default=None)
-    parser.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default=env("KV_CACHE_DTYPE"))
+    parser.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default=env("KV_CACHE_DTYPE", kv_cache_dtype_default()))
     core_group = parser.add_argument_group("runtime feature toggles")
     for key in CORE_BOOL_FEATURE_KEYS:
         core_group.add_argument(f"--{key.replace('_', '-')}", choices=("auto", "on", "off"), default="auto")
@@ -118,7 +119,7 @@ def create_runtime_engine_from_args(
     should come through this factory.
     """
 
-    from .core.runtime import RuntimeEngine
+    from .engines.native_impl.runtime import RuntimeEngine
 
     return RuntimeEngine(
         adapter=adapter_registry.get(args.adapter),

@@ -19,7 +19,7 @@ output/state parity and show measured benefit.
 ## P1: Continuous Batching Scheduler
 
 - Status: implemented baseline, measured dmc8 serving path
-- SSOT: `langburst.core.scheduler.ContinuousBatchScheduler`
+- SSOT: `langburst.engines.native_impl.scheduler.ContinuousBatchScheduler`
 - Done:
   - decode rows scheduled before prefill rows
   - chunked prefill budget
@@ -50,7 +50,7 @@ output/state parity and show measured benefit.
 ## P3: Paged KV / Block Table
 
 - Status: decode hot path implemented, default-on for multi-user serving
-- SSOT: `langburst.core.block_table.KVBlockTable`
+- SSOT: `langburst.engines.native_impl.block_table.KVBlockTable`
 - Done:
   - logical block allocation/release
   - `block_tables` and `slot_mapping` tensors attached to `DecodeBatchPlan`

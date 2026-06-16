@@ -1,50 +1,40 @@
 # LangBurst
 
-LangBurst is a production-class serving engine target for low-bit, stateful, and
-resource-constrained model serving. It is not limited to one 16GB GPU shape:
-the design goal is a generic adapter-based runtime that can serve different
-model families, scale down to modest GPUs with quantization/offload policies,
-and expose stateful features such as ring KV, snapshots, infinite streaming,
-episodic memory, and TTT sidecars through one execution contract.
+LangBurst is a serving-engine extension layer. It does not try to reimplement
+vLLM as the default path. The default engine is vLLM; optional providers can
+plug in SGLang, EXL3/ExLlamaV3, or the legacy LangBurst native engine through
+one `EngineRegistry`.
 
-The current champion measured path is Qwen3.6-27B text inference on a
-16GB-class RTX 4080/4090 using flexible groupwise low-bit weights, Qwen Gated
-DeltaNet kernels, ring-KV attention, paged/state-arena serving work, and
-streaming decode state.
+The goal is:
 
-This is not yet a complete external serving engine replacement. The runtime is split into a common
-`RuntimeEngine`, `EngineManager`, `AdmissionController`,
-`ContinuousBatchScheduler`, `RuntimePlan`, and model adapters so future
-Gemma/Llama/MoE-style targets do not fork the server/decode loop. The current
-canonical adapter contract is:
+```text
+LangBurst policy/API/stateful extensions
+  -> EngineRegistry
+     -> vllm    # default
+     -> sglang  # optional provider target
+     -> exl3    # optional provider target
+     -> native  # legacy Qwen3.6/GDN custom runtime
+```
 
-- Adapter: `qwen36`.
-- HF source model: Qwen3.6-27B / Qwen3.5-style text model.
-- Champion converted model: Q4 Marlin fused projection checkpoint.
-- Quantized tensor kinds: `lowbit_marlin_groupwise`,
-  `lowbit_symmetric_groupwise`, and small `fp16_raw` gate projections.
-- Supported rowwise weight bits: 2 through 8, selected by checkpoint metadata.
-- Runtime entrypoints: `langburst-qwen-quantize`, `langburst-qwen-audit`,
-  `langburst-chat`, `langburst-server`, `langburst-doctor`,
-  `langburst-qwen-nextn-bench`, `langburst-qwen-graph-audit`, `langburst-qwen-profile`.
-- Generic serving features: lazy multi-model residency, LRU unload, bounded
-  request admission, queue timeout/reject counters, prompt/generation token
-  admission, state pooling, OpenAI-compatible streaming, health/model/feature
-  introspection, and OOM pool cleanup.
-- Stateful/long-context features: `kv_window_policy=error|shift|ring`, ring KV,
-  snapshots, boundary decay, `kv_cache_dtype=fp16|fp8_e4m3|int4|int4_bdr`,
-  infinite streaming gate, episodic memory gate, and TTT sidecar gate through
-  `RuntimeFeatures -> RuntimeCapabilities -> RuntimePlan`.
-- continuous-serving execution work: continuous-batching scheduler, slot-indexed state
-  arena, paged KV/block table, automatic prefix cache with Radix-style token
-  trie and shared immutable KV blocks, batch-state CUDA kernels, native
-  MTP/NEXTN speculative decoding with adaptive fallback, and CUDA Graph bucket
-  scaffolding.
-- CUDA extension symbols: Marlin W4A16 GEMM, rowwise low-bit fallback,
-  RMSNorm, GDN recurrence, fp16/fp8/int4 paged attention decode, and sampling
-  helpers.
+vLLM owns generic serving machinery such as continuous batching, paged KV,
+prefix caching, standard quantization, CUDA graph, speculative decoding, and
+OpenAI-compatible serving semantics. LangBurst keeps one bridge contract for
+the parts that are not generic vLLM work: low-resource policy,
+stateful/session state, ring/infinite context policy, episodic/TTT sidecars,
+and Qwen3.6/GDN low-bit custom-model metadata.
 
-The adapter split is documented in `docs/ADAPTER_ARCHITECTURE.md`.
+The existing Qwen3.6 native runtime is now treated as a native engine plugin.
+It remains useful for the current Qwen3.6/GDN low-bit checkpoint path, but
+the same feature request is also accepted by the vLLM provider and routed
+through `engines/vllm_bridge.py`.
+
+When `--engine vllm` is used with Qwen3.6 features, LangBurst does not wrap the
+native runtime. vLLM still owns server, scheduler, batching, paged KV/prefix
+cache, sampling, and standard HF loading. LangBurst forwards only the pieces
+that vLLM cannot replace: the converted low-bit checkpoint location, Qwen3.6
+GDN/recurrent-state intent, ring/infinite policy metadata, and sidecar flags.
+
+The engine split is documented in `docs/ADAPTER_ARCHITECTURE.md`.
 Runtime feature profiles are documented in `docs/RUNTIME_FEATURES.md`.
 Current duplicate/fragmentation boundaries are documented in `docs/STRUCTURE_AUDIT.md`.
 
@@ -64,7 +54,7 @@ Build and validate CUDA:
 ./scripts/cuda_compile_and_test.sh
 ```
 
-CPU-only tools can be installed with:
+CPU-only native tools can be installed without building LangBurst CUDA:
 
 ```bash
 LANGBURST_SKIP_CUDA_EXT=1 python -m pip install -e .
@@ -88,11 +78,24 @@ langburst-qwen-audit /path/to/converted-runtime-model --hf-model /path/to/hf-mod
 
 ## Chat
 
-The default `--weight-device auto` keeps Marlin checkpoints GPU-resident. CPU
-offload is only a fallback for checkpoints that cannot fit in VRAM.
+Default engine path:
 
 ```bash
 langburst-chat \
+  --engine vllm \
+  --model /path/or/hf-name \
+  --prompt "안녕. 너는 누구야?" \
+  --max-new-tokens 96 \
+  --temperature 0 \
+  --stream \
+  --stats
+```
+
+Legacy native Qwen3.6/GDN path:
+
+```bash
+langburst-chat \
+  --engine native \
   --adapter qwen36 \
   --runtime-profile stateful \
   --block-prefill on \
@@ -107,10 +110,11 @@ langburst-chat \
   --stats
 ```
 
-Force the GPU-resident path:
+Force the legacy native GPU-resident path:
 
 ```bash
 langburst-chat \
+  --engine native \
   --adapter qwen36 \
   --runtime-profile original \
   --hf-model /path/to/hf-model \
@@ -124,12 +128,29 @@ langburst-chat \
 
 ## OpenAI-Compatible Server
 
-Run once and keep the model resident:
+Default vLLM-backed server:
+
+```bash
+langburst-server \
+  --engine vllm \
+  --model /path/or/hf-name \
+  --qb-model /path/to/converted-runtime-model \
+  --qwen36-lowbit \
+  --kv-window-policy ring \
+  --stateful-chat on \
+  --infinite-streaming on \
+  --served-model-name langburst-vllm-model \
+  --host 0.0.0.0 \
+  --port 8008
+```
+
+Legacy native Qwen3.6/GDN server:
 
 ```bash
 LANGBURST_LOWBIT_ROWS_PER_CTA=8 \
 LANGBURST_CONTEXT_WINDOW=8192 \
 langburst-server \
+  --engine native \
   --adapter qwen36 \
   --runtime-profile stateful \
   --hf-model /path/to/hf-model \
@@ -151,23 +172,19 @@ SSE streaming is supported with `"stream": true`. Add
 `"stream_options": {"include_usage": true}` to receive the final usage object in
 the last stream chunk.
 
-Inspect the resolved runtime plan:
+Inspect the active engine:
 
 ```bash
 curl http://127.0.0.1:8008/v1/langburst/features
+curl http://127.0.0.1:8008/v1/langburst/engines
 ```
 
-The response includes requested features, adapter capabilities, effective
-features, and unsupported fields disabled by `RuntimePlan`. The
-OpenAI-compatible chat endpoint also accepts per-request runtime overrides such
-as `"runtime_profile": "original"`, `"kv_window_policy": "ring"`,
-`"kv_cache_dtype": "fp8_e4m3"`, `"kv_cache_dtype": "int4_bdr"`,
-`"state_pool": true`, `"gpu_sampling": true`, `"block_prefill": true`, or
-`"prefix_cache": true`, or `"prefill_chunk_size": 64`.
-`block_prefill` is the default serving path. Its accepted implementation uses
-exact decode semantics internally; faster batched internals must clear final
-logit parity, continuation-state parity, and recall gates before becoming
-default.
+The response reports the selected engine descriptor, `EngineFeaturePlan`, and
+vLLM bridge metadata. Native runtime feature overrides such as
+`kv_window_policy`, `stateful_chat`, `infinite_streaming`, `episodic_memory`,
+and `ttt_sidecar` are also accepted by the vLLM provider. vLLM handles the
+generic substrate; LangBurst forwards Qwen3.6/GDN, ring/infinite, recurrent,
+episodic, and TTT intent through host state and custom-model metadata.
 
 The chat endpoint accepts common modern LLM API controls. These are wired into
 the shared generation contract:

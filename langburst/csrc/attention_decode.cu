@@ -847,3 +847,66 @@ torch::Tensor attention_decode_paged_int4(
   QB_CUDA_CHECK(cudaGetLastError());
   return out;
 }
+
+void attention_append_paged_int4(
+    torch::Tensor k_new,
+    torch::Tensor v_new,
+    torch::Tensor k_pages,
+    torch::Tensor v_pages,
+    torch::Tensor k_scales,
+    torch::Tensor v_scales,
+    torch::Tensor k_zeros,
+    torch::Tensor v_zeros,
+    torch::Tensor slot_mapping,
+    int64_t block_size_i,
+    int64_t hadamard_order_i,
+    bool bdr_k,
+    bool rotate_v) {
+  QB_CHECK_CUDA(k_new); QB_CHECK_CUDA(v_new); QB_CHECK_CUDA(k_pages); QB_CHECK_CUDA(v_pages);
+  QB_CHECK_CUDA(k_scales); QB_CHECK_CUDA(v_scales); QB_CHECK_CUDA(k_zeros); QB_CHECK_CUDA(v_zeros);
+  QB_CHECK_CUDA(slot_mapping);
+  QB_CHECK_CONTIGUOUS(k_new); QB_CHECK_CONTIGUOUS(v_new); QB_CHECK_CONTIGUOUS(k_pages); QB_CHECK_CONTIGUOUS(v_pages);
+  QB_CHECK_CONTIGUOUS(k_scales); QB_CHECK_CONTIGUOUS(v_scales); QB_CHECK_CONTIGUOUS(k_zeros); QB_CHECK_CONTIGUOUS(v_zeros);
+  QB_CHECK_CONTIGUOUS(slot_mapping);
+  QB_CHECK_HALF(k_new); QB_CHECK_HALF(v_new); QB_CHECK_UINT8(k_pages); QB_CHECK_UINT8(v_pages);
+  QB_CHECK_HALF(k_scales); QB_CHECK_HALF(v_scales); QB_CHECK_HALF(k_zeros); QB_CHECK_HALF(v_zeros); QB_CHECK_INT64(slot_mapping);
+  TORCH_CHECK(!rotate_v, "INT4 BDR rotate_v is not implemented in LangBurst; use K-only BDR");
+  TORCH_CHECK(k_new.dim() == 3 && v_new.dim() == 3, "k_new/v_new must be [batch, kv_heads, head_dim]");
+  TORCH_CHECK(k_pages.dim() == 4 && v_pages.dim() == 4, "paged cache must be [num_blocks, kv_heads, block_size, packed_head_dim]");
+  TORCH_CHECK(k_scales.dim() == 3 && v_scales.dim() == 3, "int4 scales must be [num_blocks, kv_heads, block_size]");
+  TORCH_CHECK(k_zeros.dim() == 3 && v_zeros.dim() == 3, "int4 zero points must be [num_blocks, kv_heads, block_size]");
+  int batch = static_cast<int>(k_new.size(0));
+  int head_dim = static_cast<int>(k_new.size(2));
+  int kv_heads = static_cast<int>(k_new.size(1));
+  int num_blocks = static_cast<int>(k_pages.size(0));
+  int block_size = static_cast<int>(block_size_i);
+  int hadamard_order = static_cast<int>(hadamard_order_i);
+  TORCH_CHECK(head_dim == 256, "paged append kernel currently specializes head_dim=256");
+  TORCH_CHECK((head_dim % 2) == 0, "INT4 KV requires even head_dim");
+  TORCH_CHECK(!bdr_k || (hadamard_order > 0 && (hadamard_order & (hadamard_order - 1)) == 0 && head_dim % hadamard_order == 0),
+              "BDR hadamard_order must be a power-of-two divisor of head_dim");
+  TORCH_CHECK(block_size > 0 && k_pages.size(2) == block_size, "block_size mismatch");
+  TORCH_CHECK(v_new.size(0) == batch && v_new.size(1) == kv_heads && v_new.size(2) == head_dim, "v_new shape mismatch");
+  TORCH_CHECK(k_pages.size(1) == kv_heads && v_pages.size(1) == kv_heads, "arena kv_heads mismatch");
+  TORCH_CHECK(k_pages.size(3) == head_dim / 2 && v_pages.size(3) == head_dim / 2, "int4 packed head_dim mismatch");
+  TORCH_CHECK(k_scales.size(0) == num_blocks && k_scales.size(1) == kv_heads && k_scales.size(2) == block_size, "k_scales shape mismatch");
+  TORCH_CHECK(v_scales.sizes() == k_scales.sizes(), "v_scales shape mismatch");
+  TORCH_CHECK(k_zeros.sizes() == k_scales.sizes(), "k_zeros shape mismatch");
+  TORCH_CHECK(v_zeros.sizes() == k_scales.sizes(), "v_zeros shape mismatch");
+  TORCH_CHECK(slot_mapping.size(0) == batch, "slot_mapping batch mismatch");
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 append_grid(batch, kv_heads);
+  attention_kv_append_paged_int4_kernel<256><<<append_grid, QB_ATT_BLOCK, 0, stream>>>(
+      reinterpret_cast<const half*>(k_new.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v_new.data_ptr<at::Half>()),
+      reinterpret_cast<uint8_t*>(k_pages.data_ptr()),
+      reinterpret_cast<uint8_t*>(v_pages.data_ptr()),
+      reinterpret_cast<half*>(k_scales.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(v_scales.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(k_zeros.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(v_zeros.data_ptr<at::Half>()),
+      slot_mapping.data_ptr<int64_t>(),
+      batch, num_blocks, kv_heads, block_size, hadamard_order, bdr_k);
+  QB_CUDA_CHECK(cudaGetLastError());
+}

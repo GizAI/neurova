@@ -21,6 +21,18 @@ dependencies = [
   "pydantic>=2",
 ]
 
+[project.optional-dependencies]
+vllm = ["vllm>=0.8"]
+sglang = ["sglang>=0.4"]
+exl3 = ["exllamav3>=0.1"]
+
+[project.entry-points."langburst.engines"]
+vllm = "langburst.engines.vllm:VLLMProvider"
+native = "langburst.engines.native:NativeProvider"
+
+[project.entry-points."vllm.general_plugins"]
+langburst_lowbit = "langburst.engines.vllm_plugins:register"
+
 [project.scripts]
 langburst-qwen-bench-estimate = "langburst.adapters.qwen36_tools.bench_estimate:main"
 langburst-qwen-quantize = "langburst.adapters.qwen36_tools.quantize:main"

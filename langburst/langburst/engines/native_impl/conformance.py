@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Sequence
 
-from .adapter import ModelAdapter
-from .features import RuntimeFeatures
+from ...core.adapter import ModelAdapter
+from ...core.features import RuntimeFeatures
 from .runtime import GenerationConfig, RuntimeEngine
 
 

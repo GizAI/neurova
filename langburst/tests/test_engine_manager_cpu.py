@@ -4,8 +4,8 @@ from pathlib import Path
 
 import langburst.adapters  # noqa: F401
 from langburst.core.adapter import adapter_registry
-from langburst.core.manager import EngineManager, EngineResourcePolicy, ModelResourceSpec
-from langburst.core.runtime import GenerationConfig
+from langburst.engines.native_impl.manager import EngineManager, EngineResourcePolicy, ModelResourceSpec
+from langburst.engines.native_impl.runtime import GenerationConfig
 from langburst.server import create_app
 
 from test_adapter_runtime_cpu import ToyAdapter

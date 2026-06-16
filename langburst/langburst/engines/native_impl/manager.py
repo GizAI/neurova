@@ -12,8 +12,8 @@ from typing import Any
 
 import torch
 
-from .adapter import adapter_registry
-from .defaults import (
+from ...core.adapter import adapter_registry
+from ...core.defaults import (
     DEFAULT_MAX_GENERATION_TOKENS,
     DEFAULT_MAX_BATCHED_TOKENS,
     DEFAULT_PREFILL_CHUNK_SIZE,
@@ -25,7 +25,7 @@ from .defaults import (
     max_state_pool_size_default,
     serving_recent_window_default,
 )
-from .features import RuntimeFeatures, RuntimePlan, resolve_runtime_plan
+from ...core.features import RuntimeFeatures, RuntimePlan, resolve_runtime_plan
 from .batch_worker import BatchGenerationWorker
 from .model_runner import BatchedModelRunner
 from .runtime import RuntimeEngine
@@ -310,10 +310,13 @@ class EngineManager:
         }
         if torch.cuda.is_available():
             free_bytes, total_bytes = torch.cuda.mem_get_info()
+            device = torch.cuda.current_device()
             out.update(
                 {
                     "cuda_free_mib": free_bytes // (1024 * 1024),
                     "cuda_total_mib": total_bytes // (1024 * 1024),
+                    "cuda_allocated_mib": torch.cuda.memory_allocated(device) // (1024 * 1024),
+                    "cuda_reserved_mib": torch.cuda.memory_reserved(device) // (1024 * 1024),
                     "reserve_free_vram_mib": self.policy.reserve_free_vram_mib,
                 }
             )
@@ -407,8 +410,11 @@ class EngineManager:
             status = self._status[name]
             status.state = "unloaded"
             status.unload_count += 1
+            del engine
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
             return True
 
     def resolve_plan(self, model_name: str | None = None, features: RuntimeFeatures | None = None) -> RuntimePlan:
@@ -489,11 +495,19 @@ class EngineManager:
 
     def _drop_batch_runners(self, model_name: str) -> None:
         for key in [key for key in self._batch_workers if key[0] == model_name]:
-            self._batch_workers[key].shutdown()
-            del self._batch_workers[key]
+            worker = self._batch_workers.pop(key)
+            worker.shutdown()
+            del worker
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         for key in [key for key in self._batch_runners if key[0] == model_name]:
-            self._batch_runners[key].clear()
-            del self._batch_runners[key]
+            runner = self._batch_runners.pop(key)
+            runner.clear()
+            del runner
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def validate_generation_request(self, *, prompt_tokens: int, generation_tokens: int) -> None:
         if prompt_tokens < 1:
@@ -579,6 +593,7 @@ class EngineManager:
     def recover_runtime_oom(self, model_name: str | None = None) -> bool:
         name = model_name or self.default_model_name()
         recovered = self.unload(name)
+        self._drop_batch_runners(name)
         self.batch_scheduler.clear()
         if self.kv_block_table is not None:
             self.kv_block_table.clear()

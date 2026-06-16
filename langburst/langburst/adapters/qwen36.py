@@ -17,6 +17,17 @@ from .qwen36_mtp import native_mtp1_proposer_for_model
 from .qwen36_impl.state import DecodeState, DecodeStateArena
 
 
+def _largest_power_of_two_divisor(value: int) -> int:
+    value = max(1, int(value))
+    return value & -value
+
+
+def _resolved_kv_cache_spec(cfg: Qwen36_27B_TextConfig, features: RuntimeFeatures | None) -> KVCacheSpec:
+    raw_dtype = features.kv_cache_dtype if features is not None else cfg.kv_cache_mode
+    hadamard_order = min(128, _largest_power_of_two_divisor(cfg.attention_head_dim))
+    return KVCacheSpec.resolve(raw_dtype, hadamard_order=hadamard_order)
+
+
 def choose_qwen_weight_device(qb_model: Path, requested: str, runtime_device: str) -> str:
     if requested != "auto":
         return runtime_device if requested == "cuda" else "cpu"
@@ -91,7 +102,7 @@ class Qwen36Adapter:
             max_seq_len=recent_window,
             device=device,
             kv_window_policy=features.kv_window_policy,
-            kv_cache_spec=KVCacheSpec.resolve(features.kv_cache_dtype),
+            kv_cache_spec=_resolved_kv_cache_spec(cfg, features),
         )
 
     def estimate_state_bytes(
@@ -102,7 +113,7 @@ class Qwen36Adapter:
         features: RuntimeFeatures | None = None,
         ) -> int:
         dtype_bytes = 2
-        kv_spec = KVCacheSpec.resolve(features.kv_cache_dtype if features is not None else cfg.kv_cache_mode)
+        kv_spec = _resolved_kv_cache_spec(cfg, features)
         gdn = (
             len(cfg.gdn_layers)
             * cfg.linear_num_value_heads
@@ -133,7 +144,7 @@ class Qwen36Adapter:
         features: RuntimeFeatures,
     ) -> int:
         dtype_bytes = 2
-        kv_spec = KVCacheSpec.resolve(features.kv_cache_dtype if features is not None else cfg.kv_cache_mode)
+        kv_spec = _resolved_kv_cache_spec(cfg, features)
         gdn_per_slot = (
             len(cfg.gdn_layers)
             * cfg.linear_num_value_heads
@@ -173,7 +184,7 @@ class Qwen36Adapter:
             kv_block_size=kv_block_size,
             device=device,
             kv_window_policy=features.kv_window_policy,
-            kv_cache_spec=KVCacheSpec.resolve(features.kv_cache_dtype),
+            kv_cache_spec=_resolved_kv_cache_spec(cfg, features),
         )
 
     def encode_prompt(self, tokenizer, prompt: str, system: str | None = None) -> list[int]:

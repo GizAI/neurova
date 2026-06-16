@@ -11,6 +11,7 @@ DEFAULT_MAX_PROMPT_TOKENS = 16384
 DEFAULT_MAX_GENERATION_TOKENS = 1024
 DEFAULT_MAX_BATCHED_TOKENS = 256
 DEFAULT_PREFILL_CHUNK_SIZE = 64
+DEFAULT_KV_CACHE_DTYPE = "int4_bdr"
 DEFAULT_KV_BLOCK_SIZE = 16
 DEFAULT_KV_BLOCKS = 1024
 
@@ -43,6 +44,10 @@ def max_state_pool_size_default() -> int:
 
 def kv_block_size_default() -> int:
     return _env_int("LANGBURST_KV_BLOCK_SIZE", DEFAULT_KV_BLOCK_SIZE)
+
+
+def kv_cache_dtype_default() -> str:
+    return os.environ.get("LANGBURST_KV_CACHE_DTYPE", DEFAULT_KV_CACHE_DTYPE)
 
 
 def kv_blocks_default() -> int:

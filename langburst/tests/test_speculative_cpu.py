@@ -11,7 +11,7 @@ from langburst.speculation import (
     SpeculativeProbeResult,
 )
 from langburst.speculative_verifier import NativeNextNVerifier, TargetVerification
-from langburst.core.policy import RuntimePolicyResolver
+from langburst.engines.native_impl.policy import RuntimePolicyResolver
 from langburst.tuning import verify_nextn_mode
 
 

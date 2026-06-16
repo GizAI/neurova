@@ -8,12 +8,12 @@ import torch
 
 import langburst.adapters  # noqa: F401 - registers built-in adapters
 from langburst.core.adapter import AdapterDescriptor, adapter_registry
-from langburst.core.conformance import assert_minimal_adapter_conformance
 from langburst.core.features import RuntimeCapabilities, RuntimeFeatures
-from langburst.core.block_table import KVBlockTable
-from langburst.core.model_runner import BatchedModelRunner
-from langburst.core.runtime import GenerationConfig, RuntimeEngine
-from langburst.core.scheduler import ContinuousBatchScheduler
+from langburst.engines.native_impl.conformance import assert_minimal_adapter_conformance
+from langburst.engines.native_impl.block_table import KVBlockTable
+from langburst.engines.native_impl.model_runner import BatchedModelRunner
+from langburst.engines.native_impl.runtime import GenerationConfig, RuntimeEngine
+from langburst.engines.native_impl.scheduler import ContinuousBatchScheduler
 from langburst.adapters.hf_causal import HFCausalState
 from langburst.adapters.qwen36_impl.model import Qwen36Model
 from langburst.speculative_batch import DecodeRequestState, build_decode_batch_plan

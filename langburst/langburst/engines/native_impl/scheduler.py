@@ -7,7 +7,7 @@ from typing import Sequence
 
 from .block_table import KVBlockTable
 from .cuda_graph import CudaGraphBucketPlanner
-from ..speculative_batch import DecodeBatchPlan, DecodeInputBuffers, DecodeRequestState, build_decode_batch_plan
+from ...speculative_batch import DecodeBatchPlan, DecodeInputBuffers, DecodeRequestState, build_decode_batch_plan
 
 
 @dataclass(frozen=True)

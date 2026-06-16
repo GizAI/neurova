@@ -21,6 +21,13 @@ from langburst.core.kv_cache import (
 KVWindowPolicy = Literal["error", "shift", "ring"]
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
 @dataclass
 class StateSnapshotInfo:
     """Small JSON-like metadata stored next to tensor state.
@@ -666,13 +673,10 @@ class DecodeStateArena:
             )
             for layer in cfg.gdn_layers
         }
-        mirror_default = "1" if self.kv_cache_spec.dtype == "fp16" else "0"
-        mirror_paged_kv = os.environ.get("LANGBURST_PAGED_KV_MIRROR", mirror_default).strip().lower() not in {
-            "0",
-            "false",
-            "off",
-            "no",
-        }
+        mirror_paged_kv = _env_flag("LANGBURST_PAGED_KV_MIRROR", self.kv_cache_spec.dtype == "fp16")
+        paged_attention_kernels = _env_flag("LANGBURST_PAGED_ATTENTION_KERNELS", False)
+        shadow_default = (not mirror_paged_kv) or paged_attention_kernels
+        allocate_paged_shadow = self.paged_kv_enabled and _env_flag("LANGBURST_PAGED_KV_SHADOW", shadow_default)
         arena_kv = allocate_kv_cache_tensors(
             self.kv_layout,
             self.kv_cache_spec,
@@ -692,7 +696,8 @@ class DecodeStateArena:
         self.paged_attn_v_scale = None
         self.paged_attn_k_zero = None
         self.paged_attn_v_zero = None
-        if self.paged_kv_enabled:
+        self.paged_kv_pages_allocated = False
+        if allocate_paged_shadow:
             paged_kv = allocate_kv_cache_tensors(
                 self.kv_layout,
                 self.kv_cache_spec,
@@ -706,6 +711,7 @@ class DecodeStateArena:
             self.paged_attn_v_scale = paged_kv.v_scale
             self.paged_attn_k_zero = paged_kv.k_zero
             self.paged_attn_v_zero = paged_kv.v_zero
+            self.paged_kv_pages_allocated = True
         self._free_slots = list(range(self.num_slots - 1, -1, -1))
         self._active_slots: set[int] = set()
 
@@ -794,4 +800,5 @@ class DecodeStateArena:
         }
         if self.paged_kv_enabled:
             out["paged_kv_mirror"] = bool(next(iter(self.attn_k.values())).size(-2) > 0) if self.attn_k else False
+            out["paged_kv_pages_allocated"] = self.paged_kv_pages_allocated
         return out

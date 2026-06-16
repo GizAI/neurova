@@ -8,7 +8,7 @@ from langburst.adapters.qwen36_impl.config import Qwen36_27B_TextConfig
 from langburst.adapters.qwen36 import Qwen36Adapter
 from langburst.core.features import RuntimeFeatures
 from langburst.core.kv_cache import KVCacheLayout, KVCacheSpec, allocate_kv_cache_tensors, hadamard_transform, pack_int4_rows, unpack_int4_rows
-from langburst.core.state_store import BatchStateStore
+from langburst.engines.native_impl.state_store import BatchStateStore
 from langburst.adapters.qwen36_impl.state import DecodeStateArena
 
 
@@ -128,8 +128,8 @@ def test_batch_state_store_uses_arena_for_qwen_like_engine():
         "max_seq_len": 4,
         "kv_num_blocks": 0,
         "kv_block_size": 0,
-        "kv_cache_dtype": "fp16",
-        "kv_storage_head_dim": 4,
+        "kv_cache_dtype": "int4_bdr",
+        "kv_storage_head_dim": 2,
         "paged_kv_enabled": False,
     }
     first.gdn_states[0].fill_(7)
@@ -143,13 +143,38 @@ def test_batch_state_store_uses_arena_for_qwen_like_engine():
         "max_seq_len": 4,
         "kv_num_blocks": 0,
         "kv_block_size": 0,
-        "kv_cache_dtype": "fp16",
-        "kv_storage_head_dim": 4,
+        "kv_cache_dtype": "int4_bdr",
+        "kv_storage_head_dim": 2,
         "paged_kv_enabled": False,
     }
 
 
-def test_decode_state_arena_can_allocate_paged_kv_buffers():
+def test_decode_state_arena_uses_canonical_mirror_without_shadow_pages_by_default(monkeypatch):
+    monkeypatch.delenv("LANGBURST_PAGED_KV_SHADOW", raising=False)
+    monkeypatch.delenv("LANGBURST_PAGED_ATTENTION_KERNELS", raising=False)
+    arena = DecodeStateArena(
+        cfg=tiny_qwen_cfg(),
+        max_seq_len=4,
+        num_slots=2,
+        kv_num_blocks=8,
+        kv_block_size=4,
+        device="cpu",
+    )
+
+    assert arena.paged_attn_k is None
+    assert arena.paged_attn_v is None
+    assert arena.summary()["kv_num_blocks"] == 8
+    assert arena.summary()["kv_block_size"] == 4
+    assert arena.summary()["kv_cache_dtype"] == "fp16"
+    assert arena.summary()["kv_storage_head_dim"] == 4
+    assert arena.summary()["paged_kv_enabled"] is True
+    assert arena.summary()["paged_kv_mirror"] is True
+    assert arena.summary()["paged_kv_pages_allocated"] is False
+    assert arena.attn_k[1].size(2) == 4
+
+
+def test_decode_state_arena_can_allocate_paged_kv_shadow_buffers(monkeypatch):
+    monkeypatch.setenv("LANGBURST_PAGED_KV_SHADOW", "1")
     arena = DecodeStateArena(
         cfg=tiny_qwen_cfg(),
         max_seq_len=4,
@@ -162,13 +187,9 @@ def test_decode_state_arena_can_allocate_paged_kv_buffers():
     assert arena.paged_attn_k is not None
     assert arena.paged_attn_v is not None
     assert arena.paged_attn_k[1].shape == (8, 1, 4, 4)
-    assert arena.summary()["kv_num_blocks"] == 8
-    assert arena.summary()["kv_block_size"] == 4
-    assert arena.summary()["kv_cache_dtype"] == "fp16"
-    assert arena.summary()["kv_storage_head_dim"] == 4
     assert arena.summary()["paged_kv_enabled"] is True
     assert arena.summary()["paged_kv_mirror"] is True
-    assert arena.attn_k[1].size(2) == 4
+    assert arena.summary()["paged_kv_pages_allocated"] is True
 
 
 def test_decode_state_arena_can_allocate_fp8_paged_kv_buffers():
