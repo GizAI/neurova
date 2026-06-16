@@ -8,7 +8,12 @@ import numpy as np
 import torch
 
 from .ops import cuda_ops
-from .tuning import lowbit_rows_per_cta
+
+
+from .tuning import DEFAULT_MARLIN_DIRECT_MAX_BATCH, lowbit_rows_per_cta, marlin_direct_max_batch
+
+
+MARLIN_DIRECT_MAX_BATCH = DEFAULT_MARLIN_DIRECT_MAX_BATCH
 
 
 @dataclass
@@ -86,6 +91,12 @@ class LowBitMarlinTensor:
             raise RuntimeError("Marlin tensors require CUDA")
         x = x.to(device=self.qweight.device, dtype=torch.float16).contiguous()
         batch = int(x.size(0))
+        if batch > marlin_direct_max_batch():
+            # The current vendored Marlin path is deterministic for M=1 but not
+            # accepted for large padded M on Ada. Preserve block-prefill
+            # semantics by evaluating rows through the stable GEMM contract.
+            rows = [self.gemm(row.reshape(1, -1)).reshape(-1).clone() for row in x]
+            return torch.stack(rows, dim=0).contiguous()
         rows = int(self.qweight.size(1) // 2)
         out = self._out_cache.get(batch)
         if out is None or out.device != self.qweight.device or out.size(1) != rows:
@@ -94,6 +105,8 @@ class LowBitMarlinTensor:
         workspace_size = max(1, rows // 128 * 16)
         if self._workspace is None or self._workspace.device != self.qweight.device or self._workspace.numel() < workspace_size:
             self._workspace = torch.zeros((workspace_size,), device=self.qweight.device, dtype=torch.int32)
+        else:
+            self._workspace[:workspace_size].zero_()
         cuda_ops().lowbit_marlin_gemm_out(
             self.qweight,
             self.scales,

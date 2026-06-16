@@ -140,12 +140,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm_qwen", &rmsnorm_qwen, "Qwen RMSNorm fp16 using 1+weight");
   m.def("rmsnorm_silu_gate", &rmsnorm_silu_gate, "RMSNorm followed by SiLU gate fp16");
   m.def("rmsnorm_qwen_silu_gate", &rmsnorm_qwen_silu_gate, "Qwen RMSNorm followed by SiLU gate fp16");
+  m.def("silu_mul", &silu_mul, "Fused SiLU(gate) * up fp16");
   m.def("gdn_recurrent", &gdn_recurrent,
         "Single-token Qwen-style recurrent gated delta rule, state updated in-place");
   m.def("gdn_recurrent_ab", &gdn_recurrent_ab,
         "Single-token Qwen-style recurrent gated delta rule with fused a/b gate computation");
   m.def("gdn_recurrent_scan", &gdn_recurrent_scan,
         "Block Qwen-style recurrent gated delta scan, state updated in-place");
+  m.def("gdn_recurrent_ab_scan", &gdn_recurrent_ab_scan,
+        "Block Qwen-style recurrent gated delta scan with fused a/b gate computation");
   m.def("depthwise_conv_update", &depthwise_conv_update,
         "Single-token causal depthwise conv update with SiLU");
   m.def("depthwise_conv_update_scan", &depthwise_conv_update_scan,

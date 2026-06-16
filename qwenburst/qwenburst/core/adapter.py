@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 import torch
-from .features import RuntimeFeatures
+from .features import RuntimeCapabilities, RuntimeFeatures
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,7 @@ class AdapterDescriptor:
     adapter_id: str
     family: str
     default_model_name: str
+    capabilities: RuntimeCapabilities = field(default_factory=RuntimeCapabilities)
     supports_state: bool = True
     supports_mtp: bool = False
 

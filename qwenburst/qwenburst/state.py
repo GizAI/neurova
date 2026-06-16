@@ -34,6 +34,30 @@ class StateSnapshotInfo:
 
 
 @dataclass
+class DecodeStateWriteSnapshot:
+    gdn_states: dict[int, torch.Tensor]
+    gdn_conv_states: dict[int, torch.Tensor]
+    attn_k_rows: dict[int, tuple[list[int], torch.Tensor]]
+    attn_v_rows: dict[int, tuple[list[int], torch.Tensor]]
+    pos: int
+    kv_len: int
+
+    def restore_(self, state: "DecodeState") -> None:
+        for layer, tensor in self.gdn_states.items():
+            state.gdn_states[layer].copy_(tensor)
+        for layer, tensor in self.gdn_conv_states.items():
+            state.gdn_conv_states[layer].copy_(tensor)
+        for layer, (indices, values) in self.attn_k_rows.items():
+            for row, idx in enumerate(indices):
+                state.attn_k[layer][:, idx, :].copy_(values[:, row, :])
+        for layer, (indices, values) in self.attn_v_rows.items():
+            for row, idx in enumerate(indices):
+                state.attn_v[layer][:, idx, :].copy_(values[:, row, :])
+        state.pos = self.pos
+        state.kv_len = self.kv_len
+
+
+@dataclass
 class DecodeState:
     """Runtime state for stateful / streaming text generation.
 
@@ -178,7 +202,7 @@ class DecodeState:
             kv_window_policy=self.kv_window_policy,
         )
 
-    def copy_from_(self, other: "DecodeState") -> None:
+    def copy_from_(self, other: "DecodeState", *, copy_attention: bool = True) -> None:
         """Replace this state with another state under the same allocation contract."""
         if self.max_seq_len != other.max_seq_len or self.kv_window_policy != other.kv_window_policy:
             raise ValueError("cannot copy DecodeState with different KV allocation contract")
@@ -186,12 +210,52 @@ class DecodeState:
             self.gdn_states[k].copy_(v)
         for k, v in other.gdn_conv_states.items():
             self.gdn_conv_states[k].copy_(v)
-        for k, v in other.attn_k.items():
-            self.attn_k[k].copy_(v)
-        for k, v in other.attn_v.items():
-            self.attn_v[k].copy_(v)
+        if copy_attention:
+            for k, v in other.attn_k.items():
+                self.attn_k[k].copy_(v)
+            for k, v in other.attn_v.items():
+                self.attn_v[k].copy_(v)
         self.pos = other.pos
         self.kv_len = other.kv_len
+
+    def speculative_write_snapshot(self, num_tokens: int) -> DecodeStateWriteSnapshot:
+        """Snapshot only state locations a speculative block may overwrite.
+
+        This is the qwenburst analogue of vLLM's lookahead slot safety: a block
+        verifier may write candidate state into live buffers, then either keep it
+        on full accept or restore this snapshot on rejection.
+        """
+        if num_tokens < 0:
+            raise ValueError("num_tokens must be >= 0")
+        indices: list[int] = []
+        for offset in range(num_tokens):
+            logical_pos = self.pos + offset
+            if self.kv_window_policy == "ring":
+                idx = logical_pos % self.max_seq_len
+            elif logical_pos < self.max_seq_len:
+                idx = logical_pos
+            elif self.kv_window_policy == "error":
+                raise RuntimeError(f"attention KV window is full at {self.max_seq_len} tokens")
+            else:
+                # The shift policy mutates the whole cache when full; it is a
+                # correctness fallback, not a safe transactional verifier mode.
+                raise RuntimeError("shift KV policy does not support speculative transaction snapshots")
+            indices.append(idx)
+        unique_indices = list(dict.fromkeys(indices))
+        return DecodeStateWriteSnapshot(
+            gdn_states={k: v.clone() for k, v in self.gdn_states.items()},
+            gdn_conv_states={k: v.clone() for k, v in self.gdn_conv_states.items()},
+            attn_k_rows={
+                layer: (unique_indices, tensor[:, unique_indices, :].detach().clone())
+                for layer, tensor in self.attn_k.items()
+            },
+            attn_v_rows={
+                layer: (unique_indices, tensor[:, unique_indices, :].detach().clone())
+                for layer, tensor in self.attn_v.items()
+            },
+            pos=self.pos,
+            kv_len=self.kv_len,
+        )
 
     def attention_write_index(self) -> int:
         """Return physical KV index for the next token.
@@ -340,3 +404,131 @@ class DecodeState:
                 live = min(v.size(1), state.max_seq_len)
                 state.attn_v[int(k)][:, :live, :].copy_(v[:, :live, :].to(device=device, dtype=dtype))
         return state
+
+
+class DecodeStateArena:
+    """Slot-indexed state pool for vLLM-style batched serving.
+
+    Each request gets a lightweight DecodeState view into contiguous
+    [slot, ...] buffers. Releasing a request resets its slot and returns it to
+    the free list; model code can still consume the standard DecodeState API.
+    """
+
+    def __init__(
+        self,
+        *,
+        cfg: Qwen36_27B_TextConfig,
+        max_seq_len: int,
+        num_slots: int,
+        device: str | torch.device = "cuda",
+        dtype: torch.dtype = torch.float16,
+        kv_window_policy: KVWindowPolicy = "error",
+    ) -> None:
+        if num_slots < 1:
+            raise ValueError("num_slots must be >= 1")
+        if max_seq_len < 1:
+            raise ValueError("max_seq_len must be >= 1")
+        self.cfg = cfg
+        self.max_seq_len = int(max_seq_len)
+        self.num_slots = int(num_slots)
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.kv_window_policy = kv_window_policy
+        conv_dim = (
+            cfg.linear_key_head_dim * cfg.linear_num_key_heads * 2
+            + cfg.linear_value_head_dim * cfg.linear_num_value_heads
+        )
+        self.gdn_states = {
+            layer: torch.zeros(
+                self.num_slots,
+                cfg.linear_num_value_heads,
+                cfg.linear_key_head_dim,
+                cfg.linear_value_head_dim,
+                device=self.device,
+                dtype=dtype,
+            )
+            for layer in cfg.gdn_layers
+        }
+        self.gdn_conv_states = {
+            layer: torch.zeros(
+                self.num_slots,
+                conv_dim,
+                cfg.linear_conv_kernel_dim - 1,
+                device=self.device,
+                dtype=dtype,
+            )
+            for layer in cfg.gdn_layers
+        }
+        self.attn_k = {
+            layer: torch.zeros(
+                self.num_slots,
+                cfg.num_key_value_heads,
+                self.max_seq_len,
+                cfg.attention_head_dim,
+                device=self.device,
+                dtype=dtype,
+            )
+            for layer in cfg.attention_layers
+        }
+        self.attn_v = {layer: torch.zeros_like(self.attn_k[layer]) for layer in cfg.attention_layers}
+        self._free_slots = list(range(self.num_slots - 1, -1, -1))
+        self._active_slots: set[int] = set()
+
+    @property
+    def free_slot_count(self) -> int:
+        return len(self._free_slots)
+
+    @property
+    def active_slot_count(self) -> int:
+        return len(self._active_slots)
+
+    def allocate(self) -> tuple[int, DecodeState]:
+        if not self._free_slots:
+            raise MemoryError("DecodeStateArena exhausted")
+        slot = self._free_slots.pop()
+        self._active_slots.add(slot)
+        self.reset_slot(slot)
+        return slot, self.view(slot)
+
+    def release(self, slot: int) -> None:
+        slot = int(slot)
+        if slot not in self._active_slots:
+            return
+        self.reset_slot(slot)
+        self._active_slots.remove(slot)
+        self._free_slots.append(slot)
+
+    def reset_slot(self, slot: int) -> None:
+        slot = int(slot)
+        for tensor in self.gdn_states.values():
+            tensor[slot].zero_()
+        for tensor in self.gdn_conv_states.values():
+            tensor[slot].zero_()
+        for tensor in self.attn_k.values():
+            tensor[slot].zero_()
+        for tensor in self.attn_v.values():
+            tensor[slot].zero_()
+
+    def view(self, slot: int) -> DecodeState:
+        slot = int(slot)
+        if slot < 0 or slot >= self.num_slots:
+            raise IndexError("DecodeStateArena slot out of range")
+        return DecodeState(
+            cfg=self.cfg,
+            gdn_states={layer: tensor[slot] for layer, tensor in self.gdn_states.items()},
+            gdn_conv_states={layer: tensor[slot] for layer, tensor in self.gdn_conv_states.items()},
+            attn_k={layer: tensor[slot] for layer, tensor in self.attn_k.items()},
+            attn_v={layer: tensor[slot] for layer, tensor in self.attn_v.items()},
+            pos=0,
+            max_seq_len=self.max_seq_len,
+            kv_len=0,
+            kv_window_policy=self.kv_window_policy,
+        )
+
+    def summary(self) -> dict[str, int]:
+        return {
+            "num_slots": self.num_slots,
+            "active_slots": self.active_slot_count,
+            "free_slots": self.free_slot_count,
+            "max_seq_len": self.max_seq_len,
+        }

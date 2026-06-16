@@ -102,6 +102,10 @@ class CPUFallbackOps:
         return (y * torch.nn.functional.silu(z.to(torch.float32))).to(x.dtype)
 
     @staticmethod
+    def silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        return (torch.nn.functional.silu(gate.float()) * up.float()).to(gate.dtype)
+
+    @staticmethod
     def gdn_recurrent(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         qf = q.to(torch.float32)
         kf = k.to(torch.float32)
@@ -139,6 +143,33 @@ class CPUFallbackOps:
         beta = torch.sigmoid(b).to(torch.float16).contiguous()
         g = (-torch.exp(A_log.to(a.device)) * torch.nn.functional.softplus(a.float() + dt_bias.to(a.device))).contiguous()
         return CPUFallbackOps.gdn_recurrent(q, k, v, g, beta, state)
+
+    @staticmethod
+    def gdn_recurrent_ab_scan(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        outs = []
+        for t in range(q.size(0)):
+            outs.append(
+                CPUFallbackOps.gdn_recurrent_ab(
+                    q[t],
+                    k[t],
+                    v[t],
+                    a[t],
+                    b[t],
+                    A_log,
+                    dt_bias,
+                    state,
+                )
+            )
+        return torch.stack(outs, dim=0).contiguous()
 
     @staticmethod
     def depthwise_conv_update(state: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:

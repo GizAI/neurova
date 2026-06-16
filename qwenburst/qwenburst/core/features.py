@@ -11,10 +11,12 @@ KV_POLICIES: tuple[KVPolicy, ...] = ("error", "shift", "ring")
 BOOL_FEATURE_KEYS = (
     "stateful_chat",
     "infinite_streaming",
+    "state_pool",
     "snapshots",
     "episodic_memory",
     "ttt_sidecar",
-    "speculative_mtp",
+    "gpu_sampling",
+    "speculative_decoding",
     "cuda_graph",
     "block_prefill",
 )
@@ -31,11 +33,13 @@ class RuntimeFeatureOverride:
     kv_window_policy: KVPolicy | None = None
     stateful_chat: bool | None = None
     infinite_streaming: bool | None = None
+    state_pool: bool | None = None
     snapshots: bool | None = None
     boundary_decay: float | None = None
     episodic_memory: bool | None = None
     ttt_sidecar: bool | None = None
-    speculative_mtp: bool | None = None
+    gpu_sampling: bool | None = None
+    speculative_decoding: bool | None = None
     cuda_graph: bool | None = None
     block_prefill: bool | None = None
     prefill_chunk_size: int | None = None
@@ -66,11 +70,13 @@ class RuntimeFeatures:
     kv_window_policy: KVPolicy = "ring"
     stateful_chat: bool = True
     infinite_streaming: bool = True
+    state_pool: bool = True
     snapshots: bool = False
     boundary_decay: float = 1.0
     episodic_memory: bool = False
     ttt_sidecar: bool = False
-    speculative_mtp: bool = False
+    gpu_sampling: bool = True
+    speculative_decoding: bool = True
     cuda_graph: bool = False
     block_prefill: bool = True
     prefill_chunk_size: int = 64
@@ -83,11 +89,13 @@ class RuntimeFeatures:
                 kv_window_policy="error",
                 stateful_chat=False,
                 infinite_streaming=False,
+                state_pool=True,
                 snapshots=False,
                 boundary_decay=1.0,
                 episodic_memory=False,
                 ttt_sidecar=False,
-                speculative_mtp=False,
+                gpu_sampling=True,
+                speculative_decoding=False,
                 cuda_graph=False,
                 block_prefill=True,
                 prefill_chunk_size=64,
@@ -100,11 +108,13 @@ class RuntimeFeatures:
                 kv_window_policy="ring",
                 stateful_chat=True,
                 infinite_streaming=True,
+                state_pool=True,
                 snapshots=True,
                 boundary_decay=1.0,
                 episodic_memory=True,
                 ttt_sidecar=True,
-                speculative_mtp=False,
+                gpu_sampling=True,
+                speculative_decoding=True,
                 cuda_graph=False,
                 block_prefill=True,
                 prefill_chunk_size=64,
@@ -118,11 +128,13 @@ class RuntimeFeatures:
         kv_window_policy: KVPolicy | None = None,
         stateful_chat: bool | None = None,
         infinite_streaming: bool | None = None,
+        state_pool: bool | None = None,
         snapshots: bool | None = None,
         boundary_decay: float | None = None,
         episodic_memory: bool | None = None,
         ttt_sidecar: bool | None = None,
-        speculative_mtp: bool | None = None,
+        gpu_sampling: bool | None = None,
+        speculative_decoding: bool | None = None,
         cuda_graph: bool | None = None,
         block_prefill: bool | None = None,
         prefill_chunk_size: int | None = None,
@@ -132,11 +144,13 @@ class RuntimeFeatures:
             "kv_window_policy": kv_window_policy,
             "stateful_chat": stateful_chat,
             "infinite_streaming": infinite_streaming,
+            "state_pool": state_pool,
             "snapshots": snapshots,
             "boundary_decay": boundary_decay,
             "episodic_memory": episodic_memory,
             "ttt_sidecar": ttt_sidecar,
-            "speculative_mtp": speculative_mtp,
+            "gpu_sampling": gpu_sampling,
+            "speculative_decoding": speculative_decoding,
             "cuda_graph": cuda_graph,
             "block_prefill": block_prefill,
             "prefill_chunk_size": prefill_chunk_size,
@@ -154,3 +168,118 @@ class RuntimeFeatures:
 
     def summary(self) -> dict[str, object]:
         return {field.name: getattr(self, field.name) for field in fields(self)}
+
+    def with_overrides_from_mapping(self, data: dict[str, Any]) -> "RuntimeFeatures":
+        return self.with_overrides(RuntimeFeatureOverride.from_mapping(data))
+
+
+@dataclass(frozen=True)
+class RuntimeCapabilities:
+    """Adapter-declared runtime support.
+
+    `RuntimeFeatures` says what a caller requested.  Capabilities say what a
+    model adapter can execute without changing model semantics.  The resolved
+    `RuntimePlan` is the only object downstream orchestration should trust.
+    """
+
+    kv_window_policies: tuple[KVPolicy, ...] = ("error",)
+    stateful_chat: bool = False
+    infinite_streaming: bool = False
+    state_pool: bool = True
+    snapshots: bool = False
+    boundary_decay: bool = False
+    episodic_memory: bool = False
+    ttt_sidecar: bool = False
+    gpu_sampling: bool = True
+    speculative_decoding: bool = True
+    cuda_graph: bool = False
+    block_prefill: bool = True
+    max_concurrency: int = 1
+
+    @classmethod
+    def qwen_hybrid_gdn(cls) -> "RuntimeCapabilities":
+        return cls(
+            kv_window_policies=("error", "shift", "ring"),
+            stateful_chat=True,
+            infinite_streaming=True,
+            state_pool=True,
+            snapshots=True,
+            boundary_decay=True,
+            episodic_memory=True,
+            ttt_sidecar=True,
+            gpu_sampling=True,
+            speculative_decoding=True,
+            cuda_graph=False,
+            block_prefill=True,
+            max_concurrency=1,
+        )
+
+    def summary(self) -> dict[str, object]:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+
+@dataclass(frozen=True)
+class RuntimePlan:
+    """Resolved execution contract for one engine/request."""
+
+    requested: RuntimeFeatures
+    effective: RuntimeFeatures
+    capabilities: RuntimeCapabilities
+    disabled: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    @property
+    def features(self) -> RuntimeFeatures:
+        return self.effective
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "requested": self.requested.summary(),
+            "effective": self.effective.summary(),
+            "capabilities": self.capabilities.summary(),
+            "disabled": list(self.disabled),
+            "notes": list(self.notes),
+        }
+
+
+def resolve_runtime_plan(features: RuntimeFeatures, capabilities: RuntimeCapabilities) -> RuntimePlan:
+    values: dict[str, object] = {}
+    disabled: list[str] = []
+    notes: list[str] = []
+    bool_caps = (
+        "stateful_chat",
+        "infinite_streaming",
+        "state_pool",
+        "snapshots",
+        "episodic_memory",
+        "ttt_sidecar",
+        "gpu_sampling",
+        "speculative_decoding",
+        "cuda_graph",
+        "block_prefill",
+    )
+    for key in bool_caps:
+        requested = bool(getattr(features, key))
+        supported = bool(getattr(capabilities, key))
+        if requested and not supported:
+            values[key] = False
+            disabled.append(key)
+    if features.boundary_decay != 1.0 and not capabilities.boundary_decay:
+        values["boundary_decay"] = 1.0
+        disabled.append("boundary_decay")
+    if features.kv_window_policy not in capabilities.kv_window_policies:
+        if "ring" in capabilities.kv_window_policies:
+            values["kv_window_policy"] = "ring"
+        else:
+            values["kv_window_policy"] = capabilities.kv_window_policies[0]
+        disabled.append("kv_window_policy")
+    effective = features.with_overrides(RuntimeFeatureOverride.from_mapping(values))
+    if disabled:
+        notes.append("unsupported requested features were disabled by adapter capabilities")
+    return RuntimePlan(
+        requested=features,
+        effective=effective,
+        capabilities=capabilities,
+        disabled=tuple(disabled),
+        notes=tuple(notes),
+    )

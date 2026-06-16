@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from qwenburst.loader import LowBitTensor
+from qwenburst.loader import LowBitTensor, MARLIN_DIRECT_MAX_BATCH
 from qwenburst.quantize import quantize_symmetric_lowbit
 
 
@@ -58,3 +58,7 @@ def test_lowbit_tensor_supports_q3_without_model_code_changes():
     y = t.gemv(x)
     assert y.shape == (5,)
     assert torch.isfinite(y.float()).all()
+
+
+def test_marlin_direct_batch_default_matches_t4_gate():
+    assert MARLIN_DIRECT_MAX_BATCH == 4

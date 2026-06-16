@@ -1,13 +1,14 @@
 # QwenBurst
 
-QwenBurst is a low-bit local inference runtime for single-user batch-1 chat on
-16GB RTX 4080/4090-class GPUs. The current champion adapter targets
+QwenBurst is a low-bit local inference runtime for 16GB RTX 4080/4090-class
+GPUs. The current champion adapter targets
 Qwen3.6-27B text inference with flexible groupwise low-bit weights, Qwen Gated
 DeltaNet kernels, ring-KV attention, and streaming decode state.
 
-This is not a general vLLM replacement. The runtime is now split into a common
-`RuntimeEngine` plus model adapters so future Gemma-style targets do not fork
-the server/decode loop. The current canonical adapter contract is:
+This is not yet a general vLLM replacement. The runtime is now split into a
+common `RuntimeEngine`, `EngineManager`, `RequestScheduler`, and model adapters
+so future Gemma-style targets do not fork the server/decode loop. The current
+canonical adapter contract is:
 
 - Adapter: `qwen36`.
 - HF source model: Qwen3.6-27B / Qwen3.5-style text model.
@@ -111,7 +112,7 @@ qwenburst-server \
   --qb-model /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
   --host 0.0.0.0 \
   --port 8008 \
-  --recent-window 256
+  --recent-window 2048
 ```
 
 Smoke:
@@ -124,15 +125,79 @@ curl -sS http://127.0.0.1:8008/v1/chat/completions \
 
 SSE streaming is supported with `"stream": true`.
 
-Inspect enabled runtime features:
+Inspect the resolved runtime plan:
 
 ```bash
 curl http://127.0.0.1:8008/v1/qwenburst/features
 ```
 
-The OpenAI-compatible chat endpoint also accepts per-request runtime overrides
-such as `"runtime_profile": "original"`, `"kv_window_policy": "ring"`,
-`"block_prefill": true`, or `"prefill_chunk_size": 64`.
+The response includes requested features, adapter capabilities, effective
+features, and unsupported fields disabled by `RuntimePlan`. The
+OpenAI-compatible chat endpoint also accepts per-request runtime overrides such
+as `"runtime_profile": "original"`, `"kv_window_policy": "ring"`,
+`"state_pool": true`, `"gpu_sampling": true`, `"block_prefill": true`, or
+`"prefill_chunk_size": 64`.
+`block_prefill` is the default serving path. Its accepted implementation uses
+exact decode semantics internally; faster batched internals must clear final
+logit parity, continuation-state parity, and recall gates before becoming
+default.
+
+Multi-model serving uses a declarative resource file instead of server-side
+branches:
+
+```json
+{
+  "models": [
+    {
+      "model_name": "qwenburst-qwen3.6-27b-q4-marlin",
+      "adapter": "qwen36",
+      "hf_model": "/home/user/models/Qwen3.6-27B",
+      "qb_model": "/home/user/models/Qwen3.6-27B-qb4-marlin-fused",
+      "device": "cuda",
+      "recent_window": 2048,
+      "runtime_profile": "stateful",
+      "estimated_vram_mib": 14000
+    }
+  ]
+}
+```
+
+Run with bounded model residency, bounded request admission, and VRAM reserve:
+
+```bash
+qwenburst-server \
+  --models-json /path/to/qwenburst-models.json \
+  --max-loaded-models 1 \
+  --max-active-requests 1 \
+  --max-queued-requests 2 \
+  --admission-timeout-s 30 \
+  --reserve-free-vram-mib 512 \
+  --max-state-pool-size 1 \
+  --max-prompt-tokens 4096 \
+  --max-generation-tokens 1024
+```
+
+Inspect loaded models, scheduler counters, and CUDA resource state:
+
+```bash
+curl http://127.0.0.1:8008/v1/qwenburst/models
+curl http://127.0.0.1:8008/v1/qwenburst/health
+```
+
+`/v1/qwenburst/health` is the operational endpoint for model load state,
+request admission counters, CUDA memory, and pooled decode-state residency.
+If generation hits CUDA OOM, the server clears the affected model's runtime
+state pool and returns a 503 instead of silently leaving stale pooled state.
+Prompts and generation lengths are admitted before runtime state is allocated;
+oversized requests fail fast instead of pushing a 16GB server into OOM.
+
+Current serving status is intentionally conservative: the server has lazy
+multi-model residency, LRU unload, bounded request admission, and pooled
+DecodeState reuse. It does not claim vLLM-style continuous batching yet; that
+requires a real `forward_batch`/paged-KV executor and must land behind the same
+`EngineManager`/`RequestScheduler` boundary.
+Serving defaults such as recent window, VRAM reserve, state-pool size, prompt
+token limit, and generation token limit live in `qwenburst.core.defaults`.
 
 ## Runtime Tuning
 
@@ -142,6 +207,13 @@ The CUDA extension compiles low-bit GEMV variants once and selects at runtime:
 QWENBURST_LOWBIT_ROWS_PER_CTA=4 qwenburst-chat ...
 QWENBURST_LOWBIT_ROWS_PER_CTA=8 qwenburst-chat ...
 QWENBURST_LOWBIT_ROWS_PER_CTA=16 qwenburst-chat ...
+```
+
+Marlin direct batch defaults to `4` after T=4 state/continuation parity passed.
+Use this only as an emergency bisect override:
+
+```bash
+QWENBURST_MARLIN_DIRECT_MAX_BATCH=1 qwenburst-chat ...
 ```
 
 Benchmark without rebuilding:
@@ -216,7 +288,7 @@ Latest dmc8 result:
 
 Detailed per-change speed history is in `docs/PERFORMANCE_LOG.md`.
 State/runtime feature coverage is in `docs/V05_FEATURE_TEST_MATRIX.md`.
-DFlash-free speculative research is in `docs/SPECULATIVE_RESEARCH.md`.
+Native MTP speculative decoding notes are in `docs/SPECULATIVE_RESEARCH.md`.
 
 Break down decode bottlenecks without changing the serving path:
 
@@ -274,5 +346,10 @@ python -m pytest -q \
 
 The qwenburst kernel path is currently dominated by target-model Marlin
 projection work, especially MLP `gate_up` and `down` projections. Reaching 100
-emitted tok/s requires native MTP/NEXTN with an exact target-compatible accept
-contract, or a deeper fused target layer path that preserves logits.
+emitted tok/s requires a high-acceptance speculative proposer such as native
+MTP/EAGLE/Medusa behind the shared verifier contract, or a deeper fused target
+layer path that preserves logits and state trajectory. Qwen3.6 Native MTP1 is
+implemented as the only built-in proposer because the checkpoint includes MTP
+weights, but it is not the serving default until it shows a repeatable suite
+speed win. Learned external proposers such as EAGLE/Medusa stay gated by the
+same verifier contract.

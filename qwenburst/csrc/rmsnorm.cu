@@ -110,3 +110,34 @@ torch::Tensor rmsnorm_silu_gate(torch::Tensor x, torch::Tensor weight, torch::Te
 torch::Tensor rmsnorm_qwen_silu_gate(torch::Tensor x, torch::Tensor weight, torch::Tensor gate, double eps) {
   return rmsnorm_impl(x, weight, gate, eps, true);
 }
+
+__global__ void silu_mul_kernel(
+    const half* __restrict__ gate,
+    const half* __restrict__ up,
+    half* __restrict__ out,
+    int64_t n) {
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float g = __half2float(gate[i]);
+  float u = __half2float(up[i]);
+  out[i] = __float2half_rn(qb_silu(g) * u);
+}
+
+torch::Tensor silu_mul(torch::Tensor gate, torch::Tensor up) {
+  QB_CHECK_CUDA(gate); QB_CHECK_CUDA(up);
+  QB_CHECK_CONTIGUOUS(gate); QB_CHECK_CONTIGUOUS(up);
+  QB_CHECK_HALF(gate); QB_CHECK_HALF(up);
+  TORCH_CHECK(gate.sizes() == up.sizes(), "silu_mul shape mismatch");
+  auto out = torch::empty_like(gate);
+  const int threads = 256;
+  const int64_t n = gate.numel();
+  const int blocks = static_cast<int>((n + threads - 1) / threads);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  silu_mul_kernel<<<blocks, threads, 0, stream>>>(
+    reinterpret_cast<const half*>(gate.data_ptr<at::Half>()),
+    reinterpret_cast<const half*>(up.data_ptr<at::Half>()),
+    reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+    n);
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
+}

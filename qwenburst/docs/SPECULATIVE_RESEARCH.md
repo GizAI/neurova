@@ -1,227 +1,120 @@
-# Speculative Decoding Research Plan Without DFlash
+# Native MTP Speculative Decoding
 
-QwenBurst no longer carries DFlash runtime code. Future acceleration must keep
-the QwenBurst target model as the verifier and must preserve the target output
-contract.
+QwenBurst uses Qwen3.6 Native MTP as the only built-in speculative decoding
+path.  DFlash and prompt/ngram draft paths are not part of the runtime.
 
-## Non-Negotiable Acceptance Contract
-
-For greedy decoding:
+## Contract
 
 ```text
-accepted speculative tokens == tokens produced by target greedy one-by-one
+draft proposer:
+  may propose future tokens
+  must not mutate live target state
+
+target verifier:
+  verifies candidates with the QwenBurst target path
+  commits only accepted target state
+  never commits rejected candidate state
 ```
 
-For sampled decoding:
+For greedy decoding, speculative output must be byte-identical to target greedy
+one-token decoding.
+
+## Current Implementation
 
 ```text
-accept/reject must preserve the target distribution
+qwenburst.qwen_mtp.QwenNativeMTP1
+  loads mtp.* checkpoint tensors
+  predicts draft tokens from raw target hidden + first greedy token
+  can run a vLLM-style NEXTN loop by feeding each accepted draft token and the
+  previous MTP hidden back through the checkpoint's single native MTP layer
+
+qwenburst.qwen_mtp.QwenNativeMTP1Proposer
+  implements SpeculativeProposer
+  returns DraftProposal(method="native_mtp1", tokens=[...])
+  exposes propose_tensor(...) for the CUDA hot path to avoid candidate CPU sync
+  exposes propose_tensors(...) for max_draft > 1 experiments
+
+RuntimeEngine.generate_ids_native_mtp1_speculative
+  prefill returns logits + raw_hidden
+  samples first token from target logits
+  asks Native MTP/NEXTN for one or more candidates using the current target raw
+  hidden and the first token id, matching vLLM's Qwen3NextMTP shift
+  preserves target logits before running MTP because Marlin lm_head buffers are
+  reused
+  commits the first target token on the live state
+  compares MTP candidates against target argmax tokens in order
+  commits accepted candidates directly on the live target state
+  commits the target-correct token directly on first rejection
+  falls back to plain target decode when recent acceptance is too low
 ```
 
-Any proposed path that cannot prove one of these contracts stays outside the
-champion runtime.
-
-## Candidate Methods
-
-### 1. Native MTP / NEXTN
-
-Qwen3.6 checkpoints contain `mtp.*` weights, but the currently installed
-Transformers `qwen3_next` implementation ignores them:
-
-```text
-_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]
-```
-
-This is still the most promising path because it can avoid a separate draft
-model and may reuse target hidden state. Required work:
-
-```text
-1. Reverse/verify exact MTP computation from checkpoint tensors.
-2. Produce candidate tokens from target hidden state.
-3. Verify with qwenburst target on a forked DecodeState.
-4. Commit only accepted prefix.
-5. Prove greedy parity against one-token target decode.
-```
-
-Status: not enabled.
-
-Current qwenburst implementation:
+Native MTP1 is implemented behind the shared proposer/verifier contract, but it
+is not enabled by default.  The current RTX 4080 / Q4 Marlin measurements show
+identity safety after the verifier clone fix, but not a consistent speed win.
+Enable it explicitly only for experiments:
 
 ```bash
-qwenburst-speculative native-mtp1 \
-  --hf-model /home/user/models/Qwen3.6-27B \
-  --qb-model /home/user/models/Qwen3.6-27B-qb4-marlin-fused \
-  --steps 16
+qwenburst-chat --speculative-decoding on ...
 ```
 
-The probe follows the vLLM Qwen3Next MTP dataflow:
+## Why Only Native MTP
+
+Qwen3.6 includes native MTP weights.  That makes MTP the best first proposer for
+a 27B single-GPU low-VRAM engine because it avoids loading an external draft
+model.  EAGLE and Medusa remain future proposer families, but they must plug
+into the same `SpeculativeProposer` interface and target verifier.
+
+## Gates
+
+Native MTP serving is considered valid only when:
 
 ```text
-norm(next-token embedding), norm(previous hidden)
-→ concat [embedding, hidden]
-→ mtp.fc
-→ one MTP full-attention decoder layer
-→ mtp.norm
-→ target lm_head
+greedy output identity: target-only ids == native-MTP ids
+state safety: draft proposal does not mutate live DecodeState
+rollback safety: rejected candidate state is not committed
+speed: speculative tok/s beats target-only on the measured prompt suite
 ```
 
-The probe is intentionally not wired into serving.  It only becomes eligible
-for runtime integration if:
+Current implementation prioritizes target identity and state safety.  The best
+tested experimental gate is:
 
 ```text
-native_mtp1 accept_rate >= 0.55 on a prompt suite
-target verifier output remains byte-identical to target-only greedy
-accepted tokens reduce target passes enough to beat target-only tok/s
+min_verified: 1
+accept_threshold: 0.70
+max_draft: 1, 2, or 4 as an explicit benchmark axis
 ```
 
-Latest dmc8 probe:
+Latest dmc8 Q4 Marlin fused result:
 
 ```text
-native_mtp1 probe: accepted=15 / total=16, accept_rate=0.938, viable=true
+2026-06-16, 128-token suite, recent_window=2048, after removing candidate CPU
+sync and accept-path fork/copy:
+  identity: true on all prompts
+  sky:        accept_rate 0.909, speedup 1.048
+  math:       accept_rate 0.800, speedup 0.994
+  technical:  accept_rate 0.667, speedup 0.993
+  average speedup: 1.012
+  best tested gate: min_verified=1, accept_threshold=0.70, max_rejections=1
+  decision: default OFF. Keep implementation for research; do not use it as
+            the serving default until the suite shows a larger repeatable win.
 ```
 
-Exact verifier benchmark with prefill included, after adding raw hidden returns
-from `forward_block` and accepted-branch state promotion:
+Latest vLLM-style NEXTN recheck:
 
 ```text
-bench-suite-mtp1 --adaptive --min-verified 2 --accept-threshold 0.8 --recent-window 64
-
-sky 32:
-  target-only: 19.38 tok/s
-  adaptive MTP1: 24.11 tok/s
-  speedup: 1.244
-  identical: true
-  keep: true
-
-math 32:
-  target-only: 18.43 tok/s
-  adaptive MTP1: 18.55 tok/s
-  speedup: 1.006
-  identical: true
-  keep: false
-
-technical 64:
-  target-only: 28.28 tok/s
-  adaptive MTP1: 28.60 tok/s
-  speedup: 1.011
-  identical: true
-  keep: false
-
-summary:
-  all_identical: true
-  avg_speedup: 1.087
+2026-06-16, 128-token suite, recent_window=2048:
+  max_draft=2 average speedup: 1.011, identity true on all prompts
+  max_draft=4 average speedup: 1.010, identity true on all prompts
 ```
 
-Conclusion: native MTP1 can produce real speedup after raw-hidden replay removal,
-but the gain is prompt-dependent. It remains a research/tuning CLI only until a
-larger prompt suite shows no regressions and a consistent speed gate win.
+This is not yet a large speculative win.  More draft tokens alone do not help
+while the target verifier still advances the target model token by token.  The
+next speed work must reduce verifier and proposer overhead without changing the
+vLLM-compatible contract:
 
-### 2. Medusa-Style Heads
-
-Medusa adds multiple decoding heads to predict several future tokens and uses
-tree verification. Medusa-1 can keep the backbone frozen, which is attractive
-for preserving target quality.
-
-Fit for QwenBurst:
-
-```text
-Pros:
-  - no external draft model at runtime
-  - small additional heads
-  - exact target verification possible
-
-Cons:
-  - needs head training or self-distillation
-  - tree verifier still needs block target path for real speed
+1. exact fast raw block verifier with state trajectory parity
+2. target block verifier that commits only the accepted GDN/conv/KV trajectory
+3. lower-overhead MTP lm_head candidate selection
+4. verifier CUDA Graph only after shapes are static
+5. larger prompt suite before increasing default draft length
 ```
-
-Recommended experiment:
-
-```text
-train small heads on frozen hidden states
-verify top candidate chain with qwenburst forward_block/fork
-measure accepted tokens per target pass
-```
-
-### 3. EAGLE-Style Feature Drafter
-
-EAGLE drafts at the second-to-top feature level and then verifies with the
-target model. It is attractive because feature dynamics can be easier than
-token dynamics.
-
-Fit for QwenBurst:
-
-```text
-Pros:
-  - potentially higher acceptance than token-only small heads
-  - can preserve output distribution with verification
-
-Cons:
-  - requires reliable hidden-state taps
-  - needs a trained feature extrapolator
-  - qwenburst must expose exact hidden states cheaply
-```
-
-Recommended experiment:
-
-```text
-collect final/near-final hidden taps from qwenburst
-train tiny feature predictor
-project through lm_head for candidates
-verify exact target prefix before commit
-```
-
-### 4. Lookahead / Jacobi Decoding
-
-Lookahead decoding can be exact and does not require a draft model, but it
-trades extra parallel target computation for fewer sequential steps.
-
-Fit for QwenBurst:
-
-```text
-Pros:
-  - no extra model weights
-  - exact target-compatible direction
-
-Cons:
-  - qwenburst is batch-1 and Marlin projection dominated
-  - recurrent GDN state makes parallel candidate state handling harder
-  - likely needs true block verifier before it helps
-```
-
-Recommended status: research-only until `forward_block` is a real fast block
-verifier.
-
-## Current Ranking
-
-```text
-1. Native MTP/NEXTN using existing checkpoint tensors, only if exact verifier speed clears the gate
-2. Medusa-style frozen-backbone heads
-3. EAGLE-style feature drafter
-4. Lookahead/Jacobi exact decoding
-```
-
-## First Implementation Target
-
-Do not start with CUDA Graph or lm_head top-k. The current profiler says MLP
-Marlin projection dominates. A useful speculative path must reduce target
-passes per emitted token.
-
-Minimal proof:
-
-```text
-prompt set: 50 deterministic greedy prompts
-baseline: qwenburst one-token target decode
-candidate path: MTP/Medusa/EAGLE candidates + exact target verify
-pass condition:
-  token sequence identical for all prompts
-  DecodeState hash identical after generation
-  accepted_tokens_per_target_pass >= 1.8
-```
-
-Only after this proof should CUDA/block verifier optimization be attached.
-
-Current adaptive `native_mtp1` is promising but not yet a default runtime path.
-The next useful work item is a larger prompt suite and reducing verifier fork
-cost; CUDA Graph should attach only after the exact verifier path is consistently
-speed-positive.

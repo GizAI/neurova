@@ -51,3 +51,55 @@ def test_depthwise_conv_update_scan_matches_single_token_loop():
 
     assert torch.equal(y_scan, y_loop)
     assert torch.equal(state_scan, state_loop)
+
+
+def test_gdn_recurrent_ab_scan_matches_single_token_loop():
+    import qwenburst_cuda
+
+    torch.manual_seed(0)
+    tokens = 5
+    kv_heads = 4
+    v_heads = 8
+    head_dim = 128
+    q = (torch.randn(tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    k = (torch.randn(tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    v = (torch.randn(tokens, v_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    a = (torch.randn(tokens, v_heads, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    b = (torch.randn(tokens, v_heads, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    a_log = (torch.randn(v_heads, device="cuda", dtype=torch.float32) * 0.01 - 1.0).contiguous()
+    dt_bias = (torch.randn(v_heads, device="cuda", dtype=torch.float32) * 0.01).contiguous()
+    state_loop = (torch.randn(v_heads, head_dim, head_dim, device="cuda", dtype=torch.float16) * 0.01).contiguous()
+    state_scan = state_loop.clone()
+
+    loop_rows = []
+    for t in range(tokens):
+        loop_rows.append(
+            qwenburst_cuda.gdn_recurrent_ab(
+                q[t],
+                k[t],
+                v[t],
+                a[t],
+                b[t],
+                a_log,
+                dt_bias,
+                state_loop,
+            )
+        )
+    y_loop = torch.stack(loop_rows, dim=0)
+    y_scan = qwenburst_cuda.gdn_recurrent_ab_scan(q, k, v, a, b, a_log, dt_bias, state_scan)
+    torch.cuda.synchronize()
+
+    assert torch.equal(y_scan, y_loop)
+    assert torch.equal(state_scan, state_loop)
+
+
+def test_silu_mul_cuda_matches_torch():
+    import qwenburst_cuda
+
+    torch.manual_seed(0)
+    gate = torch.randn(4096, device="cuda", dtype=torch.float16)
+    up = torch.randn(4096, device="cuda", dtype=torch.float16)
+    y = qwenburst_cuda.silu_mul(gate.contiguous(), up.contiguous())
+    ref = (torch.nn.functional.silu(gate.float()) * up.float()).half()
+    torch.cuda.synchronize()
+    assert torch.allclose(y, ref, atol=2e-3, rtol=2e-3)

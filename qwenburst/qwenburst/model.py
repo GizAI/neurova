@@ -10,7 +10,7 @@ from .config import Qwen36_27B_TextConfig
 from .loader import QuantizedStore, LowBitTensor, LowBitMarlinTensor, FP16Tensor
 from .ops import cuda_ops
 from .state import DecodeState
-from .tuning import lowbit_rows_per_cta
+from .tuning import fast_raw_block_enabled, lowbit_rows_per_cta
 
 TensorLike = LowBitTensor | LowBitMarlinTensor | FP16Tensor
 
@@ -21,6 +21,15 @@ class BlockForwardResult:
     hidden_taps: list[list[torch.Tensor]]
     state: DecodeState
     raw_hiddens: list[torch.Tensor]
+    final_hiddens: list[torch.Tensor] | None = None
+
+
+@dataclass
+class VerifyBlockResult:
+    target_ids: torch.Tensor
+    logits: torch.Tensor
+    hidden: torch.Tensor
+    state: DecodeState
 
 
 class WeightResolver:
@@ -161,14 +170,27 @@ def embed_lookup(w: TensorLike, token: torch.Tensor) -> torch.Tensor:
     return w.value[token.long()].reshape(-1)
 
 
+def embed_lookup_batch(w: TensorLike, tokens: torch.Tensor, device: torch.device) -> torch.Tensor:
+    tokens = tokens.to(device=device, dtype=torch.long).reshape(-1)
+    if isinstance(w, FP16Tensor):
+        return w.value.to(device=device)[tokens].contiguous()
+    return torch.stack([embed_lookup(w, token).to(device=device, non_blocking=True) for token in tokens], dim=0).contiguous()
+
+
 def qwen_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return cuda_ops().rmsnorm_qwen(x.contiguous(), weight.to(device=x.device, dtype=x.dtype).contiguous(), eps)
 
 
-def qwen_rmsnorm_torch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    x32 = x.to(torch.float32)
-    y = x32 * torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps)
-    return (y * (1.0 + weight.to(device=x.device, dtype=torch.float32))).to(x.dtype)
+def qwen_rmsnorm_lastdim(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Apply Qwen RMSNorm over the last dimension using the common op path."""
+    shape = x.shape
+    hidden = shape[-1]
+    y = cuda_ops().rmsnorm_qwen(
+        x.reshape(-1, hidden).contiguous(),
+        weight.to(device=x.device, dtype=x.dtype).contiguous(),
+        eps,
+    )
+    return y.reshape(shape).contiguous()
 
 
 def qwen_gdn_norm_silu_gate(core: torch.Tensor, weight: torch.Tensor, z: torch.Tensor, eps: float) -> torch.Tensor:
@@ -220,6 +242,12 @@ def gdn_norm_silu_gate_2d(core: torch.Tensor, weight: torch.Tensor, z: torch.Ten
         z.reshape(-1, hidden).contiguous(),
         eps,
     ).reshape_as(core)
+
+
+def silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    if gate.device.type == "cuda" and gate.dtype == torch.float16 and up.dtype == torch.float16:
+        return cuda_ops().silu_mul(gate.contiguous(), up.contiguous())
+    return (F.silu(gate.float()) * up.float()).to(gate.dtype)
 
 
 def apply_rope_single_token(q: torch.Tensor, k: torch.Tensor, *, pos: int, rope_dim: int, rope_theta: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -394,7 +422,7 @@ class QwenBurstMLP:
         else:
             gate = linear_any(self.gate, x)
             up = linear_any(self.up, x)
-        return linear_any(self.down, F.silu(gate) * up)
+        return linear_any(self.down, silu_mul(gate, up))
 
     def forward_block(self, x: torch.Tensor) -> torch.Tensor:
         if self.gate_up is not None:
@@ -403,7 +431,7 @@ class QwenBurstMLP:
         else:
             gate = linear_any(self.gate, x)
             up = linear_any(self.up, x)
-        return linear_any(self.down, F.silu(gate) * up)
+        return linear_any(self.down, silu_mul(gate, up))
 
 
 class QwenBurstGDNLayer:
@@ -544,30 +572,100 @@ class QwenBurstGDNLayer:
 
     def forward_block(self, x: torch.Tensor, state: DecodeState) -> torch.Tensor:
         ops = cuda_ops()
-        residual = x
-        x = qwen_rmsnorm(x.contiguous(), self.input_norm, self.cfg.rms_norm_eps)
-        q, k, v, z, b, a = self.project_block(x)
-        conv_in = torch.cat([q.reshape(x.size(0), -1), k.reshape(x.size(0), -1), v.reshape(x.size(0), -1)], dim=-1).contiguous()
-        conv_out = depthwise_conv_update_block(state.gdn_conv_states[self.layer], conv_in, self.conv_weight, self.conv_bias)
+        residual = x.contiguous()
+        h = qwen_rmsnorm(residual, self.input_norm, self.cfg.rms_norm_eps)
+        q, k, v, z, b, a = self.project_block(h)
+        conv_in = torch.cat(
+            [
+                q.reshape(x.size(0), -1),
+                k.reshape(x.size(0), -1),
+                v.reshape(x.size(0), -1),
+            ],
+            dim=-1,
+        ).contiguous()
+        conv_out = depthwise_conv_update_block(
+            state.gdn_conv_states[self.layer],
+            conv_in,
+            self.conv_weight,
+            self.conv_bias,
+        )
         key_dim = self.cfg.linear_key_head_dim * self.cfg.linear_num_key_heads
         value_dim = self.cfg.linear_value_head_dim * self.cfg.linear_num_value_heads
         q2, k2, v2 = torch.split(conv_out, [key_dim, key_dim, value_dim], dim=-1)
         q = q2.view(x.size(0), self.cfg.linear_num_key_heads, self.cfg.linear_key_head_dim).contiguous()
         k = k2.view_as(q).contiguous()
         v = v2.view(x.size(0), self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim).contiguous()
-        beta = torch.sigmoid(b).to(torch.float16).contiguous()
-        g = (-torch.exp(self.A_log.to(a.device))[None, :] * F.softplus(a.float() + self.dt_bias.to(a.device)[None, :])).contiguous()
-        core = ops.gdn_recurrent_scan(q, k, v, g, beta, state.gdn_states[self.layer])
+        core = ops.gdn_recurrent_ab_scan(
+            q,
+            k,
+            v,
+            a.to(device=x.device, dtype=torch.float16).contiguous(),
+            b.to(device=x.device, dtype=torch.float16).contiguous(),
+            self.A_log,
+            self.dt_bias,
+            state.gdn_states[self.layer],
+        )
         core_norm = gdn_norm_silu_gate_2d(
             core.reshape(x.size(0), -1),
             self.gdn_norm_w,
             z.reshape(x.size(0), -1),
             self.cfg.rms_norm_eps,
         )
-        x = residual + linear_any(self.out_proj, core_norm)
-        residual = x
-        x = qwen_rmsnorm(x.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
-        return residual + self.mlp.forward_block(x)
+        h = residual + linear_any(self.out_proj, core_norm)
+        residual = h
+        h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+        return residual + self.mlp.forward_block(h)
+
+    def forward_decode_batch(self, x: torch.Tensor, states: Sequence[DecodeState]) -> torch.Tensor:
+        if x.ndim != 2 or x.size(0) != len(states):
+            raise ValueError("decode batch input must be [batch, hidden] and match states")
+        ops = cuda_ops()
+        residual = x.contiguous()
+        h = qwen_rmsnorm(residual, self.input_norm, self.cfg.rms_norm_eps)
+        q, k, v, z, b, a = self.project_block(h)
+        conv_rows = []
+        key_dim = self.cfg.linear_key_head_dim * self.cfg.linear_num_key_heads
+        value_dim = self.cfg.linear_value_head_dim * self.cfg.linear_num_value_heads
+        for row, state in enumerate(states):
+            conv_in = torch.cat(
+                [
+                    q[row].reshape(-1),
+                    k[row].reshape(-1),
+                    v[row].reshape(-1),
+                ],
+                dim=0,
+            ).contiguous()
+            conv_rows.append(depthwise_conv_update(state.gdn_conv_states[self.layer], conv_in, self.conv_weight, self.conv_bias))
+        conv_out = torch.stack(conv_rows, dim=0).contiguous()
+        q2, k2, v2 = torch.split(conv_out, [key_dim, key_dim, value_dim], dim=-1)
+        q = q2.view(x.size(0), self.cfg.linear_num_key_heads, self.cfg.linear_key_head_dim).contiguous()
+        k = k2.view_as(q).contiguous()
+        v = v2.view(x.size(0), self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim).contiguous()
+        core_rows = []
+        for row, state in enumerate(states):
+            core_rows.append(
+                ops.gdn_recurrent_ab(
+                    q[row],
+                    k[row],
+                    v[row],
+                    a[row].to(device=x.device, dtype=torch.float16).contiguous(),
+                    b[row].to(device=x.device, dtype=torch.float16).contiguous(),
+                    self.A_log,
+                    self.dt_bias,
+                    state.gdn_states[self.layer],
+                )
+            )
+        core = torch.stack(core_rows, dim=0).contiguous()
+        core_norm = gdn_norm_silu_gate_2d(
+            core.reshape(x.size(0), -1),
+            self.gdn_norm_w,
+            z.reshape(x.size(0), -1),
+            self.cfg.rms_norm_eps,
+        )
+        h = residual + linear_any(self.out_proj, core_norm)
+        residual = h
+        h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+        return residual + self.mlp.forward_block(h)
 
 
 class QwenBurstAttentionLayer:
@@ -614,9 +712,9 @@ class QwenBurstAttentionLayer:
         v = v_all.view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
 
         if self.q_norm is not None:
-            q = qwen_rmsnorm_torch(q, self.q_norm, self.cfg.rms_norm_eps)
+            q = qwen_rmsnorm_lastdim(q, self.q_norm, self.cfg.rms_norm_eps)
         if self.k_norm is not None:
-            k = qwen_rmsnorm_torch(k, self.k_norm, self.cfg.rms_norm_eps)
+            k = qwen_rmsnorm_lastdim(k, self.k_norm, self.cfg.rms_norm_eps)
         q, k = apply_rope_single_token(q, k, pos=state.pos, rope_dim=self.cfg.rope_dim, rope_theta=self.cfg.rope_theta)
 
         state.append_attention_kv(self.layer, k.contiguous(), v.contiguous())
@@ -632,7 +730,6 @@ class QwenBurstAttentionLayer:
         return residual + self.mlp(x)
 
     def forward_block(self, x: torch.Tensor, state: DecodeState, *, base_pos: int, base_kv_len: int) -> torch.Tensor:
-        ops = cuda_ops()
         residual = x.contiguous()
         h = qwen_rmsnorm(residual, self.input_norm, self.cfg.rms_norm_eps)
         if self.qkv_proj is not None:
@@ -657,64 +754,80 @@ class QwenBurstAttentionLayer:
         k = k_all.view(x.size(0), self.cfg.num_key_value_heads, self.cfg.attention_head_dim).contiguous()
         v = v_all.view(x.size(0), self.cfg.num_key_value_heads, self.cfg.attention_head_dim).contiguous()
         if self.q_norm is not None:
-            q = qwen_rmsnorm_torch(q, self.q_norm, self.cfg.rms_norm_eps).contiguous()
+            q = qwen_rmsnorm_lastdim(q, self.q_norm, self.cfg.rms_norm_eps)
         if self.k_norm is not None:
-            k = qwen_rmsnorm_torch(k, self.k_norm, self.cfg.rms_norm_eps).contiguous()
-        q, k = apply_rope_block(
-            q,
-            k,
-            start_pos=base_pos,
-            rope_dim=self.cfg.rope_dim,
-            rope_theta=self.cfg.rope_theta,
-        )
-
-        live_total = base_kv_len + x.size(0)
-        can_bulk_attention = (
-            base_pos == base_kv_len
-            and live_total <= state.max_seq_len
-            and (state.kv_window_policy != "ring" or base_pos + x.size(0) <= state.max_seq_len)
-        )
-        if can_bulk_attention:
-            state.attn_k[self.layer][:, base_pos : base_pos + x.size(0), :].copy_(k.permute(1, 0, 2).contiguous())
-            state.attn_v[self.layer][:, base_pos : base_pos + x.size(0), :].copy_(v.permute(1, 0, 2).contiguous())
-            k_all = state.attn_k[self.layer][:, :live_total, :]
-            v_all = state.attn_v[self.layer][:, :live_total, :]
-            head_ratio = self.cfg.num_attention_heads // self.cfg.num_key_value_heads
-            if head_ratio != 1:
-                k_all = k_all.repeat_interleave(head_ratio, dim=0).contiguous()
-                v_all = v_all.repeat_interleave(head_ratio, dim=0).contiguous()
-            q_att = q.permute(1, 0, 2).unsqueeze(0).contiguous()
-            k_att = k_all.unsqueeze(0).contiguous()
-            v_att = v_all.unsqueeze(0).contiguous()
-            col = torch.arange(live_total, device=x.device)
-            row_limit = base_kv_len + torch.arange(x.size(0), device=x.device)
-            mask = col.unsqueeze(0) <= row_limit.unsqueeze(1)
-            att = F.scaled_dot_product_attention(
-                q_att,
-                k_att,
-                v_att,
-                attn_mask=mask.unsqueeze(0).unsqueeze(0),
-                dropout_p=0.0,
-                scale=self.cfg.attention_head_dim ** -0.5,
-            )
-            att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
-            if gate_flat is not None:
-                att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
-            h = residual + linear_any(self.o_proj, att_block)
-            residual = h
-            h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
-            return residual + self.mlp.forward_block(h)
+            k = qwen_rmsnorm_lastdim(k, self.k_norm, self.cfg.rms_norm_eps)
 
         att_rows = []
         for offset in range(x.size(0)):
             logical_pos = base_pos + offset
             live_len = min(base_kv_len + offset + 1, state.max_seq_len)
-            state.append_attention_kv_at(self.layer, k[offset], v[offset], logical_pos=logical_pos)
+            q_row, k_row = apply_rope_single_token(
+                q[offset],
+                k[offset],
+                pos=logical_pos,
+                rope_dim=self.cfg.rope_dim,
+                rope_theta=self.cfg.rope_theta,
+            )
+            state.append_attention_kv_at(self.layer, k_row.contiguous(), v[offset], logical_pos=logical_pos)
             k_cache, v_cache, length = state.attention_kv_view_at(self.layer, logical_pos=logical_pos, live_len=live_len)
-            att = attention_decode_any(q[offset], k_cache, v_cache, length, self.cfg.attention_head_dim ** -0.5)
+            att = attention_decode_any(q_row.contiguous(), k_cache, v_cache, length, self.cfg.attention_head_dim ** -0.5)
             att_flat = att.reshape(-1).contiguous()
             if gate_flat is not None:
                 att_flat = att_flat * torch.sigmoid(gate_flat[offset].to(att_flat.dtype))
+            att_rows.append(att_flat)
+        att_block = torch.stack(att_rows, dim=0).contiguous()
+        h = residual + linear_any(self.o_proj, att_block)
+        residual = h
+        h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+        return residual + self.mlp.forward_block(h)
+
+    def forward_decode_batch(self, x: torch.Tensor, states: Sequence[DecodeState]) -> torch.Tensor:
+        if x.ndim != 2 or x.size(0) != len(states):
+            raise ValueError("decode batch input must be [batch, hidden] and match states")
+        residual = x.contiguous()
+        h = qwen_rmsnorm(residual, self.input_norm, self.cfg.rms_norm_eps)
+        if self.qkv_proj is not None:
+            qkv_all = linear_any(self.qkv_proj, h)
+            kv_rows = self.cfg.num_key_value_heads * self.cfg.attention_head_dim
+            q_all, k_all, v_all = torch.split(qkv_all, [self.qkv_q_rows, kv_rows, kv_rows], dim=-1)
+        else:
+            q_all = linear_any(self.q_proj, h)  # type: ignore[arg-type]
+            k_all = linear_any(self.k_proj, h)  # type: ignore[arg-type]
+            v_all = linear_any(self.v_proj, h)  # type: ignore[arg-type]
+
+        q_dim = self.cfg.num_attention_heads * self.cfg.attention_head_dim
+        gate_flat: torch.Tensor | None
+        if q_all.size(-1) == q_dim * 2:
+            q_heads = q_all.view(x.size(0), self.cfg.num_attention_heads, self.cfg.attention_head_dim * 2)
+            q, gate = torch.chunk(q_heads, 2, dim=-1)
+            q = q.contiguous()
+            gate_flat = gate.reshape(x.size(0), -1).contiguous()
+        else:
+            q = q_all.view(x.size(0), self.cfg.num_attention_heads, self.cfg.attention_head_dim).contiguous()
+            gate_flat = None
+        k = k_all.view(x.size(0), self.cfg.num_key_value_heads, self.cfg.attention_head_dim).contiguous()
+        v = v_all.view(x.size(0), self.cfg.num_key_value_heads, self.cfg.attention_head_dim).contiguous()
+        if self.q_norm is not None:
+            q = qwen_rmsnorm_lastdim(q, self.q_norm, self.cfg.rms_norm_eps)
+        if self.k_norm is not None:
+            k = qwen_rmsnorm_lastdim(k, self.k_norm, self.cfg.rms_norm_eps)
+
+        att_rows = []
+        for row, state in enumerate(states):
+            q_row, k_row = apply_rope_single_token(
+                q[row],
+                k[row],
+                pos=state.pos,
+                rope_dim=self.cfg.rope_dim,
+                rope_theta=self.cfg.rope_theta,
+            )
+            state.append_attention_kv(self.layer, k_row.contiguous(), v[row].contiguous())
+            k_cache, v_cache, length = state.attention_kv_view(self.layer)
+            att = attention_decode_any(q_row.contiguous(), k_cache, v_cache, length, self.cfg.attention_head_dim ** -0.5)
+            att_flat = att.reshape(-1).contiguous()
+            if gate_flat is not None:
+                att_flat = att_flat * torch.sigmoid(gate_flat[row].to(att_flat.dtype))
             att_rows.append(att_flat)
         att_block = torch.stack(att_rows, dim=0).contiguous()
         h = residual + linear_any(self.o_proj, att_block)
@@ -829,18 +942,171 @@ class QwenBurstModel:
         logits_mode: Literal["all", "last"] = "all",
         commit: bool = False,
     ) -> BlockForwardResult:
-        """Run a raw target block on a branch or directly on the provided state."""
+        """Run a target block and commit only the requested state branch."""
+        if fast_raw_block_enabled():
+            branch = state if commit else state.fork()
+            result = self._forward_block_raw(
+                tokens,
+                branch,
+                hidden_tap_layers=hidden_tap_layers,
+                return_logits=return_logits,
+                logits_mode=logits_mode,
+            )
+            if commit and branch is not state:
+                state.copy_from_(branch)
+            return result
         branch = state if commit else state.fork()
-        result = self._forward_block_raw(
-            tokens,
-            branch,
-            hidden_tap_layers=hidden_tap_layers,
-            return_logits=return_logits,
-            logits_mode=logits_mode,
+        logits_out: list[torch.Tensor] = []
+        raw_hiddens: list[torch.Tensor] = []
+        final_hiddens: list[torch.Tensor] = []
+        taps_by_token: list[list[torch.Tensor]] = []
+        token_list = [int(t) for t in tokens]
+        for i, token in enumerate(token_list):
+            want_logits = return_logits and (logits_mode == "all" or i == len(token_list) - 1)
+            result_one = self.forward_one(
+                token,
+                branch,
+                return_logits=want_logits,
+                return_hidden=True,
+                return_raw_hidden=True,
+                hidden_tap_layers=hidden_tap_layers,
+            )
+            if hidden_tap_layers is None:
+                logits, raw_hidden = result_one
+                taps: list[torch.Tensor] = []
+            else:
+                logits, raw_hidden, taps = result_one
+            if want_logits:
+                logits_out.append(logits.contiguous().clone())
+            raw_hiddens.append(raw_hidden.contiguous().clone())
+            final_hiddens.append(qwen_rmsnorm(raw_hidden.contiguous(), self.final_norm, self.cfg.rms_norm_eps).contiguous().clone())
+            taps_by_token.append(taps)
+        result = BlockForwardResult(
+            logits=logits_out,
+            hidden_taps=taps_by_token,
+            state=branch,
+            raw_hiddens=raw_hiddens,
+            final_hiddens=final_hiddens,
         )
         if commit and branch is not state:
             state.copy_from_(branch)
         return result
+
+    @torch.no_grad()
+    def forward_batch(
+        self,
+        plan: object,
+        states: Sequence[DecodeState],
+        *,
+        return_logits: bool = True,
+    ) -> list[torch.Tensor | None]:
+        """Execute a multi-request decode batch plan.
+
+        The public contract mirrors vLLM's model runner: request scheduling is
+        represented by one batch plan, while each row owns independent state.
+        Rows use the block path so chunked prefill and spec-verify spans avoid
+        token-by-token Python loops inside RuntimeEngine.
+        """
+
+        num_requests = int(getattr(plan, "num_requests"))
+        if len(states) != num_requests:
+            raise ValueError("states length must match plan.num_requests")
+        row_spans = getattr(plan, "row_spans", None)
+        draft_counts = getattr(plan, "num_draft_tokens_per_request", [0] * num_requests)
+        if return_logits and row_spans is not None and all((end - start) == 1 for start, end in row_spans) and all(int(v) == 0 for v in draft_counts):
+            return self._forward_single_token_batch(getattr(plan, "input_ids"), row_spans, states)
+        input_ids = getattr(plan, "input_ids")
+        outputs: list[torch.Tensor | None] = []
+        for row, state in enumerate(states):
+            if row_spans is not None:
+                start, end = row_spans[row]
+            else:
+                query_start_loc = getattr(plan, "query_start_loc")
+                start = int(query_start_loc[row].detach().cpu().item())
+                end = int(query_start_loc[row + 1].detach().cpu().item())
+            token_list = [int(t) for t in input_ids[start:end].detach().cpu().tolist()]
+            if not token_list:
+                outputs.append(None)
+                continue
+            if len(token_list) == 1:
+                logits = self.forward_one(token_list[0], state, return_logits=return_logits)
+                outputs.append(logits if return_logits else None)
+                continue
+            result = self.forward_block(
+                token_list,
+                state,
+                return_logits=return_logits,
+                logits_mode="last",
+                commit=True,
+            )
+            outputs.append(result.logits[-1] if return_logits and result.logits else None)
+        return outputs
+
+    @torch.no_grad()
+    def forward_batch_logits(
+        self,
+        plan: object,
+        states: Sequence[DecodeState],
+    ) -> list[list[torch.Tensor]]:
+        num_requests = int(getattr(plan, "num_requests"))
+        if len(states) != num_requests:
+            raise ValueError("states length must match plan.num_requests")
+        row_spans = getattr(plan, "row_spans", None)
+        draft_counts = getattr(plan, "num_draft_tokens_per_request")
+        if row_spans is not None and all((end - start) == 1 for start, end in row_spans) and all(int(v) == 0 for v in draft_counts):
+            return [[logit] for logit in self._forward_single_token_batch(getattr(plan, "input_ids"), row_spans, states)]
+        input_ids = getattr(plan, "input_ids")
+        outputs: list[list[torch.Tensor]] = []
+        for row, state in enumerate(states):
+            if row_spans is not None:
+                start, end = row_spans[row]
+            else:
+                query_start_loc = getattr(plan, "query_start_loc")
+                start = int(query_start_loc[row].detach().cpu().item())
+                end = int(query_start_loc[row + 1].detach().cpu().item())
+            token_list = [int(t) for t in input_ids[start:end].detach().cpu().tolist()]
+            if not token_list:
+                outputs.append([])
+                continue
+            logits_mode: Literal["all", "last"] = "all" if int(draft_counts[row]) > 0 else "last"
+            if len(token_list) == 1:
+                logits = self.forward_one(token_list[0], state, return_logits=True)
+                outputs.append([logits])
+                continue
+            result = self.forward_block(
+                token_list,
+                state,
+                return_logits=True,
+                logits_mode=logits_mode,
+                commit=True,
+            )
+            outputs.append([logit for logit in result.logits])
+        return outputs
+
+    @torch.no_grad()
+    def _forward_single_token_batch(
+        self,
+        input_ids: torch.Tensor,
+        row_spans: Sequence[tuple[int, int]],
+        states: Sequence[DecodeState],
+    ) -> list[torch.Tensor]:
+        if len(row_spans) != len(states):
+            raise ValueError("row_spans length must match states")
+        token_indices = [start for start, end in row_spans if end - start == 1]
+        if len(token_indices) != len(states):
+            raise ValueError("single-token batch path requires exactly one token per row")
+        token_tensor = input_ids[token_indices].to(device=self.device, dtype=torch.long)
+        x = embed_lookup_batch(self.embed, token_tensor, self.device)
+        for layer in self.layers:
+            forward_decode_batch = getattr(layer, "forward_decode_batch", None)
+            if not callable(forward_decode_batch):
+                raise RuntimeError(f"layer {type(layer).__name__} does not support decode batching")
+            x = forward_decode_batch(x, states)
+        for state in states:
+            state.finish_token()
+        h = qwen_rmsnorm(x.contiguous(), self.final_norm, self.cfg.rms_norm_eps)
+        logits = linear_any(self.lm_head, h)
+        return [row.contiguous() for row in logits]
 
     @torch.no_grad()
     def _forward_block_raw(
@@ -854,7 +1120,7 @@ class QwenBurstModel:
     ) -> BlockForwardResult:
         token_list = [int(t) for t in tokens]
         if not token_list:
-            return BlockForwardResult(logits=[], hidden_taps=[], state=state, raw_hiddens=[])
+            return BlockForwardResult(logits=[], hidden_taps=[], state=state, raw_hiddens=[], final_hiddens=[])
         token_tensor = torch.tensor(token_list, device=self.device, dtype=torch.long)
         x = torch.stack([embed_lookup(self.embed, tid).to(self.device, non_blocking=True) for tid in token_tensor], dim=0).contiguous()
         tap_set = set(hidden_tap_layers or ())
@@ -871,19 +1137,92 @@ class QwenBurstModel:
                     taps_by_token[i].append(x[i].detach())
         for _ in token_list:
             state.finish_token()
-        raw_hiddens = [row.contiguous() for row in x]
+        raw_hiddens = [row.contiguous().clone() for row in x]
+        final_hiddens: list[torch.Tensor] = []
         logits_out: list[torch.Tensor] = []
         if return_logits:
             if logits_mode == "last":
                 h = qwen_rmsnorm(x[-1].contiguous(), self.final_norm, self.cfg.rms_norm_eps)
-                logits_out = [linear_any(self.lm_head, h).contiguous()]
+                final_hiddens = [qwen_rmsnorm(row.contiguous(), self.final_norm, self.cfg.rms_norm_eps).contiguous().clone() for row in x]
+                logits_out = [linear_any(self.lm_head, h).contiguous().clone()]
             else:
                 h = qwen_rmsnorm(x.contiguous(), self.final_norm, self.cfg.rms_norm_eps)
+                final_hiddens = [row.contiguous().clone() for row in h]
                 logits = linear_any(self.lm_head, h)
-                logits_out = [row.contiguous() for row in logits]
+                logits_out = [row.contiguous().clone() for row in logits]
+        else:
+            final_hiddens = [qwen_rmsnorm(row.contiguous(), self.final_norm, self.cfg.rms_norm_eps).contiguous().clone() for row in x]
         return BlockForwardResult(
             logits=logits_out,
             hidden_taps=taps_by_token,
             state=state,
             raw_hiddens=raw_hiddens,
+            final_hiddens=final_hiddens,
+        )
+
+    @torch.no_grad()
+    def forward_verify_block(
+        self,
+        tokens: Sequence[int],
+        state: DecodeState,
+        *,
+        num_candidates: int,
+    ) -> VerifyBlockResult:
+        """Run a speculative target block without materializing every logits row.
+
+        The verifier needs argmax IDs for candidate positions and full logits
+        only for the continuation after the final accepted token. Keeping every
+        248K-vocab row as a Python list is substantially slower than vLLM-style
+        rejection metadata, so this path stores scalar target IDs for checks.
+        """
+        token_list = [int(t) for t in tokens]
+        if not token_list:
+            raise ValueError("verify block requires at least one token")
+        if num_candidates < 0 or num_candidates >= len(token_list):
+            raise ValueError("num_candidates must be in [0, len(tokens) - 1]")
+        if fast_raw_block_enabled() and len(token_list) > 1:
+            result = self._forward_block_raw(
+                token_list,
+                state,
+                hidden_tap_layers=None,
+                return_logits=True,
+                logits_mode="all",
+            )
+            if len(result.logits) < len(token_list):
+                raise RuntimeError("raw verify block did not return all logits")
+            target_ids = torch.empty((num_candidates,), device=self.device, dtype=torch.long)
+            for i in range(num_candidates):
+                logits_i = result.logits[i]
+                if logits_i.device.type == "cuda":
+                    target_ids[i] = cuda_ops().argmax(logits_i.contiguous()).reshape(())
+                else:
+                    target_ids[i] = torch.argmax(logits_i, dim=-1).reshape(())
+            hidden = result.final_hiddens[-1] if result.final_hiddens else result.raw_hiddens[-1]
+            return VerifyBlockResult(
+                target_ids=target_ids,
+                logits=result.logits[-1],
+                hidden=hidden,
+                state=state,
+            )
+        target_ids = torch.empty((num_candidates,), device=self.device, dtype=torch.long)
+        logits: torch.Tensor | None = None
+        hidden: torch.Tensor | None = None
+        for i, token in enumerate(token_list):
+            logits, hidden = self.forward_one(
+                token,
+                state,
+                return_hidden=True,
+                return_raw_hidden=False,
+            )
+            if i < num_candidates:
+                if logits.device.type == "cuda":
+                    target_ids[i] = cuda_ops().argmax(logits.contiguous()).reshape(())
+                else:
+                    target_ids[i] = torch.argmax(logits, dim=-1).reshape(())
+        assert logits is not None and hidden is not None
+        return VerifyBlockResult(
+            target_ids=target_ids,
+            logits=logits,
+            hidden=hidden,
+            state=state,
         )

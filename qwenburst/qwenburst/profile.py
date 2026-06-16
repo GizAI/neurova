@@ -218,14 +218,20 @@ def main() -> None:
             assert prefill_next is not None
             next_token = prefill_next
             out = []
-            for _ in range(args.max_new_tokens):
+            for i in range(args.max_new_tokens):
                 out.append(next_token)
+                if i == args.max_new_tokens - 1:
+                    break
                 logits = engine.forward_one(next_token, state, return_logits=True)
                 next_token = sample_next_tensor(logits, cfg)
         if torch.cuda.is_available() and str(args.device).startswith("cuda"):
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
-    print(f"generated={len(out)} elapsed_s={elapsed:.3f} tok_s={len(out)/max(elapsed, 1e-9):.2f}")
+    print(
+        f"prompt_tokens={len(prompt_ids)} generated={len(out)} "
+        f"max_new_tokens={args.max_new_tokens} include_prefill={args.include_prefill} "
+        f"elapsed_s={elapsed:.3f} tok_s={len(out)/max(elapsed, 1e-9):.2f}"
+    )
     print("category,calls,total_ms,avg_us,max_us,pct_measured")
     rows = profiler.table()
     total = sum(row[2] for row in rows) or 1.0

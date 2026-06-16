@@ -8,7 +8,7 @@ import torch
 
 from ..config import Qwen36_27B_TextConfig
 from ..core.adapter import AdapterDescriptor, adapter_registry
-from ..core.features import RuntimeFeatures
+from ..core.features import RuntimeCapabilities, RuntimeFeatures
 from ..loader import QuantizedStore
 from ..model import QwenBurstModel
 from ..state import DecodeState
@@ -45,6 +45,7 @@ class Qwen36Adapter:
         adapter_id="qwen36",
         family="qwen3.6-hybrid-gdn",
         default_model_name="qwenburst-qwen3.6-27b-q4-marlin",
+        capabilities=RuntimeCapabilities.qwen_hybrid_gdn(),
         supports_state=True,
         supports_mtp=False,
     )

@@ -34,6 +34,7 @@ qwenburst-speculative = "qwenburst.speculative:main"
 qwenburst-graph-audit = "qwenburst.graph:main"
 qwenburst-profile = "qwenburst.profile:main"
 qwenburst-bench-profiles = "qwenburst.bench_profiles:main"
+qwenburst-correctness = "qwenburst.correctness:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

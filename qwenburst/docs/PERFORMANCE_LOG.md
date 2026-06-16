@@ -1,5 +1,263 @@
 # QwenBurst Performance Log
 
+## 2026-06-16 vLLM MTP Comparison and Verifier Contract
+
+Current accepted conclusion:
+
+```text
+fast raw block:
+  default off.
+  final-logit parity was not enough; real-model state parity still showed
+  GDN/conv/KV differences and speculative technical output drift.
+  keep QWENBURST_FAST_RAW_BLOCK=1 only as an explicit research override.
+
+speculative decoding:
+  default off.
+  Native MTP1 remains the only built-in proposer, but the latest measured
+  suite is not speed-positive enough for serving default.
+  prompt-lookup/n-gram has been removed from the runtime path.
+
+EAGLE / Medusa:
+  future proposer implementations behind the same verifier interface.
+  not default until they show sequence identity, state identity, and a measured
+  speed win on a prompt suite.
+```
+
+Follow-up vLLM gap check:
+
+```text
+vLLM Qwen3NextMTP pattern:
+  - MTP layer is a real full_attention decoder layer.
+  - Draft prefill/decode keeps draft hidden state and slot mappings.
+  - Multi-step speed comes from target block verification, not from MTP1 alone.
+
+QwenBurst measured limit:
+  - MTP proposer cost: about 1.76 ms.
+  - Target step cost: about 24.1 ms.
+  - Exact MTP1 still needs the same target forward count as greedy decode.
+  - Therefore exact MTP1 cannot produce a large speedup without a target block
+    verifier.
+
+Fast raw verifier experiment with QWENBURST_FAST_RAW_BLOCK=1:
+  sky 128:       target 41.16 tok/s, rawspec 44.88 tok/s, speedup 1.09, identical true
+  technical 128: target 41.38 tok/s, rawspec 40.41 tok/s, speedup 0.98, identical true
+  interpretation: this is the right direction for vLLM-like speed, but it is
+  prompt-dependent and still lacks full state trajectory parity.
+
+Kernel/primitive checks:
+  - depthwise_conv_update_scan matches the single-token loop.
+  - gdn_recurrent_ab_scan now has a CUDA parity test against the single-token
+    loop.
+  - Real-model GDN block still differs slightly because block projection and
+    layer composition are not exactly the same state trajectory as token-loop
+    target decode.
+```
+
+vLLM comparison pass:
+
+```text
+source checked: /tmp/vllm-qwen-mtp, latest main fast-forwarded on 2026-06-16
+relevant pattern:
+  - Qwen3Next MTP uses current target hidden + sampled first token.
+  - Speculative proposer avoids prompt-history reconstruction.
+  - Hot candidate path should not preserve full vocab logits when only argmax is needed.
+
+QwenBurst fixes kept:
+  - Native MTP proposer now receives empty history because it only consumes model signals.
+  - MTP candidate argmax no longer clones the full 248K-vocab lm_head output.
+  - Verifier logits/raw_hidden are cloned because Marlin lm_head reuses output
+    buffers; without this, rejected candidates corrupted target-second checks.
+  - q/k RMSNorm now goes through the shared CUDA RMSNorm path instead of ad hoc
+    torch ops.
+  - Verifier now commits the first target token on the live state, compares the
+    MTP candidate to the target second-token argmax, and commits the accepted or
+    corrected second token directly on the live target state. This removes the
+    accepted-path fork/copy and candidate CPU sync.
+
+QwenBurst fix rejected:
+  - Reusing one branch DecodeState was measured and removed. It was no faster
+    because copy_from_ still copies the full GDN/conv state every speculative step.
+  - Fast raw block as speculative verifier. It is not lossless yet.
+
+Latest dmc8 128-token suite after kept fixes:
+  sky:        speedup 1.048, accept_rate 0.909, identical true
+  math:       speedup 0.994, accept_rate 0.800, identical true
+  technical:  speedup 0.993, accept_rate 0.667, identical true
+  average speedup: 1.012
+  policy sweep best: min_verified=1, accept_threshold=0.70, max_rejections=1
+  decision: default OFF; keep as research path until the gain is larger than
+            measurement noise on a broader prompt suite.
+```
+
+Native NEXTN follow-up after matching vLLM's recurrent MTP proposer loop:
+
+```text
+implementation:
+  - QwenNativeMTP1.argmax_sequence now reuses the checkpoint's single MTP layer
+    for multiple draft steps, matching vLLM's Qwen3NextMTP decode pattern.
+  - RuntimeEngine and qwenburst.speculative now share the same max_draft
+    candidate loop.
+  - n-gram/prompt lookup remains absent from the runtime path.
+
+dmc8, Qwen3.6-27B-qb4-marlin-fused, recent_window=2048, 128-token suite:
+
+max_draft=2 adaptive min_verified=1 accept_threshold=0.70:
+  sky:        target 33.67 tok/s, speculative 35.21 tok/s, speedup 1.046, accept 0.500, identical true
+  math:       target 32.55 tok/s, speculative 32.34 tok/s, speedup 0.993, accept 0.667, identical true
+  technical:  target 35.35 tok/s, speculative 35.11 tok/s, speedup 0.993, accept 0.667, identical true
+  average speedup: 1.011
+
+max_draft=4 adaptive min_verified=1 accept_threshold=0.70:
+  sky:        target 33.63 tok/s, speculative 35.14 tok/s, speedup 1.045, accept 0.500, identical true
+  math:       target 32.49 tok/s, speculative 32.20 tok/s, speedup 0.991, accept 0.857, identical true
+  technical:  target 35.29 tok/s, speculative 35.04 tok/s, speedup 0.993, accept 0.667, identical true
+  average speedup: 1.010
+
+decision:
+  keep Native NEXTN as an explicit experimental path only.
+  Do not default-enable it: exact output identity is preserved, but the measured
+  speed win is still measurement-noise sized because qwenburst target
+  verification still performs token-by-token target forwards.
+
+next real speed boundary:
+  vLLM's proposer loop is not enough. The missing piece is a state-safe target
+  block verifier with commit-able per-token GDN/conv/KV trajectory, so accepted
+  speculative tokens reduce target work instead of only adding MTP proposal
+  overhead.
+```
+
+Latest dmc8 fast raw block parity gate after adding gdn_recurrent_ab_scan:
+
+```text
+QWENBURST_FAST_RAW_BLOCK=1
+input_tokens=88
+argmax_match=true
+max_abs_logit_diff=0.0
+mean_abs_logit_diff=0.0
+pos_match=true
+kv_len_match=true
+gdn_state_max_abs_diff=0.017456 to 0.033325
+conv_state_max_abs_diff=0.109375 to 0.131836
+attention_kv_max_abs_diff=1.092529 to 2.088379
+continuation_argmax_match=true
+continuation_max_abs_logit_diff=0.0
+```
+
+Interpretation: fast raw block still needs full state trajectory parity before
+it can be a default path.  The fused `gdn_recurrent_ab_scan` reduced one known
+source of mismatch but did not complete the fix.
+
+Removed prompt-lookup check that motivated the native-MTP-only policy:
+
+```text
+normal explanation prompt, 96 generated tokens:
+  speculative off: 30.09 tok/s
+  speculative on:  30.11 tok/s
+  output: identical
+
+repeated pattern prompt, 72 generated tokens:
+  speculative off: 20.81 tok/s
+  speculative on:  20.78 tok/s
+  output: identical
+```
+
+Conclusion: prompt-lookup speculation was correct but not useful enough for
+this Qwen3.6 runtime, so it was removed instead of kept as a parallel path.
+
+Speculative research basis from current literature:
+
+```text
+EAGLE-3 is the highest-priority learned proposer family.
+MTP is attractive when the target checkpoint has native heads.
+N-gram/prompt lookup is not part of qwenburst's Qwen3.6 runtime path.
+All proposers must share the verifier/commit interface.
+```
+
+## 2026-06-16 Runtime Plan and Fast-Block Audit
+
+Architecture cleanup:
+
+- Added `RuntimeCapabilities` and `RuntimePlan`.
+- `RuntimeFeatures` now represents requested behavior only.
+- `RuntimePlan` resolves requested features against adapter-declared
+  capabilities before runtime/server/bench code uses them.
+- `/v1/qwenburst/features` now reports the execution plan rather than only raw
+  requested defaults.
+
+Earlier audit conclusion before the full state/continuation parity gate:
+
+```text
+fast raw block:
+  keep as a research/internal path.
+  do not promote from final-logit parity alone.
+  it needs state trajectory + continuation parity.
+
+batched Marlin:
+  keep as a layer-level [T, D] primitive candidate.
+  do not use as an lm_head/verifier shortcut.
+  enable larger M only after continuation-state parity.
+
+current default:
+  Q4 Marlin target-only.
+  public block prefill API with exact state updates.
+```
+
+Regression shield added:
+
+```text
+qwenburst-correctness --require-block-prefill-parity
+  now compares continuation logits after prefill, not only final prefill logits.
+```
+
+Accepted micro-optimization:
+
+```text
+Removed unnecessary Marlin output-buffer zeroing.
+Correctness gate passed.
+Same include-prefill profile row:
+  before: 2.464s, 6.49 generated tok/s
+  after:  2.399s, 6.67 generated tok/s
+  gain:   about 2.7%
+```
+
+Rejected/default-off during audit:
+
+```text
+fast raw block with batched Marlin:
+  final prompt logits matched on a short parity row,
+  but long continuation recall failed on filler32 UUID.
+  not default.
+```
+
+Latest accepted-path profile, same include-prefill prompt:
+
+```text
+generated=16 elapsed_s=2.435 tok_s=6.57
+mlp_gate_up:      36.95%
+mlp_down:         16.86%
+gdn_qkvz:         12.06%
+gdn_out:           8.97%
+rmsnorm:           5.60%
+gdn_norm_gate:     4.17%
+attn_qkv:          3.55%
+gdn_recurrent:     3.11%
+attn_o:            3.00%
+gdn_conv:          2.83%
+attention_decode:  1.54%
+lm_head:           1.16%
+```
+
+Interpretation:
+
+```text
+single-request tok/s:
+  dominated by layer projections, especially MLP and GDN projections.
+
+multi-user throughput:
+  next architecture layer is request scheduling + paged/ring KV resource
+  management, not more server-side branching.
+```
+
 This document records measured speed changes for the QwenBurst Qwen3.6-27B
 runtime on `ml-dmc8` RTX 4080 16GB. Only end-to-end generated-token speed is
 counted unless explicitly marked as profiler data.
@@ -23,7 +281,10 @@ Important interpretation rules:
   `qwenburst.generate --stats`.
 - Output sanity was checked on every accepted benchmark row. UTF-8 and natural
   English generation remained valid.
-- Native MTP/NEXTN is not enabled. Current speed is pure target-model speed.
+- Historical rows in this section predate the current default-off Native MTP1
+  decision. Treat them as
+  pure target-model speed unless a row explicitly says speculative decoding is
+  enabled.
 
 ## Improvement Timeline
 
@@ -201,7 +462,7 @@ decode was healthy.
 Change:
 
 - Added `RuntimeFeatures.block_prefill` and `prefill_chunk_size`.
-- Enabled block prefill in `original`, `stateful`, and `research` profiles.
+- Added block prefill as the default runtime switch.
 - Routed runtime prefill through chunked `model.forward_block(..., commit=True)`.
 - Added `logits_mode="last"` so the final chunk computes the giant vocabulary
   projection only for the last prefill token.
@@ -319,6 +580,76 @@ input_tokens=4984:
 
 This replaces the earlier live-server long-context row where 4962 input tokens
 plus an 82-token response took 245.003s on the old token-loop prefill process.
+
+Correctness status update:
+
+```text
+The original fast block internals were not accepted:
+  1. batched Marlin M>1 projection was not deterministic on dmc8;
+  2. the vectorized block path did not match token-loop logits.
+
+Block prefill remains enabled as the public/default API, but it now uses exact
+single-token decode semantics internally. LowBitMarlinTensor.gemm also routes
+M>1 calls through repeated stable M=1 Marlin calls until a batched kernel passes
+repeated logits parity.
+
+Accepted dmc8 gate:
+
+qwenburst-correctness --require-block-prefill-parity
+  ok=true
+  input_tokens=270
+  token_loop_argmax=41874
+  block_prefill_argmax=41874
+  max_abs_logit_diff=0.0
+  exact recall filler0/filler8 passed
+```
+
+Current accepted speed after the correctness fix:
+
+```text
+input_tokens=20, generated=32:
+  elapsed_s=1.499
+  generated_tok_s_full=21.35
+  total_tok_s=34.70
+
+input_tokens=76, generated=32:
+  elapsed_s=2.653
+  generated_tok_s_full=12.06
+  total_tok_s=40.71
+```
+
+Historical rejected/default-off acceleration candidates checked after that fix:
+
+```text
+native MTP1 adaptive suite:
+  sky:       speedup 1.146, keep true
+  math:      speedup 0.929, keep false
+  technical: speedup 0.956, keep false
+  avg_speedup 1.010, all_identical true
+Historical decision: keep that earlier path as research CLI only. This was
+superseded by later default-off Native MTP1 measurements.
+
+CUDA Graph static audit:
+  graph_ready=false
+  blockers: Python pos/kv_len counters, Python ring-KV logical view, Python state mutation.
+Decision: not default.
+
+FlashInfer:
+  not installed in qwenburst16g-cu130.
+Decision: not default.
+
+FP8:
+  torch FP8 dtypes available, but no KV/GDN parity path yet.
+Decision: not default.
+```
+
+Accepted stability change:
+
+```text
+RuntimeEngine now reuses a single pooled DecodeState per feature contract for
+server completion paths. This reduces repeated 8192-window state allocation and
+fragmentation risk without changing logits.
+```
 
 ### 9. Long-KV Decode SDPA Path
 
@@ -512,9 +843,9 @@ average speedup: 1.087
 all outputs identical: true
 ```
 
-Therefore MTP is still not enabled in the default champion server path. It is
-kept as an explicit research/tuning CLI because the gain is prompt-dependent.
-The acceptance and speed criteria for default MTP serving are:
+Historical decision at that point: MTP was not enabled in the default champion
+server path because the gain was prompt-dependent. Later measurements kept
+Native MTP1 default-off. The acceptance and speed criteria remain:
 
 ```text
 candidate tokens must match target greedy tokens exactly before state commit
@@ -691,15 +1022,319 @@ P3: GraphDecodeState and CUDA Graph only after P1/P2 has a speed-positive path
 
 ## Long-Context Prefill Status
 
-The old OpenWebUI row with 4962 input tokens in 245.003s is obsolete. It measured
-the removed token-loop prefill path. Current chunked block prefill is the
-accepted baseline.
+The old OpenWebUI row with 4962 input tokens in 245.003s is obsolete as a speed
+target. Current correctness baseline is block prefill with exact decode
+semantics.
 
 Current remaining long-context issue:
 
 ```text
-prefill is now about 1.1K tokens/s on 2K-6K prompts.
-decode-only after 6.6K live KV is about 40 tok/s.
-full generated-token tok/s falls on long prompts because prefill wall time is
-included in the end-to-end denominator.
+experimental batched-Marlin block prefill measured about 1.1K tokens/s on 2K-6K prompts.
+decode-only after 6.6K live KV measured about 40 tok/s.
+these rows are not default-serving claims after the M>1 Marlin correctness fix;
+fresh speed rows are required.
+```
+
+## 2026-06-16 Runtime Loop Cleanup
+
+Change:
+
+```text
+generate_ids / generate_ids_greedy_gpu:
+  stop computing the unused next-token logits after the last emitted token.
+
+profile manual decode loop:
+  same fix, so profiler call counts match emitted-token semantics.
+
+RuntimeEngine:
+  cache forward_block capability inspection at engine construction instead of
+  calling inspect.signature during every prefill.
+```
+
+Correctness:
+
+```text
+local targeted:
+  17 passed in 0.73s
+
+dmc8 targeted:
+  17 passed in 1.01s
+```
+
+dmc8 Q4 Marlin target-only actual generation:
+
+```text
+prompt:
+  "Write a concise technical note about quantized LLM inference."
+
+settings:
+  QWENBURST_LOWBIT_ROWS_PER_CTA=8
+  runtime_profile=stateful
+  weight_device=cuda
+  recent_window=256
+  max_new_tokens=256
+  temperature=0
+
+result:
+  generated=256
+  elapsed=7.243s
+  tok/s=35.34
+  output sanity: normal English technical note
+```
+
+Short decode bottleneck profile after the loop cleanup:
+
+```text
+prompt_tokens=24 generated=64 max_new_tokens=64 include_prefill=False
+elapsed_s=2.702 tok_s=23.68
+
+category            calls   total_ms   avg_us   pct_measured
+mlp_gate_up          4032    658.052   163.21   36.12
+mlp_down             4032    302.112    74.93   16.58
+gdn_qkvz             3024    214.607    70.97   11.78
+gdn_out              3024    156.594    51.78    8.60
+rmsnorm              8127     99.007    12.18    5.43
+gdn_norm_gate        3024     71.576    23.67    3.93
+attn_qkv             1008     63.534    63.03    3.49
+lm_head                63     62.472   991.63    3.43
+gdn_recurrent        3024     55.217    18.26    3.03
+attn_o               1008     53.420    53.00    2.93
+gdn_conv             3024     42.994    14.22    2.36
+attention_decode     1008     41.859    41.53    2.30
+```
+
+Interpretation:
+
+```text
+The cleanup removes pure wasted work and improves short-generation fairness.
+For long fixed-length generations the speed impact is bounded to roughly one
+target forward per request, so the 256-token tok/s stays near the previous
+champion range.
+
+The next material optimization is still not lm_head or sampling. The largest
+wall is MLP/GDN projection work, especially mlp_gate_up + mlp_down.
+```
+
+## 2026-06-16 MLP Activation Fusion And MTP Gate Recheck
+
+Change:
+
+```text
+Added qwenburst_cuda.silu_mul(gate, up):
+  fused FP16 SiLU(gate) * up for MLP activation.
+
+QwenBurstMLP:
+  uses silu_mul instead of torch F.silu(gate) * up when CUDA FP16 is available.
+
+SpeculativeBenchmarkResult.keep:
+  now requires identical output, speedup > 1.03, and accept_rate > 0.
+  This prevents noisy adaptive fallback rows from being marked as keep.
+```
+
+Build / correctness:
+
+```text
+dmc8 build:
+  CUDA 13 nvcc from nvidia/cu13 package was required.
+  System /usr/bin/nvcc is CUDA 12.0 and mismatches torch CUDA 13.0.
+
+dmc8 CUDA targeted:
+  tests/test_v05_cuda_kernels.py: 5 passed in 1.21s
+
+local CPU targeted:
+  18 passed in 0.80s
+```
+
+dmc8 actual generation after `silu_mul`:
+
+```text
+same 256-token technical-note prompt:
+  before: 35.34 tok/s
+  after:  35.54 tok/s
+  gain:   about 0.6%
+  output sanity: normal English technical note
+```
+
+Decode profile after `silu_mul`:
+
+```text
+prompt_tokens=24 generated=64 max_new_tokens=64 include_prefill=False
+elapsed_s=2.658 tok_s=24.08
+
+category            calls   total_ms   avg_us   pct_measured
+mlp_gate_up          4032    658.157   163.23   36.55
+mlp_down             4032    302.242    74.96   16.78
+gdn_qkvz             3024    214.339    70.88   11.90
+gdn_out              3024    156.026    51.60    8.66
+rmsnorm              8127     97.799    12.03    5.43
+gdn_norm_gate        3024     71.745    23.73    3.98
+attn_qkv             1008     63.557    63.05    3.53
+lm_head                63     62.384   990.22    3.46
+gdn_recurrent        3024     55.072    18.21    3.06
+attn_o               1008     53.522    53.10    2.97
+attention_decode     1008     41.926    41.59    2.33
+gdn_conv             3024     23.719     7.84    1.32
+```
+
+Interpretation:
+
+```text
+silu_mul is a small positive cleanup, not a main 100 tok/s lever.
+The projection wall remains unchanged: mlp_gate_up + mlp_down + gdn_qkvz + gdn_out.
+```
+
+Historical Native MTP1 adaptive recheck before the vLLM-shift, Marlin aliasing,
+state-copy, and GDN block-scan fixes:
+
+```text
+bench-suite-mtp1 --adaptive --min-verified 2 --accept-threshold 0.8
+
+sky:
+  target 21.10 tok/s, speculative 22.97 tok/s, speedup 1.089,
+  accept_rate 0.000, identical true
+
+math:
+  target 19.79 tok/s, speculative 18.58 tok/s, speedup 0.939,
+  accept_rate 0.000, identical true
+
+technical:
+  target 30.64 tok/s, speculative 29.07 tok/s, speedup 0.949,
+  accept_rate 0.000, identical true
+
+summary:
+  avg_speedup 0.992
+```
+
+Historical decision at that point:
+
+```text
+Do not enable that earlier MTP1 path in serving.
+This result has been superseded by the current Native MTP1 default described at
+the top of this file and in SPECULATIVE_RESEARCH.md.
+```
+
+## 2026-06-16 Batched Marlin T=4 Gate
+
+Context:
+
+```text
+fast raw block and batched Marlin are still required for a real verifier, but
+they must be gated by state trajectory parity, not final logits only.
+
+The current accepted public forward_block still uses exact sequential state
+updates. This section only changes the Marlin direct batch limit used by
+accepted block prefill attention/MLP projections.
+```
+
+Marlin micro correctness:
+
+```text
+lowbit_marlin_gemm direct M=1:  rel=0.000350 pass
+lowbit_marlin_gemm direct M=2:  rel=0.000334 pass
+lowbit_marlin_gemm direct M=4:  rel=0.000347 pass
+lowbit_marlin_gemm direct M=8:  rel=0.000342 pass
+lowbit_marlin_gemm direct M=16: rel=0.000344 pass
+```
+
+Model-level strengthened parity:
+
+```text
+QWENBURST_MARLIN_DIRECT_MAX_BATCH=4
+prefill_chunk_size=4
+input_tokens=88
+
+ok=true
+argmax_match=true
+max_abs_logit_diff=0.0
+pos_match=true
+kv_len_match=true
+gdn_state_max_abs_diff=0.0
+conv_state_max_abs_diff=0.0
+attention_kv_max_abs_diff=0.0
+continuation_argmax_match=true
+continuation_max_abs_logit_diff=0.0
+recall filler0 passed
+```
+
+Long-ish prompt include-prefill comparison:
+
+```text
+prompt_tokens=3618
+generated=64
+prefill_chunk_size=4
+
+direct_max_batch=1:
+  elapsed=92.818s
+  tok/s=0.69
+
+direct_max_batch=4:
+  elapsed=91.844s
+  tok/s=0.70
+
+gain:
+  about 1.1% wall-clock on this long prompt
+```
+
+Decision:
+
+```text
+Set QWENBURST_MARLIN_DIRECT_MAX_BATCH default to 4.
+It is a small but state-parity-positive improvement and remains overridable by
+environment variable if a future checkpoint exposes a regression.
+```
+
+## 2026-06-16 Serving Resource Boundary Cleanup
+
+Accepted structural changes:
+
+```text
+EngineResourcePolicy.max_state_pool_size:
+  host-level cap for retained DecodeState objects.
+
+RuntimeEngine.state_pool_summary:
+  exposes pooled-state residency without endpoint-specific introspection.
+
+EngineManager.health:
+  one operational status payload for model states, scheduler counters, CUDA
+  resource state, and pooled-state residency.
+
+EngineManager.validate_generation_request:
+  rejects over-limit prompt and generation requests before DecodeState
+  allocation or CUDA work starts.
+
+server OOM handling:
+  CUDA OOM during generation clears the affected model runtime pool and returns
+  503 instead of leaving stale pooled state resident.
+```
+
+Performance interpretation:
+
+```text
+This is not a tok/s optimization and does not change logits math.
+It is kept because it removes a real serving failure mode on 16GB GPUs:
+oversized requests, request-scoped state allocation, and stale pooled state
+after OOM.
+```
+
+Targeted verification:
+
+```text
+pytest -q qwenburst/tests/test_adapter_runtime_cpu.py \
+          qwenburst/tests/test_engine_manager_cpu.py \
+          qwenburst/tests/test_server_config_cpu.py \
+          qwenburst/tests/test_scheduler_cpu.py
+
+21 passed in 1.00s
+```
+
+Default decision:
+
+```text
+Keep state pooling on with max_state_pool_size=1.
+Keep server default recent_window=2048 via qwenburst.core.defaults.
+Keep max_prompt_tokens=4096 and max_generation_tokens=1024 as admission
+defaults for 16GB serving; larger context should be an explicit operator choice.
+Keep request admission conservative.
+Do not claim continuous batching until a real forward_batch/paged-KV executor
+exists and shows measured throughput benefit.
 ```

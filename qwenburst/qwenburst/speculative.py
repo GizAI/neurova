@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -11,131 +10,11 @@ import torch
 from .adapters import Qwen36Adapter
 from .core.adapter import adapter_registry
 from .core.runtime import GenerationConfig, RuntimeEngine, sample_next_tensor
-from .loader import FP16Tensor, QuantizedStore
-from .model import (
-    QwenBurstMLP,
-    QwenBurstModel,
-    WeightResolver,
-    apply_rope_single_token,
-    embed_lookup,
-    linear_any,
-    qwen_rmsnorm,
-    qwen_rmsnorm_torch,
-)
-
-
-@dataclass(frozen=True)
-class SpeculativeProbeResult:
-    method: str
-    total: int
-    accepted: int
-    min_accept_rate: float
-
-    @property
-    def accept_rate(self) -> float:
-        return self.accepted / self.total if self.total else 0.0
-
-    @property
-    def viable(self) -> bool:
-        return self.total > 0 and self.accept_rate >= self.min_accept_rate
-
-
-@dataclass(frozen=True)
-class SpeculativeBenchmarkResult:
-    method: str
-    tokens: int
-    target_seconds: float
-    speculative_seconds: float
-    accepted_second_tokens: int
-    verified_steps: int
-    identical: bool
-
-    @property
-    def target_tok_s(self) -> float:
-        return self.tokens / self.target_seconds if self.target_seconds > 0 else 0.0
-
-    @property
-    def speculative_tok_s(self) -> float:
-        return self.tokens / self.speculative_seconds if self.speculative_seconds > 0 else 0.0
-
-    @property
-    def speedup(self) -> float:
-        return self.speculative_tok_s / self.target_tok_s if self.target_tok_s > 0 else 0.0
-
-    @property
-    def accept_rate(self) -> float:
-        return self.accepted_second_tokens / self.verified_steps if self.verified_steps else 0.0
-
-    @property
-    def keep(self) -> bool:
-        return self.identical and self.speedup > 1.03
-
-
-class QwenNativeMTP1:
-    """Qwen3.6 native MTP1 candidate generator.
-
-    This is intentionally research-only until acceptance is high enough.  It
-    follows the vLLM Qwen3Next MTP dataflow: normalize next-token embedding and
-    previous hidden state, concatenate `[embedding, hidden]`, project through
-    `mtp.fc`, run the single MTP full-attention layer, then project with the
-    target lm_head.
-    """
-
-    def __init__(self, model: QwenBurstModel, store: QuantizedStore):
-        self.model = model
-        self.cfg = model.cfg
-        self.device = model.device
-        wr = WeightResolver(store)
-        self.pre_fc_norm_embedding = wr.fp16("mtp.pre_fc_norm_embedding.weight").to(self.device, dtype=torch.float16).contiguous()
-        self.pre_fc_norm_hidden = wr.fp16("mtp.pre_fc_norm_hidden.weight").to(self.device, dtype=torch.float16).contiguous()
-        self.fc = wr.get("mtp.fc.weight")
-        if not isinstance(self.fc, FP16Tensor):
-            raise TypeError("mtp.fc.weight must be fp16_raw for native MTP probing")
-        self.input_norm = wr.fp16("mtp.layers.0.input_layernorm.weight").to(self.device, dtype=torch.float16).contiguous()
-        self.post_norm = wr.fp16("mtp.layers.0.post_attention_layernorm.weight").to(self.device, dtype=torch.float16).contiguous()
-        self.qkv_proj = wr.any_linear("mtp.layers.0.self_attn.qkv_proj.weight")
-        self.o_proj = wr.any_linear("mtp.layers.0.self_attn.o_proj.weight")
-        self.q_norm = wr.fp16("mtp.layers.0.self_attn.q_norm.weight").to(self.device, dtype=torch.float16).contiguous()
-        self.k_norm = wr.fp16("mtp.layers.0.self_attn.k_norm.weight").to(self.device, dtype=torch.float16).contiguous()
-        self.mlp = QwenBurstMLP(self.cfg, wr, prefix="mtp.layers.0")
-        self.norm = wr.fp16("mtp.norm.weight").to(self.device, dtype=torch.float16).contiguous()
-        kv_rows = self.cfg.num_key_value_heads * self.cfg.attention_head_dim
-        self.qkv_q_rows = self.cfg.num_attention_heads * self.cfg.attention_head_dim * 2
-        self.qkv_split = (self.qkv_q_rows, kv_rows, kv_rows)
-
-    def _single_token_decoder_layer(self, x: torch.Tensor, *, pos: int) -> torch.Tensor:
-        residual = x
-        h = qwen_rmsnorm(x.contiguous(), self.input_norm, self.cfg.rms_norm_eps)
-        qkv_all = linear_any(self.qkv_proj, h)
-        q_all, k_all, v_all = torch.split(qkv_all, self.qkv_split, dim=0)
-        q_heads = q_all.view(self.cfg.num_attention_heads, self.cfg.attention_head_dim * 2)
-        q, gate = torch.chunk(q_heads, 2, dim=-1)
-        k = k_all.view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
-        v = v_all.view(self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
-        q = qwen_rmsnorm_torch(q.contiguous(), self.q_norm, self.cfg.rms_norm_eps)
-        k = qwen_rmsnorm_torch(k.contiguous(), self.k_norm, self.cfg.rms_norm_eps)
-        q, k = apply_rope_single_token(q, k, pos=pos, rope_dim=self.cfg.rope_dim, rope_theta=self.cfg.rope_theta)
-
-        # Research approximation: no MTP KV cache is committed here.  The target
-        # model remains the only verifier/committer.
-        ratio = self.cfg.num_attention_heads // self.cfg.num_key_value_heads
-        att = v.repeat_interleave(ratio, dim=0)
-        att_flat = (att.reshape(-1) * torch.sigmoid(gate.reshape(-1).to(att.dtype))).contiguous()
-        h = residual + linear_any(self.o_proj, att_flat)
-        residual = h
-        h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
-        return residual + self.mlp(h)
-
-    @torch.no_grad()
-    def logits_for_second_token(self, raw_hidden: torch.Tensor, first_token: torch.Tensor, *, pos: int) -> torch.Tensor:
-        emb = embed_lookup(self.model.embed, first_token).to(self.device, dtype=torch.float16).reshape(-1).contiguous()
-        h_norm = qwen_rmsnorm(raw_hidden.to(self.device, dtype=torch.float16).contiguous(), self.pre_fc_norm_hidden, self.cfg.rms_norm_eps)
-        e_norm = qwen_rmsnorm(emb, self.pre_fc_norm_embedding, self.cfg.rms_norm_eps)
-        x = torch.cat([e_norm, h_norm], dim=0)
-        x = linear_any(self.fc, x).to(self.device, dtype=torch.float16).contiguous()
-        x = self._single_token_decoder_layer(x, pos=pos)
-        x = qwen_rmsnorm(x.contiguous(), self.norm, self.cfg.rms_norm_eps)
-        return linear_any(self.model.lm_head, x)
+from .model import QwenBurstModel
+from .qwen_mtp import QwenNativeMTP1, QwenNativeMTP1Proposer
+from .speculation import DraftRequest, SpeculativeBenchmarkResult, SpeculativeProbeResult
+from .speculative_verifier import NativeNextNVerifier, VerifierMode, tensor_ids
+from .tuning import speculative_verifier_mode
 
 
 @torch.no_grad()
@@ -159,14 +38,14 @@ def probe_native_mtp1(
     )
     if not isinstance(engine.model, QwenBurstModel):
         raise TypeError("native_mtp1 currently supports QwenBurstModel only")
-    mtp = QwenNativeMTP1(engine.model, engine.model.store)
+    proposer = QwenNativeMTP1Proposer(QwenNativeMTP1(engine.model, engine.model.store))
     state = engine.new_state()
     prompt_ids = engine.encode_prompt(prompt)
     logits: torch.Tensor | None = None
     raw_hidden: torch.Tensor | None = None
     for i, tid in enumerate(prompt_ids):
         if i == len(prompt_ids) - 1:
-            logits, raw_hidden = engine.model.forward_one(tid, state, return_hidden=True, return_raw_hidden=True)
+            logits, raw_hidden = engine.model.forward_one(tid, state, return_hidden=True, return_raw_hidden=False)
         else:
             engine.model.forward_one(tid, state, return_logits=False)
     assert logits is not None and raw_hidden is not None
@@ -175,12 +54,17 @@ def probe_native_mtp1(
     total = 0
     for _ in range(steps):
         first = sample_next_tensor(logits, gen_cfg)
-        mtp_logits = mtp.logits_for_second_token(raw_hidden, first, pos=state.pos)
-        candidate_second = sample_next_tensor(mtp_logits, gen_cfg)
-
-        logits, raw_hidden = engine.model.forward_one(first, state, return_hidden=True, return_raw_hidden=True)
+        first_pos = int(state.pos)
+        candidate_second = proposer.propose_tensor(
+            DraftRequest(
+                history=[],
+                max_draft=1,
+                signals={"raw_hidden": raw_hidden, "first_token": first, "pos": first_pos},
+            )
+        )
+        logits, raw_hidden = engine.model.forward_one(first, state, return_hidden=True, return_raw_hidden=False)
         target_second = sample_next_tensor(logits, gen_cfg)
-        accepted += int(torch.equal(candidate_second.reshape(()).cpu(), target_second.reshape(()).cpu()))
+        accepted += int(torch.equal(candidate_second.reshape(()), target_second.reshape(())))
         total += 1
     return SpeculativeProbeResult("native_mtp1", total=total, accepted=accepted, min_accept_rate=min_accept_rate)
 
@@ -193,9 +77,10 @@ def _sync_if_cuda() -> None:
 @torch.no_grad()
 def _target_only_ids(engine: RuntimeEngine, prompt_ids: list[int], *, max_new_tokens: int) -> tuple[list[int], float]:
     cfg = GenerationConfig(max_new_tokens=max_new_tokens)
+    features = engine.features.with_overrides(speculative_decoding=False)
     _sync_if_cuda()
     t0 = time.perf_counter()
-    out = engine.generate_ids_greedy_gpu(prompt_ids, cfg)
+    out = engine.generate_ids_greedy_gpu(prompt_ids, cfg, features=features)
     _sync_if_cuda()
     return out, time.perf_counter() - t0
 
@@ -206,50 +91,59 @@ def generate_native_mtp1_ids(
     prompt_ids: list[int],
     *,
     max_new_tokens: int,
+    max_draft: int = 1,
+    verifier_mode: VerifierMode | None = None,
     adaptive: bool = False,
-    min_verified: int = 8,
-    accept_threshold: float = 0.80,
+    min_verified: int = 1,
+    accept_threshold: float = 1.00,
+    max_rejections: int | None = None,
 ) -> tuple[list[int], float, int, int]:
     if not isinstance(engine.model, QwenBurstModel):
         raise TypeError("native_mtp1 currently supports QwenBurstModel only")
-    mtp = QwenNativeMTP1(engine.model, engine.model.store)
+    proposer = QwenNativeMTP1Proposer(QwenNativeMTP1(engine.model, engine.model.store))
     state = engine.new_state()
     _sync_if_cuda()
     t0 = time.perf_counter()
-    logits: torch.Tensor | None = None
-    raw_hidden: torch.Tensor | None = None
-    for i, tid in enumerate(prompt_ids):
-        if i == len(prompt_ids) - 1:
-            logits, raw_hidden = engine.model.forward_one(tid, state, return_hidden=True, return_raw_hidden=True)
-        else:
-            engine.model.forward_one(tid, state, return_logits=False)
-    assert logits is not None and raw_hidden is not None
+    features = engine.resolve_plan(engine.features).effective
+    logits, raw_hidden = engine._prefill_with_raw_hidden(prompt_ids, state, features)
     cfg = GenerationConfig(max_new_tokens=max_new_tokens)
     out: list[int] = []
-    accepted = 0
-    verified = 0
+    recent_accepts: list[int] = []
+    verifier = NativeNextNVerifier(
+        model=engine.model,
+        proposer=proposer,
+        sample_next=lambda current_logits: sample_next_tensor(current_logits, cfg),
+        max_draft=max_draft,
+        mode=(verifier_mode or speculative_verifier_mode()),  # type: ignore[arg-type]
+    )
     while len(out) < max_new_tokens:
-        first = sample_next_tensor(logits, cfg)
-        first_id = int(first.detach().cpu().item())
-        candidate_logits = mtp.logits_for_second_token(raw_hidden, first, pos=state.pos)
-        candidate = sample_next_tensor(candidate_logits, cfg)
-        candidate_id = int(candidate.detach().cpu().item())
-
-        branch = state.fork()
-        verified_block = engine.model.forward_block([first_id, candidate_id], branch, return_logits=True, commit=True)
-        target_second = sample_next_tensor(verified_block.logits[0], cfg)
-        target_second_id = int(target_second.detach().cpu().item())
-        verified += 1
-        if candidate_id == target_second_id and len(out) + 2 <= max_new_tokens:
-            state = branch
-            out.extend([first_id, candidate_id])
-            logits = verified_block.logits[1]
-            raw_hidden = verified_block.raw_hiddens[1]
-            accepted += 1
-        else:
-            logits, raw_hidden = engine.model.forward_one(first_id, state, return_hidden=True, return_raw_hidden=True)
-            out.append(first_id)
-        if adaptive and verified >= min_verified and (accepted / verified) < accept_threshold:
+        step = verifier.step(
+            logits=logits,
+            raw_hidden=raw_hidden,
+            state=state,
+            remaining_tokens=max_new_tokens - len(out),
+        )
+        out.extend(tensor_ids(step.tokens))
+        logits = step.logits
+        raw_hidden = step.raw_hidden
+        if step.verified:
+            recent_accepts.extend([1] * step.accepted)
+            if step.rejected:
+                recent_accepts.append(0)
+        if len(recent_accepts) > min_verified:
+            del recent_accepts[: len(recent_accepts) - min_verified]
+        if adaptive and max_rejections is not None and verifier.rejected >= max_rejections:
+            while len(out) < max_new_tokens:
+                next_token = sample_next_tensor(logits, cfg)
+                next_id = int(next_token.detach().cpu().item())
+                out.append(next_id)
+                if len(out) >= max_new_tokens:
+                    break
+                logits = engine.model.forward_one(next_id, state, return_logits=True)
+            break
+        recent_ready = len(recent_accepts) >= min_verified
+        recent_rate = sum(recent_accepts) / len(recent_accepts) if recent_accepts else 0.0
+        if adaptive and recent_ready and recent_rate < accept_threshold:
             while len(out) < max_new_tokens:
                 next_token = sample_next_tensor(logits, cfg)
                 next_id = int(next_token.detach().cpu().item())
@@ -259,7 +153,7 @@ def generate_native_mtp1_ids(
                 logits = engine.model.forward_one(next_id, state, return_logits=True)
             break
     _sync_if_cuda()
-    return out[:max_new_tokens], time.perf_counter() - t0, accepted, verified
+    return out[:max_new_tokens], time.perf_counter() - t0, verifier.accepted, verifier.verified
 
 
 @torch.no_grad()
@@ -268,6 +162,8 @@ def benchmark_native_mtp1_with_engine(
     *,
     prompt: str,
     max_new_tokens: int,
+    max_draft: int = 1,
+    verifier_mode: VerifierMode | None = None,
 ) -> SpeculativeBenchmarkResult:
     if not isinstance(engine.model, QwenBurstModel):
         raise TypeError("native_mtp1 currently supports QwenBurstModel only")
@@ -277,6 +173,8 @@ def benchmark_native_mtp1_with_engine(
         engine,
         prompt_ids,
         max_new_tokens=max_new_tokens,
+        max_draft=max_draft,
+        verifier_mode=verifier_mode,
         adaptive=False,
     )
     return SpeculativeBenchmarkResult(
@@ -297,6 +195,8 @@ def benchmark_native_mtp1(
     qb_model: Path,
     prompt: str,
     max_new_tokens: int,
+    max_draft: int = 1,
+    verifier_mode: VerifierMode | None = None,
     recent_window: int = 256,
 ) -> SpeculativeBenchmarkResult:
     engine = RuntimeEngine(
@@ -307,7 +207,13 @@ def benchmark_native_mtp1(
         recent_window=recent_window,
         weight_device="cuda",
     )
-    return benchmark_native_mtp1_with_engine(engine, prompt=prompt, max_new_tokens=max_new_tokens)
+    return benchmark_native_mtp1_with_engine(
+        engine,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        max_draft=max_draft,
+        verifier_mode=verifier_mode,
+    )
 
 
 def main() -> None:
@@ -327,18 +233,35 @@ def main() -> None:
     bench.add_argument("--qb-model", type=Path, default=Path("/home/user/models/Qwen3.6-27B-qb4-marlin-fused"))
     bench.add_argument("--prompt", default="Explain why the sky is blue in one paragraph.")
     bench.add_argument("--max-new-tokens", type=int, default=64)
+    bench.add_argument("--max-draft", type=int, default=1)
+    verifier_choices = ("sequential", "transaction_block")
+    bench.add_argument("--verifier-mode", choices=verifier_choices, default=speculative_verifier_mode())
     bench.add_argument("--recent-window", type=int, default=256)
     bench.add_argument("--adaptive", action="store_true")
-    bench.add_argument("--min-verified", type=int, default=8)
-    bench.add_argument("--accept-threshold", type=float, default=0.80)
+    bench.add_argument("--min-verified", type=int, default=1)
+    bench.add_argument("--accept-threshold", type=float, default=1.00)
+    bench.add_argument("--max-rejections", type=int, default=None)
     suite = sub.add_parser("bench-suite-mtp1", help="benchmark MTP1 over several prompts with one model load")
     suite.add_argument("--hf-model", type=Path, default=Path("/home/user/models/Qwen3.6-27B"))
     suite.add_argument("--qb-model", type=Path, default=Path("/home/user/models/Qwen3.6-27B-qb4-marlin-fused"))
     suite.add_argument("--recent-window", type=int, default=64)
     suite.add_argument("--max-new-tokens", type=int, default=32)
+    suite.add_argument("--max-draft", type=int, default=1)
+    suite.add_argument("--verifier-mode", choices=verifier_choices, default=speculative_verifier_mode())
     suite.add_argument("--adaptive", action="store_true")
-    suite.add_argument("--min-verified", type=int, default=8)
-    suite.add_argument("--accept-threshold", type=float, default=0.80)
+    suite.add_argument("--min-verified", type=int, default=1)
+    suite.add_argument("--accept-threshold", type=float, default=1.00)
+    suite.add_argument("--max-rejections", type=int, default=None)
+    sweep = sub.add_parser("bench-policy-sweep-mtp1", help="sweep adaptive MTP1 policy with one model load")
+    sweep.add_argument("--hf-model", type=Path, default=Path("/home/user/models/Qwen3.6-27B"))
+    sweep.add_argument("--qb-model", type=Path, default=Path("/home/user/models/Qwen3.6-27B-qb4-marlin-fused"))
+    sweep.add_argument("--recent-window", type=int, default=64)
+    sweep.add_argument("--max-new-tokens", type=int, default=128)
+    sweep.add_argument("--max-draft-values", default="1,2,4")
+    sweep.add_argument("--verifier-modes", default="sequential,transaction_block")
+    sweep.add_argument("--min-verified-values", default="1,2,4,8")
+    sweep.add_argument("--accept-threshold-values", default="0.70,0.75,0.80,0.85,0.90")
+    sweep.add_argument("--max-rejections-values", default="none,1,2")
     args = ap.parse_args()
     if args.cmd == "native-mtp1":
         result = probe_native_mtp1(
@@ -368,9 +291,12 @@ def main() -> None:
                 engine,
                 prompt_ids,
                 max_new_tokens=args.max_new_tokens,
+                max_draft=args.max_draft,
+                verifier_mode=args.verifier_mode,
                 adaptive=True,
                 min_verified=args.min_verified,
                 accept_threshold=args.accept_threshold,
+                max_rejections=args.max_rejections,
             )
             result = SpeculativeBenchmarkResult(
                 method="native_mtp1_adaptive",
@@ -387,6 +313,8 @@ def main() -> None:
                 qb_model=args.qb_model,
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
+                max_draft=args.max_draft,
+                verifier_mode=args.verifier_mode,
                 recent_window=args.recent_window,
             )
         print(result)
@@ -419,9 +347,12 @@ def main() -> None:
                     engine,
                     prompt_ids,
                     max_new_tokens=tokens,
+                    max_draft=args.max_draft,
+                    verifier_mode=args.verifier_mode,
                     adaptive=True,
                     min_verified=args.min_verified,
                     accept_threshold=args.accept_threshold,
+                    max_rejections=args.max_rejections,
                 )
                 result = SpeculativeBenchmarkResult(
                     method="native_mtp1_adaptive",
@@ -433,10 +364,18 @@ def main() -> None:
                     identical=target_ids == spec_ids,
                 )
             else:
-                result = benchmark_native_mtp1_with_engine(engine, prompt=prompt, max_new_tokens=tokens)
+                result = benchmark_native_mtp1_with_engine(
+                    engine,
+                    prompt=prompt,
+                    max_new_tokens=tokens,
+                    max_draft=args.max_draft,
+                    verifier_mode=args.verifier_mode,
+                )
             row = {
                 "name": name,
                 "tokens": result.tokens,
+                "max_draft": args.max_draft,
+                "verifier_mode": args.verifier_mode,
                 "target_tok_s": round(result.target_tok_s, 2),
                 "speculative_tok_s": round(result.speculative_tok_s, 2),
                 "speedup": round(result.speedup, 3),
@@ -453,6 +392,92 @@ def main() -> None:
             "all_identical": all(r["identical"] for r in rows),
             "avg_speedup": round(sum(float(r["speedup"]) for r in rows) / len(rows), 3),
         }, ensure_ascii=False))
+    elif args.cmd == "bench-policy-sweep-mtp1":
+        prompts = [
+            ("sky", "Explain why the sky is blue in one paragraph.", args.max_new_tokens),
+            ("math", "Solve: if a train travels 120 km in 2 hours, what is its speed? Answer briefly.", args.max_new_tokens),
+            ("technical", "Write a concise technical note about quantized LLM inference.", max(args.max_new_tokens, 64)),
+        ]
+        min_verified_values = [int(x) for x in args.min_verified_values.split(",") if x.strip()]
+        max_draft_values = [int(x) for x in args.max_draft_values.split(",") if x.strip()]
+        verifier_modes = [x.strip() for x in args.verifier_modes.split(",") if x.strip()]
+        accept_threshold_values = [float(x) for x in args.accept_threshold_values.split(",") if x.strip()]
+        max_rejections_values = [
+            None if x.strip().lower() in {"none", "null", "-1"} else int(x)
+            for x in args.max_rejections_values.split(",")
+            if x.strip()
+        ]
+        engine = RuntimeEngine(
+            adapter=adapter_registry.get("qwen36"),
+            hf_model=args.hf_model,
+            qb_model=args.qb_model,
+            device="cuda",
+            recent_window=args.recent_window,
+            weight_device="cuda",
+        )
+        encoded = [(name, engine.encode_prompt(prompt), tokens) for name, prompt, tokens in prompts]
+        baselines: dict[str, tuple[list[int], float]] = {}
+        for name, prompt_ids, tokens in encoded:
+            baselines[name] = _target_only_ids(engine, prompt_ids, max_new_tokens=tokens)
+        best: dict[str, object] | None = None
+        for verifier_mode in verifier_modes:
+            for max_draft in max_draft_values:
+                for min_verified in min_verified_values:
+                    for accept_threshold in accept_threshold_values:
+                        for max_rejections in max_rejections_values:
+                            rows = []
+                            for name, prompt_ids, tokens in encoded:
+                                target_ids, target_s = baselines[name]
+                                spec_ids, spec_s, accepted, verified = generate_native_mtp1_ids(
+                                    engine,
+                                    prompt_ids,
+                                    max_new_tokens=tokens,
+                                    max_draft=max_draft,
+                                    verifier_mode=verifier_mode,  # type: ignore[arg-type]
+                                    adaptive=True,
+                                    min_verified=min_verified,
+                                    accept_threshold=accept_threshold,
+                                    max_rejections=max_rejections,
+                                )
+                                result = SpeculativeBenchmarkResult(
+                                    method="native_mtp1_adaptive",
+                                    tokens=tokens,
+                                    target_seconds=target_s,
+                                    speculative_seconds=spec_s,
+                                    accepted_second_tokens=accepted,
+                                    verified_steps=verified,
+                                    identical=target_ids == spec_ids,
+                                )
+                                rows.append({
+                                    "name": name,
+                                    "speedup": result.speedup,
+                                    "accept_rate": result.accept_rate,
+                                    "identical": result.identical,
+                                })
+                            avg_speedup = sum(float(r["speedup"]) for r in rows) / len(rows)
+                            all_identical = all(bool(r["identical"]) for r in rows)
+                            candidate = {
+                                "verifier_mode": verifier_mode,
+                                "max_draft": max_draft,
+                                "min_verified": min_verified,
+                                "accept_threshold": accept_threshold,
+                                "max_rejections": max_rejections,
+                                "avg_speedup": round(avg_speedup, 3),
+                                "all_identical": all_identical,
+                                "rows": [
+                                    {
+                                        "name": r["name"],
+                                        "speedup": round(float(r["speedup"]), 3),
+                                        "accept_rate": round(float(r["accept_rate"]), 3),
+                                        "identical": r["identical"],
+                                    }
+                                    for r in rows
+                                ],
+                            }
+                            print(json.dumps(candidate, ensure_ascii=False))
+                            if all_identical and (best is None or avg_speedup > float(best["avg_speedup"])):
+                                best = candidate
+        print("best=" + json.dumps(best, ensure_ascii=False))
 
 
 if __name__ == "__main__":

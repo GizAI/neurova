@@ -518,3 +518,137 @@ torch::Tensor gdn_recurrent_scan(torch::Tensor q, torch::Tensor k, torch::Tensor
   QB_CUDA_CHECK(cudaGetLastError());
   return out;
 }
+
+__global__ void gdn_recurrent_ab_scan_128_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    const half* __restrict__ a,
+    const half* __restrict__ b,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    half* __restrict__ state,
+    half* __restrict__ out,
+    int tokens,
+    int kv_heads,
+    int v_heads) {
+  int vh = blockIdx.x;
+  int tid = threadIdx.x;
+  if (vh >= v_heads || tid >= QB_GDN_D) return;
+
+  int ratio = v_heads / kv_heads;
+  int kh = vh / ratio;
+  half* S = state + static_cast<int64_t>(vh) * QB_GDN_D * QB_GDN_D;
+
+  __shared__ float q_s[QB_GDN_D];
+  __shared__ float k_s[QB_GDN_D];
+  __shared__ float red[QB_GDN_BLOCK];
+  __shared__ float delta_s[QB_GDN_D];
+
+  for (int t = 0; t < tokens; ++t) {
+    const int64_t q_off = (static_cast<int64_t>(t) * kv_heads + kh) * QB_GDN_D;
+    const int64_t v_off = (static_cast<int64_t>(t) * v_heads + vh) * QB_GDN_D;
+    float qv = __half2float(q[q_off + tid]);
+    float kv = __half2float(k[q_off + tid]);
+    q_s[tid] = qv;
+    k_s[tid] = kv;
+
+    red[tid] = qv * qv;
+    __syncthreads();
+    for (int stride = QB_GDN_BLOCK / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) red[tid] += red[tid + stride];
+      __syncthreads();
+    }
+    float q_inv = rsqrtf(red[0] + 1e-6f);
+
+    red[tid] = kv * kv;
+    __syncthreads();
+    for (int stride = QB_GDN_BLOCK / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) red[tid] += red[tid + stride];
+      __syncthreads();
+    }
+    float k_inv = rsqrtf(red[0] + 1e-6f);
+
+    q_s[tid] *= q_inv * rsqrtf(static_cast<float>(QB_GDN_D));
+    k_s[tid] *= k_inv;
+    __syncthreads();
+
+    int j = tid;
+    float old_j = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < QB_GDN_D; ++d) {
+      old_j += k_s[d] * __half2float(S[d * QB_GDN_D + j]);
+    }
+
+    float vj = __half2float(v[v_off + j]);
+    float delta = vj - old_j;
+    delta_s[j] = delta;
+    __syncthreads();
+
+    float ax = __half2float(a[static_cast<int64_t>(t) * v_heads + vh]) + dt_bias[vh];
+    float softplus = ax > 20.0f ? ax : log1pf(__expf(ax));
+    float g = -__expf(A_log[vh]) * softplus;
+    float decay = __expf(g);
+    float beta = qb_sigmoid(__half2float(b[static_cast<int64_t>(t) * v_heads + vh]));
+
+    #pragma unroll
+    for (int d = 0; d < QB_GDN_D; ++d) {
+      float s_old = __half2float(S[d * QB_GDN_D + j]);
+      float s_new = decay * s_old + beta * k_s[d] * delta;
+      S[d * QB_GDN_D + j] = __float2half_rn(s_new);
+    }
+    __syncthreads();
+
+    float yj = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < QB_GDN_D; ++d) {
+      yj += q_s[d] * __half2float(S[d * QB_GDN_D + j]);
+    }
+    out[v_off + j] = __float2half_rn(yj);
+    __syncthreads();
+  }
+}
+
+torch::Tensor gdn_recurrent_ab_scan(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor A_log,
+    torch::Tensor dt_bias,
+    torch::Tensor state) {
+  QB_CHECK_CUDA(q); QB_CHECK_CUDA(k); QB_CHECK_CUDA(v); QB_CHECK_CUDA(a); QB_CHECK_CUDA(b); QB_CHECK_CUDA(A_log); QB_CHECK_CUDA(dt_bias); QB_CHECK_CUDA(state);
+  QB_CHECK_CONTIGUOUS(q); QB_CHECK_CONTIGUOUS(k); QB_CHECK_CONTIGUOUS(v); QB_CHECK_CONTIGUOUS(a); QB_CHECK_CONTIGUOUS(b); QB_CHECK_CONTIGUOUS(A_log); QB_CHECK_CONTIGUOUS(dt_bias); QB_CHECK_CONTIGUOUS(state);
+  QB_CHECK_HALF(q); QB_CHECK_HALF(k); QB_CHECK_HALF(v); QB_CHECK_HALF(a); QB_CHECK_HALF(b); QB_CHECK_HALF(state);
+  TORCH_CHECK(A_log.scalar_type() == at::kFloat && dt_bias.scalar_type() == at::kFloat, "A_log/dt_bias must be fp32");
+  TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "q/k/v shapes must be [tokens, heads, 128]");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0), "q/k/v token count mismatch");
+  TORCH_CHECK(q.size(2) == QB_GDN_D && k.size(2) == QB_GDN_D && v.size(2) == QB_GDN_D, "head dim must be 128");
+  int tokens = static_cast<int>(q.size(0));
+  int kv_heads = static_cast<int>(q.size(1));
+  int v_heads = static_cast<int>(v.size(1));
+  TORCH_CHECK(k.size(1) == kv_heads, "k heads mismatch");
+  TORCH_CHECK(v_heads % kv_heads == 0, "v_heads must be divisible by kv_heads");
+  TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && a.size(0) == tokens && b.size(0) == tokens, "a/b must be [tokens, v_heads]");
+  TORCH_CHECK(a.size(1) == v_heads && b.size(1) == v_heads, "a/b v_heads mismatch");
+  TORCH_CHECK(A_log.size(0) == v_heads && dt_bias.size(0) == v_heads, "A_log/dt_bias v_heads mismatch");
+  TORCH_CHECK(state.dim() == 3 && state.size(0) == v_heads && state.size(1) == QB_GDN_D && state.size(2) == QB_GDN_D,
+              "state must be [v_heads, 128, 128]");
+
+  auto out = torch::empty({tokens, v_heads, QB_GDN_D}, q.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  gdn_recurrent_ab_scan_128_kernel<<<v_heads, QB_GDN_BLOCK, 0, stream>>>(
+      reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(a.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(b.data_ptr<at::Half>()),
+      A_log.data_ptr<float>(),
+      dt_bias.data_ptr<float>(),
+      reinterpret_cast<half*>(state.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      tokens, kv_heads, v_heads);
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
