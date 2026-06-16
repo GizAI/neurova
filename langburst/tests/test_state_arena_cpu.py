@@ -167,6 +167,8 @@ def test_decode_state_arena_can_allocate_paged_kv_buffers():
     assert arena.summary()["kv_cache_dtype"] == "fp16"
     assert arena.summary()["kv_storage_head_dim"] == 4
     assert arena.summary()["paged_kv_enabled"] is True
+    assert arena.summary()["paged_kv_mirror"] is True
+    assert arena.attn_k[1].size(2) == 4
 
 
 def test_decode_state_arena_can_allocate_fp8_paged_kv_buffers():

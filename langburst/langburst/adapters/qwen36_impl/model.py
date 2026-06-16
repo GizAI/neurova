@@ -490,6 +490,59 @@ def attention_decode_paged_batch(
     return out
 
 
+def arena_has_canonical_attention_mirror(arena: object, layer: int) -> bool:
+    mirror_k = getattr(arena, "attn_k", {}).get(layer)
+    mirror_v = getattr(arena, "attn_v", {}).get(layer)
+    return mirror_k is not None and mirror_v is not None and int(mirror_k.size(-2)) > 0
+
+
+def write_paged_kv_row(
+    arena: object,
+    layer: int,
+    row: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    plan: Any | None,
+) -> None:
+    """Mirror a canonical attention KV write into paged storage.
+
+    This is the state-trajectory parity bridge: the canonical DecodeState path
+    remains the source of truth while paged KV pages stay warm for future hot
+    kernels, prefix/state cache ownership, and block-table validation.
+    """
+
+    if plan is None:
+        return
+    k_pages = getattr(arena, "paged_attn_k", None)
+    v_pages = getattr(arena, "paged_attn_v", None)
+    if k_pages is None or v_pages is None:
+        return
+    slot_mapping = getattr(plan, "slot_mapping", None)
+    if slot_mapping is None:
+        return
+    block_size = int(getattr(arena, "kv_block_size", 0))
+    if block_size <= 0:
+        return
+    slot = int(slot_mapping.to(device=k.device, dtype=torch.long)[row].detach().cpu().item())
+    block = slot // block_size
+    offset = slot % block_size
+    kv_spec = getattr(arena, "kv_cache_spec")
+    if kv_spec.is_int4:
+        k_store = hadamard_transform(k, kv_spec.hadamard_order) if kv_spec.uses_bdr else k
+        v_store = hadamard_transform(v, kv_spec.hadamard_order) if kv_spec.uses_bdr and kv_spec.rotate_v else v
+        k_packed, k_scale, k_zero = pack_int4_rows(k_store)
+        v_packed, v_scale, v_zero = pack_int4_rows(v_store)
+        k_pages[layer][block, :, offset, :].copy_(k_packed)
+        v_pages[layer][block, :, offset, :].copy_(v_packed)
+        getattr(arena, "paged_attn_k_scale")[layer][block, :, offset].copy_(k_scale)
+        getattr(arena, "paged_attn_v_scale")[layer][block, :, offset].copy_(v_scale)
+        getattr(arena, "paged_attn_k_zero")[layer][block, :, offset].copy_(k_zero)
+        getattr(arena, "paged_attn_v_zero")[layer][block, :, offset].copy_(v_zero)
+        return
+    k_pages[layer][block, :, offset, :].copy_(k.to(device=k_pages[layer].device, dtype=k_pages[layer].dtype))
+    v_pages[layer][block, :, offset, :].copy_(v.to(device=v_pages[layer].device, dtype=v_pages[layer].dtype))
+
+
 def attention_decode_paged_reference(
     arena: object,
     layer: int,
@@ -1235,6 +1288,7 @@ class Qwen36AttentionLayer:
             k = qwen_rmsnorm_lastdim(k, self.k_norm, self.cfg.rms_norm_eps)
 
         arena_ctx = _arena_batch(states)
+        use_paged_attention = False
         if (
             arena_ctx is not None
             and plan is not None
@@ -1243,6 +1297,9 @@ class Qwen36AttentionLayer:
             and getattr(arena_ctx[0], "paged_attn_k", None) is not None
         ):
             arena, _state_indices = arena_ctx
+            use_paged_attention = paged_attention_kernels_enabled() or not arena_has_canonical_attention_mirror(arena, self.layer)
+        if use_paged_attention:
+            arena, _state_indices = arena_ctx  # type: ignore[misc]
             positions = plan.positions.to(device=x.device, dtype=torch.long).contiguous()
             q_rope, k_rope = apply_rope_decode_batch(
                 q,
@@ -1279,6 +1336,10 @@ class Qwen36AttentionLayer:
                 if gate_flat is not None:
                     att_flat = att_flat * torch.sigmoid(gate_flat[row].to(att_flat.dtype))
                 att_rows.append(att_flat)
+                arena_ctx_row = _arena_batch(states)
+                if arena_ctx_row is not None:
+                    arena, _state_indices = arena_ctx_row
+                    write_paged_kv_row(arena, self.layer, row, k_row.contiguous(), v[row].contiguous(), plan)
             att_block = torch.stack(att_rows, dim=0).contiguous()
         h = residual + linear_any(self.o_proj, att_block)
         residual = h
