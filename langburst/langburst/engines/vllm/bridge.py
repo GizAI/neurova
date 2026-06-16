@@ -23,11 +23,11 @@ VLLM_OWNED_FEATURES: tuple[str, ...] = (
     "attention_kernels",
 )
 
-LANGBURST_QWEN36_BRIDGE_FEATURES: tuple[str, ...] = (
-    "qwen36_config",
-    "qwen36_lowbit_checkpoint_loader",
-    "qwen36_gdn_blocks",
-    "qwen36_recurrent_state",
+LANGBURST_CUSTOM_MODEL_BRIDGE_FEATURES: tuple[str, ...] = (
+    "custom_config",
+    "lowbit_checkpoint_loader",
+    "stateful_hybrid_blocks",
+    "recurrent_state",
     "gdn_recurrent_kernel",
     "episodic_memory_sidecar",
     "ttt_sidecar",
@@ -84,6 +84,12 @@ def lowbit_min_batched_tokens(*, enable_mtp: bool) -> int:
     return LOWBIT_MTP_MIN_BATCHED_TOKENS if enable_mtp else LOWBIT_MAMBA_MIN_BATCHED_TOKENS
 
 
+def resolve_lowbit_enable_mtp(extra: dict[str, Any]) -> bool:
+    """Low-bit bridge models use native MTP unless explicitly disabled."""
+
+    return bool(extra.get("enable_mtp", True))
+
+
 def resolve_lowbit_max_num_batched_tokens(spec: EngineModelSpec, *, enable_mtp: bool) -> int:
     import os
 
@@ -125,9 +131,9 @@ def build_vllm_bridge_config(spec: EngineModelSpec, feature_plan: EngineFeatureP
     """Resolve all LangBurst-to-vLLM integration knobs in one place.
 
     vLLM owns generic scheduling, PagedAttention, prefix caching, and sampling.
-    LangBurst owns the custom Qwen3.6/GDN/recurrent semantics until a proper
-    out-of-tree vLLM model implementation is installed. The bridge metadata is
-    forwarded through HF config overrides so that custom model code can consume
+    LangBurst owns custom low-bit/recurrent semantics until a provider-native
+    model implementation is installed. The bridge metadata is forwarded through
+    HF config overrides so that custom model code can consume
     the same feature request without server-side branching.
     """
 
@@ -136,7 +142,7 @@ def build_vllm_bridge_config(spec: EngineModelSpec, feature_plan: EngineFeatureP
         "features": requested.summary(),
         "support": dict(feature_plan.support),
         "vllm_owned": VLLM_OWNED_FEATURES,
-        "langburst_qwen36_bridge": LANGBURST_QWEN36_BRIDGE_FEATURES,
+        "langburst_custom_model_bridge": LANGBURST_CUSTOM_MODEL_BRIDGE_FEATURES,
         "excluded_native_runtime": LANGBURST_NATIVE_RUNTIME_EXCLUDED_FROM_VLLM,
     }
     kwargs: dict[str, Any] = {}
@@ -147,29 +153,30 @@ def build_vllm_bridge_config(spec: EngineModelSpec, feature_plan: EngineFeatureP
         hf_overrides["langburst_kv_policy"] = "ring" if requested.ring_kv else "paged_prefix"
         hf_overrides["langburst_infinite_context"] = bool(requested.infinite_context)
 
-    if requested.qwen36_lowbit:
+    if requested.custom_model_bridge:
         metadata["requires_custom_model"] = False
-        metadata["qwen36_checkpoint"] = spec.extra.get("qb_model")
+        metadata["lowbit_checkpoint"] = spec.extra.get("qb_model")
         kwargs["enforce_eager"] = True
         kwargs["dtype"] = str(spec.extra.get("dtype", "float16"))
         kwargs["language_model_only"] = True
         kwargs["load_format"] = "langburst_lowbit"
-        enable_mtp = bool(spec.extra.get("enable_mtp", False))
-        # Qwen3.5/GDN + Mamba align mode raises vLLM's attention block size
-        # above the user context length. MTP pads it slightly higher again.
+        enable_mtp = resolve_lowbit_enable_mtp(spec.extra)
+        # Hybrid recurrent bridges need a minimum token budget for aligned
+        # recurrent cache blocks. MTP pads it slightly higher again.
         kwargs["max_num_batched_tokens"] = resolve_lowbit_max_num_batched_tokens(spec, enable_mtp=enable_mtp)
         kwargs["max_num_seqs"] = int(spec.extra.get("max_num_seqs", 1))
         kwargs["kv_cache_dtype"] = str(spec.extra.get("kv_cache_dtype", "fp8"))
         if kv_cache_memory_bytes := spec.extra.get("kv_cache_memory_bytes"):
             kwargs["kv_cache_memory_bytes"] = int(kv_cache_memory_bytes)
         kwargs["quantization"] = "langburst_lowbit"
-        kwargs["reasoning_parser"] = str(spec.extra.get("reasoning_parser", "qwen3"))
+        if reasoning_parser := spec.extra.get("reasoning_parser"):
+            kwargs["reasoning_parser"] = str(reasoning_parser)
         if enable_mtp and "speculative_config" not in spec.extra:
             kwargs["speculative_config"] = {
                 "method": "mtp",
                 "num_speculative_tokens": int(spec.extra.get("mtp_speculative_tokens", 2)),
             }
-        hf_overrides["langburst_qwen36_lowbit"] = True
+        hf_overrides["langburst_custom_model_bridge"] = True
         if qb_model := spec.extra.get("qb_model"):
             kwargs["model_loader_extra_config"] = {"qb_model": str(qb_model)}
             hf_overrides["langburst_qb_model"] = str(qb_model)

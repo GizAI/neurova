@@ -13,7 +13,14 @@ import torch
 from pydantic import BaseModel
 from starlette.requests import Request
 
-from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, engine_model_spec_from_args, runtime_features_from_args
+from .cli_features import (
+    add_adapter_arg,
+    add_model_path_args,
+    add_runtime_feature_args,
+    engine_model_spec_from_args,
+    runtime_features_from_args,
+    runtime_features_from_obj,
+)
 from .core.defaults import (
     DEFAULT_MAX_BATCHED_TOKENS,
     DEFAULT_MAX_GENERATION_TOKENS,
@@ -250,28 +257,7 @@ def _flat_token_ids(value: list[int] | list[list[int]] | None) -> tuple[int, ...
 
 
 def _request_feature_overrides(req: ChatCompletionRequest, base: RuntimeFeatures) -> RuntimeFeatures:
-    profile = req.runtime_profile or base.profile
-    features = base if profile == base.profile else RuntimeFeatures.from_profile(profile).with_overrides(
-        kv_cache_dtype=base.kv_cache_dtype,
-        prefill_chunk_size=base.prefill_chunk_size,
-    )
-    overrides = {
-        "kv_window_policy": req.kv_window_policy,
-        "stateful_chat": req.stateful_chat,
-        "state_pool": req.state_pool,
-        "snapshots": req.snapshots,
-        "boundary_decay": req.boundary_decay,
-        "gpu_sampling": req.gpu_sampling,
-        "speculative_decoding": req.speculative_decoding,
-        "cuda_graph": req.cuda_graph,
-        "block_prefill": req.block_prefill,
-        "prefix_cache": req.prefix_cache,
-        "infinite_streaming": req.infinite_streaming,
-        "episodic_memory": req.episodic_memory,
-        "ttt_sidecar": req.ttt_sidecar,
-        "prefill_chunk_size": req.prefill_chunk_size,
-    }
-    return features.with_overrides_from_mapping({k: v for k, v in overrides.items() if v is not None})
+    return runtime_features_from_obj(req, base=base)
 
 
 def _native_generation_config(engine, req: ChatCompletionRequest) -> GenerationConfig:
@@ -711,10 +697,12 @@ def main() -> None:
     ap.add_argument("--gpu-memory-utilization", type=float, default=None)
     ap.add_argument("--max-model-len", type=int, default=None)
     ap.add_argument("--quantization", default=None)
-    ap.add_argument("--qwen36-lowbit", action="store_true")
+    ap.add_argument("--custom-model-bridge", action="store_true", help="request LangBurst custom low-bit/model bridge")
     ap.add_argument("--recurrent-state", action="store_true")
     ap.add_argument("--vllm-custom-model", default=None)
-    ap.add_argument("--enable-mtp", action="store_true")
+    mtp_group = ap.add_mutually_exclusive_group()
+    mtp_group.add_argument("--enable-mtp", dest="enable_mtp", action="store_true", default=None)
+    mtp_group.add_argument("--disable-mtp", dest="enable_mtp", action="store_false")
     ap.add_argument("--mtp-speculative-tokens", type=int, default=2)
     ap.add_argument("--no-trust-remote-code", action="store_true")
     add_model_path_args(ap, required=False)

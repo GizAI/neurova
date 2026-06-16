@@ -95,7 +95,7 @@ the internal file layout.
 - CUDA graph support
 - standard quantization backends
 - speculative decoding
-- LangBurst feature bridge for Qwen3.6/GDN custom-model integration
+- LangBurst feature bridge for low-bit/stateful custom-model integration
 
 The vLLM provider should not call or wrap LangBurst's native runtime. It should
 use vLLM modules directly where vLLM already provides the capability.
@@ -107,11 +107,13 @@ translated by `engines/vllm/bridge.py`:
   request model.
 - `ring_kv` and `infinite_context`: vLLM prefix caching/PagedAttention are
   enabled and the exact LangBurst policy is forwarded through `hf_overrides`.
-- `qwen36_lowbit`: the converted LangBurst checkpoint path and 4-bit metadata
-  are forwarded to a custom vLLM model implementation. The custom model must be
-  registered through vLLM's out-of-tree model/plugin mechanism; LangBurst passes
-  the architecture name through `hf_overrides["architectures"]`.
-- `recurrent_state`: marked as custom-model bridge metadata for Qwen3.6/GDN.
+- `custom_model_bridge`: the converted LangBurst checkpoint path and low-bit
+  metadata are forwarded to a custom provider model implementation. The custom
+  model must be registered through the provider's out-of-tree model/plugin
+  mechanism; LangBurst passes the architecture name through
+  `hf_overrides["architectures"]`.
+- `recurrent_state`: marked as custom-model bridge metadata for stateful hybrid
+  model families.
 - `episodic_memory` and `ttt_sidecar`: exposed as sidecar metadata so request
   processors or custom model code can consume the same feature request.
 

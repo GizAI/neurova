@@ -5,9 +5,11 @@ import torch
 from langburst.speculative_batch import (
     DecodeInputBuffers,
     DecodeRequestState,
+    NativeSpecDecodeMetadata,
     apply_decode_post_update,
     build_decode_batch_plan,
     make_speculative_batch_plan,
+    resolve_greedy_speculative_metadata,
     resolve_speculative_batch,
     sampled_and_rejected_counts,
     tensor_token_ids,
@@ -62,6 +64,31 @@ def test_build_decode_batch_plan_combines_prefill_and_spec_decode_rows():
     assert batch.seq_lens.tolist() == [3, 5]
     assert batch.logits_indices.tolist() == [1, 2, 3, 4]
     assert batch.cu_num_logits.tolist() == [0, 1, 4]
+    assert batch.spec_decode_metadata is not None
+    assert batch.spec_decode_metadata.num_draft_tokens == [0, 2]
+    assert batch.spec_decode_metadata.draft_token_ids.tolist() == [204, 205]
+
+
+def test_build_decode_batch_plan_keeps_tensor_drafts_in_metadata():
+    req = DecodeRequestState(
+        "decode",
+        1,
+        [201, 202],
+        computed_tokens=2,
+        last_sampled_token=203,
+        draft_token_ids_tensor=torch.tensor([204, 205], dtype=torch.long),
+    )
+    buffers = DecodeInputBuffers(max_num_requests=1, max_num_tokens=3)
+
+    batch = build_decode_batch_plan([req], buffers=buffers)
+
+    assert req.draft_token_ids is None
+    assert req.num_draft_tokens == 2
+    assert batch.input_ids.tolist() == [203, 204, 205]
+    assert batch.num_draft_tokens_per_request == [2]
+    assert batch.spec_decode_metadata is not None
+    assert batch.spec_decode_metadata.draft_token_ids.data_ptr() != 0
+    assert batch.spec_decode_metadata.draft_token_ids.tolist() == [204, 205]
 
 
 def test_sampled_and_rejected_counts_match_vllm_shape_contract():
@@ -73,6 +100,38 @@ def test_sampled_and_rejected_counts_match_vllm_shape_contract():
 
     assert sampled.tolist() == [0, 2, 3]
     assert rejected.tolist() == [0, 1, 1]
+
+
+def test_native_spec_decode_metadata_matches_vllm_index_contract():
+    meta = NativeSpecDecodeMetadata.from_draft_rows([[10, 11, 12], [], [20, 21], [30]])
+
+    assert meta.num_draft_tokens == [3, 0, 2, 1]
+    assert meta.draft_token_ids.tolist() == [10, 11, 12, 20, 21, 30]
+    assert meta.cu_num_draft_tokens.tolist() == [3, 3, 5, 6]
+    assert meta.cu_num_sampled_tokens.tolist() == [4, 5, 8, 10]
+    assert meta.logits_indices.tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert meta.target_logits_indices.tolist() == [0, 1, 2, 5, 6, 8]
+    assert meta.bonus_logits_indices.tolist() == [3, 4, 7, 9]
+    assert meta.max_spec_len == 3
+    assert meta.select_rows([0, 2]).num_draft_tokens == [3, 2]
+    assert meta.select_rows([0, 2]).draft_token_ids.tolist() == [10, 11, 12, 20, 21]
+
+
+def test_resolve_greedy_speculative_metadata_is_the_batch_decision_ssot():
+    meta = NativeSpecDecodeMetadata.from_draft_rows([[10, 11, 12], [], [20, 21]])
+
+    decisions = resolve_greedy_speculative_metadata(
+        meta,
+        target_token_ids=torch.tensor([10, 99, 12, 20, 21]),
+        bonus_token_ids=torch.tensor([13, 30, 22]),
+        scheduled_token_counts=[4, 1, 3],
+    )
+
+    assert [decision.token_ids for decision in decisions] == [[10, 99], [30], [20, 21, 22]]
+    assert [decision.sampled_count for decision in decisions] == [2, 1, 3]
+    assert [decision.rejected_count for decision in decisions] == [2, 0, 0]
+    assert [decision.accepted_draft_tokens for decision in decisions] == [1, 0, 2]
+    assert [decision.all_drafts_accepted for decision in decisions] == [False, True, True]
 
 
 def test_apply_decode_post_update_uses_query_len_minus_rejected_delta():

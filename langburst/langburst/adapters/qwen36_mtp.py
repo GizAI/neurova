@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 
 from ..ops import cuda_ops
@@ -11,6 +13,7 @@ from .qwen36_impl.model import (
     apply_rope_single_token,
     attention_decode_any,
     embed_lookup,
+    embed_lookup_batch,
     linear_any,
     qwen_rmsnorm,
     qwen_rmsnorm_lastdim,
@@ -126,6 +129,52 @@ class QwenNativeMTP1:
         return torch.argmax(logits, dim=-1).reshape(()).to(dtype=torch.long)
 
     @torch.no_grad()
+    def argmax_first_batch(
+        self,
+        raw_hidden: torch.Tensor,
+        first_tokens: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Batched native MTP1 proposal for the first draft token.
+
+        For the first MTP step each request has a one-token MTP attention
+        context. Causal attention over one key has probability 1, so the
+        attention value is exactly V; q/k/rope only affect future MTP steps.
+        """
+
+        hidden = raw_hidden.to(device=self.device, dtype=torch.float16).contiguous()
+        if hidden.ndim != 2:
+            raise ValueError("raw_hidden must be [batch, hidden]")
+        tokens = first_tokens.to(device=self.device, dtype=torch.long).reshape(-1)
+        if tokens.numel() != hidden.size(0):
+            raise ValueError("first_tokens batch size must match raw_hidden")
+        emb = embed_lookup_batch(self.model.embed, tokens, self.device).to(dtype=torch.float16)
+        h_norm = qwen_rmsnorm(hidden, self.pre_fc_norm_hidden, self.cfg.rms_norm_eps)
+        e_norm = qwen_rmsnorm(emb, self.pre_fc_norm_embedding, self.cfg.rms_norm_eps)
+        x = linear_any(self.fc, torch.cat([e_norm, h_norm], dim=-1)).to(dtype=torch.float16).contiguous()
+
+        residual = x
+        h = qwen_rmsnorm(x, self.input_norm, self.cfg.rms_norm_eps)
+        qkv_all = linear_any(self.qkv_proj, h)
+        q_all, _k_all, v_all = torch.split(qkv_all, self.qkv_split, dim=-1)
+        q_heads = q_all.view(hidden.size(0), self.cfg.num_attention_heads, self.cfg.attention_head_dim * 2)
+        _q, gate = torch.chunk(q_heads, 2, dim=-1)
+        v = v_all.view(hidden.size(0), self.cfg.num_key_value_heads, self.cfg.attention_head_dim)
+        ratio = self.cfg.num_attention_heads // self.cfg.num_key_value_heads
+        att = v.repeat_interleave(ratio, dim=1)
+        att_flat = (att.reshape(hidden.size(0), -1) * torch.sigmoid(gate.reshape(hidden.size(0), -1).to(att.dtype))).contiguous()
+        h = residual + linear_any(self.o_proj, att_flat)
+        residual = h
+        h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+        x = residual + self.mlp(h)
+        x = qwen_rmsnorm(x.contiguous(), self.norm, self.cfg.rms_norm_eps)
+        logits = linear_any(self.model.lm_head, x).contiguous()
+        if logits.device.type == "cuda":
+            return cuda_ops().argmax_many(logits).to(device=logits.device, dtype=torch.long)
+        return torch.argmax(logits, dim=-1).to(dtype=torch.long)
+
+    @torch.no_grad()
     def argmax_sequence(
         self,
         raw_hidden: torch.Tensor,
@@ -195,6 +244,38 @@ class QwenNativeMTP1Proposer:
             pos=int(pos),
             max_draft=int(request.max_draft),
         )
+
+    @torch.no_grad()
+    def propose_tensors_batch(self, requests: Sequence[DraftRequest]) -> torch.Tensor:
+        if not requests:
+            return torch.empty((0, 0), device=self.mtp.device, dtype=torch.long)
+        max_draft = int(requests[0].max_draft)
+        if any(int(req.max_draft) != max_draft for req in requests):
+            raise ValueError("batched native_mtp1 requires a uniform max_draft")
+        if max_draft <= 0:
+            return torch.empty((len(requests), 0), device=self.mtp.device, dtype=torch.long)
+        if max_draft != 1:
+            rows = [self.propose_tensors(req).reshape(-1)[:max_draft] for req in requests]
+            return torch.stack(rows, dim=0).contiguous()
+        raw_hiddens: list[torch.Tensor] = []
+        first_tokens: list[torch.Tensor] = []
+        positions: list[int] = []
+        for req in requests:
+            signals = req.signals or {}
+            raw_hidden = signals.get("raw_hidden")
+            first_token = signals.get("first_token")
+            pos = signals.get("pos")
+            if raw_hidden is None or first_token is None or pos is None:
+                raise ValueError("native_mtp1 batch proposer requires raw_hidden, first_token, and pos signals")
+            raw_hiddens.append(raw_hidden.reshape(-1).to(device=self.mtp.device, dtype=torch.float16))
+            first_tokens.append(first_token.reshape(()).to(device=self.mtp.device, dtype=torch.long))
+            positions.append(int(pos))
+        tokens = self.mtp.argmax_first_batch(
+            torch.stack(raw_hiddens, dim=0).contiguous(),
+            torch.stack(first_tokens, dim=0).contiguous(),
+            positions=torch.tensor(positions, device=self.mtp.device, dtype=torch.long),
+        )
+        return tokens.reshape(len(requests), 1).contiguous()
 
     @torch.no_grad()
     def propose(self, request: DraftRequest) -> DraftProposal:

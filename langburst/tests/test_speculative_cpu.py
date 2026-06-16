@@ -69,9 +69,9 @@ def test_speculative_verifier_env_override(monkeypatch):
 
 def test_verify_nextn_mode_default_and_env(monkeypatch):
     monkeypatch.delenv("LANGBURST_VERIFY_NEXTN_MODE", raising=False)
-    assert verify_nextn_mode() == "fused"
-    monkeypatch.setenv("LANGBURST_VERIFY_NEXTN_MODE", "block")
     assert verify_nextn_mode() == "block"
+    monkeypatch.setenv("LANGBURST_VERIFY_NEXTN_MODE", "fused")
+    assert verify_nextn_mode() == "fused"
 
 
 def test_runtime_policy_resolver_reads_env(monkeypatch):

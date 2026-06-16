@@ -29,8 +29,6 @@ def add_adapter_arg(
     ensure_adapters_loaded()
     choices = adapter_ids or adapter_registry.ids()
     resolved_default = default or env("ADAPTER")
-    if resolved_default is None and "qwen36" in choices:
-        resolved_default = "qwen36"
     parser.add_argument(
         "--adapter",
         default=resolved_default or (choices[0] if choices else None),
@@ -105,16 +103,41 @@ def runtime_features_from_args(args: argparse.Namespace) -> RuntimeFeatures:
     return RuntimeFeatures.from_profile(args.runtime_profile).with_overrides(runtime_feature_override_from_args(args))
 
 
-def engine_feature_request_from_args(args: argparse.Namespace) -> EngineFeatureRequest:
-    features = runtime_features_from_args(args)
+def runtime_features_from_obj(obj: object, *, base: RuntimeFeatures | None = None) -> RuntimeFeatures:
+    profile = getattr(obj, "runtime_profile", None) or (base.profile if base is not None else "stateful")
+    features = base if base is not None and profile == base.profile else RuntimeFeatures.from_profile(profile)
+    if base is not None and profile != base.profile:
+        features = features.with_overrides(
+            kv_cache_dtype=base.kv_cache_dtype,
+            prefill_chunk_size=base.prefill_chunk_size,
+        )
+    return features.with_overrides(RuntimeFeatureOverride.from_obj(obj))
+
+
+def engine_feature_request_from_features(
+    features: RuntimeFeatures,
+    *,
+    custom_model_bridge: bool = False,
+    recurrent_state: bool = False,
+) -> EngineFeatureRequest:
     return EngineFeatureRequest.from_mapping(
         {
             **features.summary(),
-            "qwen36_lowbit": bool(args.qwen36_lowbit or args.qb_model),
+            "custom_model_bridge": bool(custom_model_bridge),
             "ring_kv": features.kv_window_policy == "ring",
-            "recurrent_state": bool(args.recurrent_state or args.qwen36_lowbit or args.qb_model),
+            "recurrent_state": bool(recurrent_state or custom_model_bridge),
             "infinite_context": bool(features.infinite_streaming),
         }
+    )
+
+
+def engine_feature_request_from_args(args: argparse.Namespace) -> EngineFeatureRequest:
+    features = runtime_features_from_args(args)
+    custom_model_bridge = bool(getattr(args, "custom_model_bridge", False) or getattr(args, "qb_model", None))
+    return engine_feature_request_from_features(
+        features,
+        custom_model_bridge=custom_model_bridge,
+        recurrent_state=bool(getattr(args, "recurrent_state", False)),
     )
 
 
@@ -131,9 +154,10 @@ def engine_model_spec_from_args(args: argparse.Namespace, *, served_model_name: 
         "cpu_embed": bool(args.cpu_embed),
         "runtime_profile": args.runtime_profile,
         "vllm_custom_model": args.vllm_custom_model,
-        "enable_mtp": bool(args.enable_mtp),
         "mtp_speculative_tokens": args.mtp_speculative_tokens,
     }
+    if args.enable_mtp is not None:
+        extra["enable_mtp"] = bool(args.enable_mtp)
     return EngineModelSpec(
         model=model,
         served_model_name=served_model_name or args.served_model_name,

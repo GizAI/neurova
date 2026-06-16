@@ -77,6 +77,7 @@ class VerifyBlockResult:
     logits: torch.Tensor
     hidden: torch.Tensor
     state: DecodeState
+    commit_states: list[DecodeState] | None = None
 
 
 class WeightResolver:
@@ -2226,6 +2227,47 @@ class Qwen36Model:
         )
 
     @torch.no_grad()
+    def _forward_verify_block_fast(
+        self,
+        tokens: Sequence[int],
+        state: DecodeState,
+        *,
+        num_candidates: int,
+    ) -> VerifyBlockResult:
+        token_list = [int(t) for t in tokens]
+        if not token_list:
+            raise ValueError("verify block requires at least one token")
+        if num_candidates < 0 or num_candidates >= len(token_list):
+            raise ValueError("num_candidates must be in [0, len(tokens) - 1]")
+        token_tensor = torch.tensor(token_list, device=self.device, dtype=torch.long)
+        x = embed_lookup_batch(self.embed, token_tensor, self.device)
+        base_pos = state.pos
+        base_kv_len = state.kv_len
+        for layer in self.layers:
+            if isinstance(layer, Qwen36AttentionLayer):
+                x = layer.forward_block(x, state, base_pos=base_pos, base_kv_len=base_kv_len)
+            else:
+                x = layer.forward_block(x, state)
+        for _ in token_list:
+            state.finish_token()
+        state.last_raw_hidden = x[-1].contiguous().clone()
+        h = qwen_rmsnorm(x.contiguous(), self.final_norm, self.cfg.rms_norm_eps)
+        logits = linear_any(self.lm_head, h).contiguous()
+        target_ids = torch.empty((num_candidates,), device=self.device, dtype=torch.long)
+        for i in range(num_candidates):
+            logits_i = logits[i].contiguous()
+            if logits_i.device.type == "cuda":
+                target_ids[i] = cuda_ops().argmax(logits_i).reshape(())
+            else:
+                target_ids[i] = torch.argmax(logits_i, dim=-1).reshape(())
+        return VerifyBlockResult(
+            target_ids=target_ids,
+            logits=logits[-1].contiguous().clone(),
+            hidden=h[-1].contiguous().clone(),
+            state=state,
+        )
+
+    @torch.no_grad()
     def forward_verify_block(
         self,
         tokens: Sequence[int],
@@ -2246,53 +2288,11 @@ class Qwen36Model:
         if num_candidates < 0 or num_candidates >= len(token_list):
             raise ValueError("num_candidates must be in [0, len(tokens) - 1]")
         mode = verify_nextn_mode()
-        if mode == "fused" and len(token_list) > 1:
-            result = self._forward_block_raw(
+        if mode in {"block", "fused"} and len(token_list) > 1:
+            return self._forward_verify_block_fast(
                 token_list,
                 state,
-                hidden_tap_layers=None,
-                return_logits=True,
-                logits_mode="all",
-            )
-            if len(result.logits) < len(token_list):
-                raise RuntimeError("raw verify block did not return all logits")
-            target_ids = torch.empty((num_candidates,), device=self.device, dtype=torch.long)
-            for i in range(num_candidates):
-                logits_i = result.logits[i]
-                if logits_i.device.type == "cuda":
-                    target_ids[i] = cuda_ops().argmax(logits_i.contiguous()).reshape(())
-                else:
-                    target_ids[i] = torch.argmax(logits_i, dim=-1).reshape(())
-            hidden = result.final_hiddens[-1] if result.final_hiddens else result.raw_hiddens[-1]
-            return VerifyBlockResult(
-                target_ids=target_ids,
-                logits=result.logits[-1],
-                hidden=hidden,
-                state=state,
-            )
-        if mode == "block" and len(token_list) > 1:
-            result = self.forward_block(
-                token_list,
-                state,
-                return_logits=True,
-                logits_mode="all",
-                commit=True,
-            )
-            if len(result.logits) < len(token_list):
-                raise RuntimeError("block verify path did not return all logits")
-            target_ids = torch.empty((num_candidates,), device=self.device, dtype=torch.long)
-            for i in range(num_candidates):
-                logits_i = result.logits[i]
-                if logits_i.device.type == "cuda":
-                    target_ids[i] = cuda_ops().argmax(logits_i.contiguous()).reshape(())
-                else:
-                    target_ids[i] = torch.argmax(logits_i, dim=-1).reshape(())
-            hidden = result.final_hiddens[-1] if result.final_hiddens else result.raw_hiddens[-1]
-            return VerifyBlockResult(
-                target_ids=target_ids,
-                logits=result.logits[-1],
-                hidden=hidden,
-                state=state,
+                num_candidates=num_candidates,
             )
         target_ids = torch.empty((num_candidates,), device=self.device, dtype=torch.long)
         logits: torch.Tensor | None = None
@@ -2323,13 +2323,14 @@ class Qwen36Model:
         plan: object,
         states: Sequence[DecodeState],
     ) -> list[VerifyBlockResult]:
-        """Verify speculative rows through the shared continuous-serving batch plan.
+        """Verify speculative rows through the target-verify state hot path.
 
-        Rows are advanced by timestep, batching all active requests through the
-        regular decode-batch layer path.  That gives the verifier the same state
-        arena, GDN batch kernel, and paged-attention extension points as normal
-        continuous batching while preserving exact per-row rollback semantics in
-        `NativeNextNVerifier`.
+        Arena-backed serving rows must not fall back to the ordinary single-row
+        block verifier: that bypasses the batch GDN/conv state kernels and the
+        paged-attention contract used by normal continuous decode.  When the
+        plan carries arena/paged state, advance candidates by timestep and batch
+        all active rows through each layer's `forward_decode_batch` path.  The
+        non-arena block verifier remains only as a local/single-state fallback.
         """
 
         num_requests = int(getattr(plan, "num_requests"))
@@ -2349,12 +2350,45 @@ class Qwen36Model:
                 raise ValueError("num_candidates must be in [0, row_token_count - 1]")
             token_rows.append(token_list)
 
+        if self._verify_batch_uses_state_hot_path(plan, states):
+            return self._forward_verify_batch_state_hot(plan, states, token_rows, draft_counts)
+
+        if max((len(tokens) for tokens in token_rows), default=1) > 1:
+            return [
+                self.forward_verify_block(
+                    tokens,
+                    state,
+                    num_candidates=int(draft_counts[row]),
+                )
+                for row, (tokens, state) in enumerate(zip(token_rows, states, strict=True))
+            ]
+
+        return self._forward_verify_batch_state_hot(plan, states, token_rows, draft_counts)
+
+    def _verify_batch_uses_state_hot_path(self, plan: object, states: Sequence[DecodeState]) -> bool:
+        if not states or _arena_batch(states) is None:
+            return False
+        if getattr(plan, "state_indices", None) is None:
+            return False
+        # Paged-KV tensors are the production verifier contract.  Without them
+        # attention would silently fall back to per-row logical views, which is
+        # useful for tests but not the vLLM-style hot path.
+        return getattr(plan, "block_tables", None) is not None and getattr(plan, "slot_mapping", None) is not None
+
+    def _forward_verify_batch_state_hot(
+        self,
+        plan: object,
+        states: Sequence[DecodeState],
+        token_rows: Sequence[Sequence[int]],
+        draft_counts: Sequence[int],
+    ) -> list[VerifyBlockResult]:
         target_ids = [
             torch.empty((int(draft_counts[row]),), device=self.device, dtype=torch.long)
-            for row in range(num_requests)
+            for row in range(len(states))
         ]
-        final_logits: list[torch.Tensor | None] = [None] * num_requests
-        final_hidden: list[torch.Tensor | None] = [None] * num_requests
+        final_logits: list[torch.Tensor | None] = [None] * len(states)
+        final_hidden: list[torch.Tensor | None] = [None] * len(states)
+        commit_states: list[list[DecodeState] | None] = [[] for _ in states]
         max_steps = max(len(row) for row in token_rows)
         for step in range(max_steps):
             active_rows = [row for row, tokens in enumerate(token_rows) if step < len(tokens)]
@@ -2372,6 +2406,13 @@ class Qwen36Model:
             for local_row, global_row in enumerate(active_rows):
                 states[global_row].finish_token()
                 states[global_row].last_raw_hidden = x[local_row].contiguous().clone()
+                row_commits = commit_states[global_row]
+                if row_commits is not None:
+                    fork = getattr(states[global_row], "fork", None)
+                    if callable(fork):
+                        row_commits.append(fork(clone_attention=True))
+                    else:
+                        commit_states[global_row] = None
                 h = qwen_rmsnorm(x[local_row].contiguous(), self.final_norm, self.cfg.rms_norm_eps)
                 logits = linear_any(self.lm_head, h).contiguous()
                 if step < int(draft_counts[global_row]):
@@ -2389,7 +2430,15 @@ class Qwen36Model:
             hidden = final_hidden[row]
             if logits is None or hidden is None:
                 raise RuntimeError(f"verify row {row} did not produce final logits")
-            results.append(VerifyBlockResult(target_ids=target_ids[row], logits=logits, hidden=hidden, state=state))
+            results.append(
+                VerifyBlockResult(
+                    target_ids=target_ids[row],
+                    logits=logits,
+                    hidden=hidden,
+                    state=state,
+                    commit_states=commit_states[row],
+                )
+            )
         return results
 
     def _verify_subplan(

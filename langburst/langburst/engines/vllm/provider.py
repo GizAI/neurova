@@ -17,6 +17,7 @@ from ..base import (
 from .bridge import (
     VLLMConversationStore,
     build_vllm_bridge_config,
+    resolve_lowbit_enable_mtp,
     resolve_lowbit_max_num_batched_tokens,
     vllm_engine_extra_kwargs,
 )
@@ -120,7 +121,7 @@ class VLLMBackend:
                 "vLLM is the default LangBurst engine but is not installed. "
                 "Install langburst with the vllm dependency or choose --engine native|sglang|exl3."
             ) from exc
-        if self.spec.features.qwen36_lowbit:
+        if self.spec.features.custom_model_bridge:
             from .plugins import register as register_vllm_plugins
 
             register_vllm_plugins()
@@ -143,8 +144,8 @@ class VLLMBackend:
         if self.spec.quantization:
             kwargs["quantization"] = self.spec.quantization
         kwargs.update(vllm_engine_extra_kwargs(self.spec.extra))
-        if self.spec.features.qwen36_lowbit and self.spec.features.recurrent_state:
-            enable_mtp = bool(self.spec.extra.get("enable_mtp", False))
+        if self.spec.features.custom_model_bridge and self.spec.features.recurrent_state:
+            enable_mtp = resolve_lowbit_enable_mtp(self.spec.extra)
             kwargs["max_num_batched_tokens"] = max(
                 resolve_lowbit_max_num_batched_tokens(self.spec, enable_mtp=enable_mtp),
                 int(kwargs.get("max_num_batched_tokens", 0) or 0),

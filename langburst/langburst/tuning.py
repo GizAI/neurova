@@ -18,7 +18,7 @@ DEFAULT_PAGED_ATTENTION_BACKEND = "auto"
 PAGED_ATTENTION_BACKEND_CHOICES = ("auto", "direct", "flash")
 DEFAULT_INT4_KV_LAYOUT = "tiled"
 INT4_KV_LAYOUT_CHOICES = ("token", "tiled")
-DEFAULT_VERIFY_NEXTN_MODE = "fused"
+DEFAULT_VERIFY_NEXTN_MODE = "block"
 VERIFY_NEXTN_MODE_CHOICES = ("sequential", "block", "fused")
 
 

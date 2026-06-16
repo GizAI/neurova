@@ -45,7 +45,7 @@ def test_vllm_backend_fails_fast_when_dependency_missing():
 def test_langburst_feature_plan_is_shared_across_vllm_and_native():
     ensure_engines_loaded()
     features = EngineFeatureRequest(
-        qwen36_lowbit=True,
+        custom_model_bridge=True,
         ring_kv=True,
         recurrent_state=True,
         infinite_context=True,
@@ -55,24 +55,24 @@ def test_langburst_feature_plan_is_shared_across_vllm_and_native():
     )
     vllm_backend = engine_registry.create(EngineModelSpec(model="dummy", features=features), engine_id="vllm")
     native_backend = engine_registry.create(
-        EngineModelSpec(model="dummy", features=features, extra={"qb_model": "dummy-qb"}),
+        EngineModelSpec(model="dummy", features=features, extra={"adapter": "qwen36", "qb_model": "dummy-qb"}),
         engine_id="native",
     )
     assert vllm_backend.feature_plan.requested == features
     assert native_backend.feature_plan.requested == features
     assert not vllm_backend.feature_plan.summary()["unsupported"]
     assert not native_backend.feature_plan.summary()["unsupported"]
-    assert vllm_backend.feature_plan.summary()["support"]["qwen36_lowbit"] == "bridge"
+    assert vllm_backend.feature_plan.summary()["support"]["custom_model_bridge"] == "bridge"
     assert vllm_backend.feature_plan.summary()["support"]["ring_kv"] == "bridge"
     assert vllm_backend.feature_plan.summary()["support"]["recurrent_state"] == "bridge"
     assert vllm_backend.feature_plan.summary()["support"]["stateful_sessions"] == "host"
-    assert native_backend.feature_plan.summary()["support"]["qwen36_lowbit"] == "engine"
+    assert native_backend.feature_plan.summary()["support"]["custom_model_bridge"] == "engine"
 
 
 def test_vllm_bridge_carries_langburst_native_feature_metadata():
     ensure_engines_loaded()
     features = EngineFeatureRequest(
-        qwen36_lowbit=True,
+        custom_model_bridge=True,
         ring_kv=True,
         recurrent_state=True,
         infinite_context=True,
@@ -102,30 +102,42 @@ def test_vllm_bridge_carries_langburst_native_feature_metadata():
     assert kwargs["hf_overrides"]["langburst_quantization_config"] == {"format": "langburst-lowbit", "bits": 4}
     assert kwargs["hf_overrides"]["quantization_config"]["quant_method"] == "langburst_lowbit"
     assert kwargs["hf_overrides"]["langburst_qb_model"] == "dummy-qb"
-    assert kwargs["hf_overrides"]["langburst_qwen36_lowbit"]
+    assert kwargs["hf_overrides"]["langburst_custom_model_bridge"]
     assert kwargs["hf_overrides"]["langburst_kv_policy"] == "ring"
     assert kwargs["hf_overrides"]["langburst_recurrent_state"]
     assert kwargs["hf_overrides"]["langburst_sidecars"] == {"episodic_memory": True, "ttt_sidecar": True}
     assert not bridge["requires_custom_model"]
     assert "RuntimeEngine" in bridge["metadata"]["excluded_native_runtime"]
     assert "scheduler" in bridge["metadata"]["vllm_owned"]
-    assert "qwen36_lowbit_checkpoint_loader" in bridge["metadata"]["langburst_qwen36_bridge"]
+    assert "lowbit_checkpoint_loader" in bridge["metadata"]["langburst_custom_model_bridge"]
 
 
-def test_vllm_mtp_is_explicit_opt_in():
+def test_vllm_lowbit_mtp_is_default_unless_disabled():
     ensure_engines_loaded()
-    features = EngineFeatureRequest(qwen36_lowbit=True, recurrent_state=True)
+    features = EngineFeatureRequest(custom_model_bridge=True, recurrent_state=True)
     backend = engine_registry.create(
         EngineModelSpec(
             model="dummy-hf",
             features=features,
-            extra={"qb_model": "dummy-qb", "enable_mtp": True, "mtp_speculative_tokens": 3},
+            extra={"qb_model": "dummy-qb", "mtp_speculative_tokens": 3},
         ),
         engine_id="vllm",
     )
     kwargs = backend.bridge.summary()["engine_kwargs"]
 
     assert kwargs["speculative_config"] == {"method": "mtp", "num_speculative_tokens": 3}
+
+    disabled_backend = engine_registry.create(
+        EngineModelSpec(
+            model="dummy-hf",
+            features=features,
+            extra={"qb_model": "dummy-qb", "enable_mtp": False},
+        ),
+        engine_id="vllm",
+    )
+    disabled_kwargs = disabled_backend.bridge.summary()["engine_kwargs"]
+
+    assert "speculative_config" not in disabled_kwargs
 
 
 def test_vllm_engine_kwargs_do_not_leak_native_runtime_extras():

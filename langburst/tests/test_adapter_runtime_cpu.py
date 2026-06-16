@@ -153,6 +153,7 @@ class NativeVerifyBatchToyModel(ToyModel):
         assert plan.input_ids.tolist() == [5, 6, 7]
         assert plan.num_draft_tokens_per_request == [2]
         states[0].pos += plan.num_tokens
+        states[0].last_raw_hidden = torch.ones((4,))
         logits = torch.full((8,), -1000.0)
         logits[3] = 1000.0
         return [

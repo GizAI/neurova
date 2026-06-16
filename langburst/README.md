@@ -148,7 +148,7 @@ langburst-server \
   --engine vllm \
   --model /path/or/hf-name \
   --qb-model /path/to/converted-runtime-model \
-  --qwen36-lowbit \
+  --custom-model-bridge \
   --kv-window-policy ring \
   --stateful-chat on \
   --infinite-streaming on \

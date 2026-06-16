@@ -17,7 +17,7 @@ def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark LangBurst q3 through the vLLM engine path.")
     parser.add_argument("--model", default="/home/user/models/Qwen3.6-27B")
     parser.add_argument("--tokenizer", default="/home/user/models/Qwen3.6-27B")
-    parser.add_argument("--qb-model", default="/home/user/models/Qwen3.6-27B-langburst-q3")
+    parser.add_argument("--qb-model", default="/home/user/models/Qwen3.6-27B-qb3")
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.965)
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
@@ -34,7 +34,7 @@ def main() -> None:
     args = _args()
     ensure_engines_loaded()
     features = EngineFeatureRequest(
-        qwen36_lowbit=True,
+        custom_model_bridge=True,
         ring_kv=True,
         recurrent_state=True,
         stateful_sessions=True,

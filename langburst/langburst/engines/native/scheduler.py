@@ -229,7 +229,7 @@ class ContinuousBatchScheduler:
         # prevents long prefill chunks from starving active decoders.
         active_rows = list(self._active.values())
         for row in [r for r in active_rows if not r.is_prefilling]:
-            n = 1 + len(row.draft_token_ids or [])
+            n = 1 + row.num_draft_tokens
             if selected and n > token_budget:
                 continue
             if n <= token_budget:
@@ -264,7 +264,7 @@ class ContinuousBatchScheduler:
                 bucket = self.cuda_graph_planner.select(
                     batch_size=len(selected),
                     query_len=max(scheduled_tokens),
-                    speculative_tokens=max((len(row.draft_token_ids or []) for row in selected), default=0),
+                    speculative_tokens=max((row.num_draft_tokens for row in selected), default=0),
                 )
                 graph_bucket = (bucket.batch_size, bucket.query_len, bucket.speculative_tokens)
             except ValueError:

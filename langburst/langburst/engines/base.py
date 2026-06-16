@@ -25,7 +25,7 @@ class EngineCapabilities:
     infinite_context: bool = False
     episodic_memory: bool = False
     ttt_sidecar: bool = False
-    qwen36_lowbit: bool = False
+    custom_model_bridge: bool = False
     custom_model: bool = False
     host_state: bool = False
     quantization: tuple[str, ...] = ()
@@ -45,7 +45,7 @@ class EngineCapabilities:
             "infinite_context": self.infinite_context,
             "episodic_memory": self.episodic_memory,
             "ttt_sidecar": self.ttt_sidecar,
-            "qwen36_lowbit": self.qwen36_lowbit,
+            "custom_model_bridge": self.custom_model_bridge,
             "custom_model": self.custom_model,
             "host_state": self.host_state,
             "quantization": list(self.quantization),
@@ -95,7 +95,7 @@ class EngineModelSpec:
 class EngineFeatureRequest:
     """LangBurst-specific feature request shared by all providers."""
 
-    qwen36_lowbit: bool = False
+    custom_model_bridge: bool = False
     stateful_sessions: bool = False
     ring_kv: bool = False
     recurrent_state: bool = False
@@ -107,7 +107,7 @@ class EngineFeatureRequest:
     def from_mapping(cls, data: dict[str, Any] | None) -> "EngineFeatureRequest":
         data = data or {}
         return cls(
-            qwen36_lowbit=bool(data.get("qwen36_lowbit", False)),
+            custom_model_bridge=bool(data.get("custom_model_bridge", False)),
             stateful_sessions=bool(data.get("stateful_sessions", data.get("stateful_chat", False))),
             ring_kv=bool(data.get("ring_kv", data.get("kv_window_policy") == "ring")),
             recurrent_state=bool(data.get("recurrent_state", False)),
@@ -118,7 +118,7 @@ class EngineFeatureRequest:
 
     def summary(self) -> dict[str, bool]:
         return {
-            "qwen36_lowbit": self.qwen36_lowbit,
+            "custom_model_bridge": self.custom_model_bridge,
             "stateful_sessions": self.stateful_sessions,
             "ring_kv": self.ring_kv,
             "recurrent_state": self.recurrent_state,
@@ -164,7 +164,7 @@ def resolve_engine_feature_plan(
         elif name in {"stateful_sessions", "episodic_memory", "ttt_sidecar"} and capabilities.host_state:
             support[name] = "host"
         elif prefer_bridge and capabilities.custom_model and name in {
-            "qwen36_lowbit",
+            "custom_model_bridge",
             "recurrent_state",
             "ring_kv",
             "infinite_context",

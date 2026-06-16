@@ -40,7 +40,7 @@ class NativeBackend:
             infinite_context=True,
             episodic_memory=True,
             ttt_sidecar=True,
-            qwen36_lowbit=True,
+            custom_model_bridge=True,
             custom_model=True,
             quantization=("langburst-lowbit", "langburst-marlin"),
         ),
@@ -61,7 +61,10 @@ class NativeBackend:
         from ...core.adapter import adapter_registry
         from ...core.features import RuntimeFeatures
         ensure_adapters_loaded()
-        adapter_id = str(self.spec.extra.get("adapter", "qwen36"))
+        adapter_id = self.spec.extra.get("adapter")
+        if not adapter_id:
+            raise RuntimeError("native engine requires adapter in EngineModelSpec.extra")
+        adapter_id = str(adapter_id)
         qb_model = self.spec.extra.get("qb_model")
         if not qb_model:
             raise RuntimeError("native engine requires qb_model in EngineModelSpec.extra")

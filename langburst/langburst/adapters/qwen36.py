@@ -61,7 +61,7 @@ class Qwen36Adapter:
         default_model_name="langburst-qwen3.6-27b-q4",
         capabilities=RuntimeCapabilities.stateful_hybrid(),
         supports_state=True,
-        supports_mtp=False,
+        supports_mtp=True,
     )
 
     def load_config(self, hf_model: Path) -> Qwen36_27B_TextConfig:
@@ -239,7 +239,7 @@ class Qwen36A3BAdapter(Qwen36Adapter):
         default_model_name="langburst-qwen3.6-35b-a3b-q4",
         capabilities=RuntimeCapabilities.stateful_hybrid(),
         supports_state=True,
-        supports_mtp=False,
+        supports_mtp=True,
     )
 
 
