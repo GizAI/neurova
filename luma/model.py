@@ -12,8 +12,8 @@ import torch.nn.functional as F
 class LUMAConfig:
     vocab_size: int = 259
     tokenizer_backend: str = "bytepatch"
-    qwen_tokenizer_path: str = "tokenizers/qwen35"
-    bytepatch_vocab_path: str = "tokenizers/luma_bytepatch/bytepatch_vocab.json"
+    qwen_tokenizer_path: str = "luma/tokenizers/qwen35"
+    bytepatch_vocab_path: str = "luma/tokenizers/luma_bytepatch/bytepatch_vocab.json"
     tokenizer_sha256: str = ""
     d_model: int = 192
     n_layer: int = 4

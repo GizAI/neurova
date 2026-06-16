@@ -61,7 +61,7 @@ class SaneFlowConfig:
     landmark_chunk: int = 64
     landmark_max: int = 64
     tokenizer_backend: str = "saneflow_bpe"
-    tokenizer_path: str = "tokenizers/saneflow_fineweb_edu_16k"
+    tokenizer_path: str = "saneflow/tokenizers/saneflow_fineweb_edu_16k"
     tokenizer_sha256: str = ""
 
     def to_dict(self) -> dict:

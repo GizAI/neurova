@@ -959,7 +959,7 @@ Mamba처럼 모든 과거를 하나의 state에 압축하는 모델도 아니라
 ### 1. memory-circuit synthetic training
 
 ```text
-runs/luma_memory_circuit_v1
+luma/runs/luma_memory_circuit_v1
 loss: 5.59 -> 0.37
 ```
 
@@ -1002,12 +1002,12 @@ loss ignore 대상: pad_id
 수정 후 target_pad_frac ~= 0.414
 ```
 
-따라서 `runs/luma_dmc8_record_sft`의 매우 낮은 loss는 폐기하고, `runs/luma_dmc8_record_sft_padfix` 이후 결과만 봐야 한다.
+따라서 `luma/runs/luma_dmc8_record_sft`의 매우 낮은 loss는 폐기하고, `luma/runs/luma_dmc8_record_sft_padfix` 이후 결과만 봐야 한다.
 
 ### 3. padfix SFT도 학습은 된다
 
 ```text
-runs/luma_dmc8_record_sft_padfix
+luma/runs/luma_dmc8_record_sft_padfix
 step 2000
 loss ~= 0.200
 lm_loss ~= 0.205
@@ -1036,17 +1036,17 @@ A: Collapse is when a modelue of field without is the time completed per unit of
 4지선다, chance는 약 25%.
 
 ```text
-runs/luma_dmc8_proto:
+luma/runs/luma_dmc8_proto:
 normal            18.1%
 no_slots          18.1%
 random_slot_keys  20.8%
 
-runs/luma_dmc8_sft:
+luma/runs/luma_dmc8_sft:
 normal            23.6%
 no_slots          29.2%
 random_slot_keys  25.0%
 
-runs/luma_memory_circuit_v1:
+luma/runs/luma_memory_circuit_v1:
 normal            22.2%
 no_slots          22.2%
 random_slot_keys  22.2%
@@ -1061,12 +1061,12 @@ random_slot_keys  22.2%
 ```text
 Built-in memory QA, 160 cases, chance ~= 25%
 
-runs/luma_memory_circuit_v1:
+luma/runs/luma_memory_circuit_v1:
 normal            28.1%
 no_slots          21.9%
 random_slot_keys  27.5%
 
-runs/luma_dmc8_proto:
+luma/runs/luma_dmc8_proto:
 normal            24.4%
 no_slots          25.0%
 random_slot_keys  26.3%

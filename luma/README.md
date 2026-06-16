@@ -1,7 +1,7 @@
 # LUMA: Ledgered Universal Memory Automaton
 
 Status: stopped archive. LUMA is not the active Neurova model line, not the
-default launcher target, and not eligible for `runs/luma_current` promotion.
+default launcher target, and not eligible for `luma/runs/luma_current` promotion.
 Run it only for explicit archive/debug work with `NEUROVA_ALLOW_LUMA=1`.
 
 This folder is a runnable zero-base prototype of the LUMA idea: events are mixed
@@ -17,7 +17,7 @@ Historical validation path:
 2. `mixed_chat`: after memory proof passes, mix raw continuation, short chat,
    answer-only memory curriculum, and a smaller slot-proof stream.
 3. `chat_candidate`: promote only when chat sanity and memory ablation gates
-   both pass. `runs/luma_current` is reserved for this stage only.
+   both pass. `luma/runs/luma_current` is reserved for this stage only.
 
 ## What is implemented
 
@@ -25,7 +25,7 @@ Historical validation path:
 - `bytepatch`: exact byte-preserving adaptive patch route with all byte
   fallbacks, all byte-pair patches, common multi-byte latent patches,
   corpus-learned latent patches, and byte-span metadata.
-- `qwen`: Qwen3.5 BBPE tokenizer route backed by `tokenizers/qwen35`.
+- `qwen`: Qwen3.5 BBPE tokenizer route backed by `luma/tokenizers/qwen35`.
 - `LUMALM`, an attention-free language model.
 - `LUMABlock`, which performs event encoding, causal local mixing, sparse slot
   read, gated slot edit, slot utility/confidence updates, and token decoding.
@@ -46,7 +46,7 @@ proof-grounded decoding.
 
 ## Promotion gate
 
-Do not promote a run to `runs/luma_current` until it passes both surfaces:
+Do not promote a run to `luma/runs/luma_current` until it passes both surfaces:
 
 - Chat sanity: `hi`, self-introduction, and simple QA produce readable Korean or
   English sentences without repetition collapse.
@@ -56,9 +56,9 @@ Do not promote a run to `runs/luma_current` until it passes both surfaces:
 ## Quick smoke train
 
 ```bash
-python3 -m luma.train --steps 50 --batch-size 4 --d-model 96 --layers 2 --slots 32 --topk 4 --seq-len 192 --out runs/luma-smoke
-python3 -m luma.generate --ckpt runs/luma-smoke/model.pt --prompt $'Memory page:\nMina owns the blue key.\nMina should go to seoul.\nQuestion: What object belongs to Mina?\nAnswer:'
-python3 -m luma.eval_memory --ckpt runs/luma-smoke/model.pt --cases 20 --compare-ablations
+python3 -m luma.train --steps 50 --batch-size 4 --d-model 96 --layers 2 --slots 32 --topk 4 --seq-len 192 --out luma/runs/luma-smoke
+python3 -m luma.generate --ckpt luma/runs/luma-smoke/model.pt --prompt $'Memory page:\nMina owns the blue key.\nMina should go to seoul.\nQuestion: What object belongs to Mina?\nAnswer:'
+python3 -m luma.eval_memory --ckpt luma/runs/luma-smoke/model.pt --cases 20 --compare-ablations
 ```
 
 ## Qwen3.5 tokenizer route
@@ -66,7 +66,7 @@ python3 -m luma.eval_memory --ckpt runs/luma-smoke/model.pt --cases 20 --compare
 Download tokenizer-only files:
 
 ```bash
-python3 scripts/luma_download_qwen_tokenizer.py --repo Qwen/Qwen3.5-0.8B --out tokenizers/qwen35
+python3 luma/scripts/luma_download_qwen_tokenizer.py --repo Qwen/Qwen3.5-0.8B --out luma/tokenizers/qwen35
 ```
 
 Train the same LUMA core with Qwen BBPE tokens instead of raw bytes:
@@ -74,7 +74,7 @@ Train the same LUMA core with Qwen BBPE tokens instead of raw bytes:
 ```bash
 python3 -m luma.train \
   --tokenizer-backend qwen \
-  --qwen-tokenizer-path tokenizers/qwen35 \
+  --qwen-tokenizer-path luma/tokenizers/qwen35 \
   --dataset-mode records \
   --data luma/README.md \
   --steps 50 \
@@ -84,12 +84,12 @@ python3 -m luma.train \
   --layers 2 \
   --slots 32 \
   --topk 4 \
-  --out runs/luma-qwen-smoke
+  --out luma/runs/luma-qwen-smoke
 ```
 
 Checkpoints store `tokenizer_backend`, tokenizer paths, vocabulary size, and a
 tokenizer fingerprint, so
-`luma.generate` and `scripts/luma_chat.py` automatically reopen the correct
+`luma.generate` and `luma/scripts/luma_chat.py` automatically reopen the correct
 front-end. The event/slot core is shared; embeddings and output heads remain
 backend-specific through each checkpoint's vocabulary size.
 
@@ -103,7 +103,7 @@ tokens. It uses:
 - 65,536 byte-pair patch tokens
 - Common multi-byte latent patches for chat, English, code, JSON, and Korean
 - Optional corpus-learned latent patches from
-  `tokenizers/luma_bytepatch/bytepatch_vocab.json`
+  `luma/tokenizers/luma_bytepatch/bytepatch_vocab.json`
 - `encode_with_spans()` metadata carrying `byte_start`, `byte_end`, and patch
   source, so ledger/proof memory can store raw-byte provenance instead of
   tokenizer ids.
@@ -111,9 +111,9 @@ tokens. It uses:
 Learn the corpus-adaptive patch vocabulary first:
 
 ```bash
-python3 scripts/luma_train_bytepatch_tokenizer.py \
+python3 luma/scripts/luma_train_bytepatch_tokenizer.py \
   --data luma/README.md \
-  --out tokenizers/luma_bytepatch/bytepatch_vocab.json \
+  --out luma/tokenizers/luma_bytepatch/bytepatch_vocab.json \
   --max-patches 8192 \
   --min-count 2 \
   --min-len 3 \
@@ -125,7 +125,7 @@ Smoke train:
 ```bash
 python3 -m luma.train \
   --tokenizer-backend bytepatch \
-  --bytepatch-vocab-path tokenizers/luma_bytepatch/bytepatch_vocab.json \
+  --bytepatch-vocab-path luma/tokenizers/luma_bytepatch/bytepatch_vocab.json \
   --dataset-mode records \
   --data luma/README.md \
   --steps 50 \
@@ -135,7 +135,7 @@ python3 -m luma.train \
   --layers 2 \
   --slots 32 \
   --topk 4 \
-  --out runs/luma-bytepatch-smoke
+  --out luma/runs/luma-bytepatch-smoke
 ```
 
 ## Archived Training Recipe
@@ -151,13 +151,13 @@ python3 -m luma.train \
   --layers 8 \
   --slots 192 \
   --topk 8 \
-  --out runs/luma_memory_proof_v1
+  --out luma/runs/luma_memory_proof_v1
 ```
 
 Remote DMC8 run:
 
 ```bash
-ssh ml-dmc8 'cd /home/user/workspace/neurova && source ~/miniconda3/etc/profile.d/conda.sh && conda activate mamba3_siso && ./scripts/luma_train_dmc8.sh'
+ssh ml-dmc8 'cd /home/user/workspace/neurova && source ~/miniconda3/etc/profile.d/conda.sh && conda activate mamba3_siso && ./luma/scripts/luma_train_dmc8.sh'
 ```
 
 The DMC8 script defaults to `RECIPE=memory_proof` and writes

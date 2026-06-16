@@ -12,7 +12,7 @@ from .tokenizer import assert_tokenizer_contract, build_tokenizer
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate text with a trained LUMA checkpoint.")
-    p.add_argument("--ckpt", default="runs/luma-smoke/model.pt")
+    p.add_argument("--ckpt", default="luma/runs/luma-smoke/model.pt")
     p.add_argument("--prompt", default="Memory page:\nMina owns the blue key.\nQuestion: What object belongs to Mina?\nAnswer:")
     p.add_argument("--max-new", type=int, default=80)
     p.add_argument("--temperature", type=float, default=0.8)

@@ -8,13 +8,16 @@ neurova.egg-info/
 neurova_state/
 neurova_test_state/
 data/
+**/data/
 .neurova_ttt_*.json
 .neurova_v6/
 .neurova_v6_backups/
 .env
-runs/
+**/runs/
 mamba/
 mamba.c/
 papers/
+**/papers/
 tokenizers/
+**/tokenizers/
 kor-racing-predictor/

@@ -1,0 +1,119 @@
+{
+  "name": "saneflow_practical_pretrain_v2_en",
+  "description": "English-only high-quality pretraining mix: FineWeb-Edu, DCLM, DCLM-Edu, Zyda, FineMath, and local code/math reasoning converted to raw continuation documents.",
+  "hf_env": "../giz/giz.env",
+  "hf_env_fallbacks": [
+    ".env"
+  ],
+  "output_root": "saneflow/data/corpus/sources/practical_pretrain_v2_en",
+  "mix_dir": "saneflow/data/corpus/mixes/saneflow_practical_pretrain_v2_en",
+  "train_records": 60000,
+  "valid_records": 2000,
+  "valid_every": 101,
+  "progress_every": 1000,
+  "filters": {
+    "min_chars": 180,
+    "max_chars": 14000,
+    "reject_hangul": true,
+    "dedup": "normalized_text_sha256",
+    "max_pii_score": 0.2,
+    "min_quality_score": 0.55
+  },
+  "sources": [
+    {
+      "name": "fineweb_edu_sample10bt",
+      "kind": "hf_stream",
+      "dataset": "HuggingFaceFW/fineweb-edu",
+      "config": "sample-10BT",
+      "split": "train",
+      "text_field": "text",
+      "domain": "educational_web",
+      "language": "en",
+      "ratio": 0.30,
+      "max_train_records": 18000,
+      "max_valid_records": 500
+    },
+    {
+      "name": "dclm_baseline_v1",
+      "kind": "hf_stream",
+      "dataset": "mlfoundations/dclm-baseline-1.0",
+      "config": null,
+      "split": "train",
+      "text_field": "text",
+      "domain": "filtered_web",
+      "language": "en",
+      "ratio": 0.22,
+      "max_train_records": 13000,
+      "max_valid_records": 400
+    },
+    {
+      "name": "dclm_edu",
+      "kind": "hf_stream",
+      "dataset": "HuggingFaceTB/dclm-edu",
+      "config": null,
+      "split": "train",
+      "text_field": "text",
+      "domain": "educational_web",
+      "language": "en",
+      "ratio": 0.14,
+      "max_train_records": 9000,
+      "max_valid_records": 300
+    },
+    {
+      "name": "zyda2_sample100bt",
+      "kind": "hf_stream",
+      "dataset": "Zyphra/Zyda-2",
+      "config": "sample-100BT",
+      "split": "train",
+      "text_field": "text",
+      "domain": "filtered_web",
+      "language": "en",
+      "ratio": 0.10,
+      "max_train_records": 7000,
+      "max_valid_records": 250
+    },
+    {
+      "name": "finemath_4plus",
+      "kind": "hf_stream",
+      "dataset": "HuggingFaceTB/finemath",
+      "config": "finemath-4plus",
+      "split": "train",
+      "text_field": "text",
+      "domain": "math",
+      "language": "en",
+      "ratio": 0.10,
+      "max_train_records": 7000,
+      "max_valid_records": 250
+    },
+    {
+      "name": "opencodeinstruct_code",
+      "kind": "local_jsonl_chatml",
+      "path": "saneflow/data/corpus/sft_sources/opencodeinstruct_direct.jsonl",
+      "domain": "code",
+      "language": "en",
+      "ratio": 0.08,
+      "max_train_records": 5000,
+      "max_valid_records": 180
+    },
+    {
+      "name": "openr1_math",
+      "kind": "local_jsonl_chatml",
+      "path": "saneflow/data/corpus/sft_sources/openr1_math_220k.jsonl",
+      "domain": "math_reasoning",
+      "language": "en",
+      "ratio": 0.04,
+      "max_train_records": 2500,
+      "max_valid_records": 100
+    },
+    {
+      "name": "limo_math",
+      "kind": "local_jsonl_chatml",
+      "path": "saneflow/data/corpus/sft_sources/limo.jsonl",
+      "domain": "math_reasoning",
+      "language": "en",
+      "ratio": 0.02,
+      "max_train_records": 1500,
+      "max_valid_records": 70
+    }
+  ]
+}

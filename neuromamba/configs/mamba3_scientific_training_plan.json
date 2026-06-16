@@ -1,0 +1,51 @@
+{
+  "name": "mamba3-scientific-training-plan-v1",
+  "principle": "Separate base language modeling from instruction SFT. Never continue-pretrain a chat checkpoint directly on raw web shards.",
+  "hardware": {
+    "rtx_4080_16gb": {
+      "role": ["tiny kernel canary", "interactive inference", "data pipeline validation"],
+      "not_for": ["paper-scale MIMO-R4 full pretraining"]
+    }
+  },
+  "stages": [
+    {
+      "id": "corpus_governance",
+      "goal": "Every sample has metadata and passes license, contamination, toxicity, PII, and dedup gates.",
+      "script": "neuromamba/scripts/mamba3_prepare_corpora.sh",
+      "outputs": ["neuromamba/data/governed_fineweb_edu_sample.jsonl", "neuromamba/data/governed_dclm_sample.jsonl", "neuromamba/data/mamba3_corpus_manifest.json"],
+      "gate": "neuromamba/scripts/mamba3_validate_governance.py each governed jsonl"
+    },
+    {
+      "id": "split",
+      "goal": "Create deterministic train/valid splits before training.",
+      "script": "neuromamba/scripts/mamba3_make_splits.py",
+      "outputs": ["neuromamba/data/splits/base_train.jsonl", "neuromamba/data/splits/base_valid.jsonl", "neuromamba/data/splits/sft_train.txt", "neuromamba/data/splits/sft_valid.txt"]
+    },
+    {
+      "id": "base_pretrain_canary",
+      "goal": "Train tiny Mamba-3 MIMO-R4 from scratch on governed web/edu data only.",
+      "checkpoint": "neuromamba/runs/mamba3_scientific/base.pt",
+      "data": ["neuromamba/data/splits/base_train.jsonl"],
+      "validation": ["neuromamba/data/splits/base_valid.jsonl"],
+      "minimum_gate": "validation loss must be finite and lower than initial random baseline"
+    },
+    {
+      "id": "instruction_sft_canary",
+      "goal": "Start from base checkpoint, then tune instruction format on instruction-only data.",
+      "checkpoint": "neuromamba/runs/mamba3_scientific/sft.pt",
+      "data": ["neuromamba/data/splits/sft_train.txt"],
+      "validation": ["neuromamba/data/splits/sft_valid.txt"],
+      "minimum_gate": "eval-english must not collapse into repeated punctuation, digits, or common words"
+    },
+    {
+      "id": "runtime_gate",
+      "goal": "Verify recurrent decode, streaming chat, and warm token/s.",
+      "script": "neuromamba/scripts/mamba3_run_gates.sh"
+    }
+  ],
+  "promotion_rule": {
+    "tiny_to_180m": "Only promote after the tiny canary preserves instruction behavior after base-pretrain then SFT.",
+    "180m_to_440m": "Only promote on hardware where MIMO-R4 backward passes kernel probe.",
+    "paper_scale": "Requires enough storage, long-running orchestration, and a GPU/kernel path that supports MIMO-R4 backward."
+  }
+}

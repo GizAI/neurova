@@ -60,7 +60,7 @@ class ByteTokenizer:
 
 @dataclass(frozen=True)
 class QwenTokenizer:
-    path: str = "tokenizers/qwen35"
+    path: str = "luma/tokenizers/qwen35"
     pad_id: int = 248044
     bos_id: int = 248044
     eos_id: int = 248044
@@ -70,7 +70,7 @@ class QwenTokenizer:
         tokenizer_json = root / "tokenizer.json"
         if not tokenizer_json.exists():
             raise FileNotFoundError(
-                f"Qwen tokenizer not found at {tokenizer_json}; run scripts/luma_download_qwen_tokenizer.py"
+                f"Qwen tokenizer not found at {tokenizer_json}; run luma/scripts/luma_download_qwen_tokenizer.py"
             )
         from tokenizers import Tokenizer
 
@@ -147,7 +147,7 @@ class AdaptiveBytePatchTokenizer:
     pair_offset: int = 259
     common_offset: int = 65795
     max_patch_bytes: int = 24
-    vocab_path: str = "tokenizers/luma_bytepatch/bytepatch_vocab.json"
+    vocab_path: str = "luma/tokenizers/luma_bytepatch/bytepatch_vocab.json"
 
     def __post_init__(self) -> None:
         common = self._load_common_patches()
@@ -301,8 +301,8 @@ def write_bytepatch_vocab(path: str | Path, patches: list[bytes], *, source: str
 
 def build_tokenizer(
     backend: str = "byte",
-    qwen_path: str = "tokenizers/qwen35",
-    bytepatch_vocab_path: str = "tokenizers/luma_bytepatch/bytepatch_vocab.json",
+    qwen_path: str = "luma/tokenizers/qwen35",
+    bytepatch_vocab_path: str = "luma/tokenizers/luma_bytepatch/bytepatch_vocab.json",
 ) -> LUMATokenizer:
     if backend == "byte":
         return ByteTokenizer()
@@ -316,8 +316,8 @@ def build_tokenizer(
 def tokenizer_fingerprint(
     backend: str,
     *,
-    qwen_path: str = "tokenizers/qwen35",
-    bytepatch_vocab_path: str = "tokenizers/luma_bytepatch/bytepatch_vocab.json",
+    qwen_path: str = "luma/tokenizers/qwen35",
+    bytepatch_vocab_path: str = "luma/tokenizers/luma_bytepatch/bytepatch_vocab.json",
 ) -> str:
     if backend == "bytepatch":
         path = Path(bytepatch_vocab_path)
@@ -343,8 +343,8 @@ def assert_tokenizer_contract(config: dict, tokenizer: LUMATokenizer) -> None:
         raise RuntimeError("checkpoint is missing tokenizer_sha256; retrain with the current tokenizer contract")
     actual_fingerprint = tokenizer_fingerprint(
         config["tokenizer_backend"],
-        qwen_path=config.get("qwen_tokenizer_path", "tokenizers/qwen35"),
-        bytepatch_vocab_path=config.get("bytepatch_vocab_path", "tokenizers/luma_bytepatch/bytepatch_vocab.json"),
+        qwen_path=config.get("qwen_tokenizer_path", "luma/tokenizers/qwen35"),
+        bytepatch_vocab_path=config.get("bytepatch_vocab_path", "luma/tokenizers/luma_bytepatch/bytepatch_vocab.json"),
     )
     if actual_fingerprint != expected_fingerprint:
         raise RuntimeError(

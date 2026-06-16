@@ -1,0 +1,47 @@
+{
+  "name": "saneflow_practical_pretrain_v1",
+  "train_out": "saneflow/data/corpus/mixes/saneflow_practical_pretrain_v1/train.jsonl",
+  "valid_out": "saneflow/data/corpus/mixes/saneflow_practical_pretrain_v1/valid.jsonl",
+  "manifest_out": "saneflow/data/corpus/mixes/saneflow_practical_pretrain_v1/manifest.json",
+  "ratio_override": "saneflow/data/corpus/mixes/saneflow_practical_pretrain_v1/doremi_ratios.json",
+  "quality_filter": {
+    "min_quality_score": 0.55,
+    "max_pii_score": 0.20,
+    "dedup": "normalized_text_sha256",
+    "policy": "education/document-quality heuristic plus upstream score when present"
+  },
+  "train_records": 120000,
+  "valid_records": 3000,
+  "sources": [
+    {
+      "name": "fineweb_edu_sample10bt",
+      "train": "saneflow/data/corpus/sources/fineweb_edu_sample10bt/train.jsonl",
+      "valid": "saneflow/data/corpus/sources/fineweb_edu_sample10bt/valid.jsonl",
+      "ratio": 0.45
+    },
+    {
+      "name": "dclm_baseline_v1",
+      "train": "saneflow/data/corpus/sources/dclm_baseline_v1/train.jsonl",
+      "valid": "saneflow/data/corpus/sources/dclm_baseline_v1/valid.jsonl",
+      "ratio": 0.25
+    },
+    {
+      "name": "gneissweb_v1",
+      "train": "saneflow/data/corpus/sources/gneissweb_v1/train.jsonl",
+      "valid": "saneflow/data/corpus/sources/gneissweb_v1/valid.jsonl",
+      "ratio": 0.15
+    },
+    {
+      "name": "fineweb2_hq_en",
+      "train": "saneflow/data/corpus/sources/fineweb2_hq_en/train.jsonl",
+      "valid": "saneflow/data/corpus/sources/fineweb2_hq_en/valid.jsonl",
+      "ratio": 0.10
+    },
+    {
+      "name": "fineweb2_hq_ko",
+      "train": "saneflow/data/corpus/sources/fineweb2_hq_ko/train.jsonl",
+      "valid": "saneflow/data/corpus/sources/fineweb2_hq_ko/valid.jsonl",
+      "ratio": 0.05
+    }
+  ]
+}

@@ -22,7 +22,7 @@ input bytes/tokens
 - `language decoder`: carries conversation quality and world/language prior.
   A small from-scratch decoder is acceptable for memory proof, but not for a
   high-quality chat model.
-- `promotion gate`: no run becomes `runs/luma_current` unless both memory proof
+- `promotion gate`: no run becomes `luma/runs/luma_current` unless both memory proof
   and chat sanity pass.
 
 ## Training Order
@@ -41,7 +41,7 @@ input bytes/tokens
      preserved.
 
 3. `chat_candidate`
-   - Objective: candidate for `runs/luma_current`.
+   - Objective: candidate for `luma/runs/luma_current`.
    - Required gates: readable hi/self-intro/simple QA, copy exact > 50%,
      recall > 60%, json_field > 70%, no repetition collapse, and ablation
      separation.
@@ -57,7 +57,7 @@ input bytes/tokens
 
 ## Current Verdict
 
-`runs/luma_mixed_v7_slotproof_fast` is not a chat model and not a proven memory
+`luma/runs/luma_mixed_v7_slotproof_fast` is not a chat model and not a proven memory
 model. Its training loss decreased, but online probes showed `no_slots` and
 `random_slot_keys` had lower LM loss than `normal`, and exact memory QA remained
 0%. It is preserved as a negative control, not promoted.

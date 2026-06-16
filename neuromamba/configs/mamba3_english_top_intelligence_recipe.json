@@ -1,0 +1,176 @@
+{
+  "name": "mamba3-english-top-intelligence-recipe-v1",
+  "architecture": {
+    "family": "pure Mamba-3",
+    "target": "MIMO-R4 + SwiGLU + pre-norm + BC/QK Norm + learnable B/C bias",
+    "tokenizer": {
+      "current_local": "llama31",
+      "ideal_from_scratch": "64K-100K English+code+math-LaTeX BPE/SPM",
+      "special_tokens": [
+        "chat boundary",
+        "tool boundary",
+        "reasoning boundary",
+        "code boundary",
+        "document boundary",
+        "state/checkpoint boundary"
+      ]
+    },
+    "paper_presets": ["mimo-r4-paper-180m", "mimo-r4-440m", "mimo-r4-880m", "mimo-r4-1.5b"],
+    "active_compute_policy": {
+      "warning": "Do not treat top-1 sparse MoE total parameters as dense active parameters.",
+      "local_current": "mimo-r4-moe-2.4b is a maximum-total-parameter diagnostic path.",
+      "sota_oriented_next": [
+        "dense-ish 900M/1.3B throughput baseline",
+        "trainable dense 1.3B-2.7B if offload or kernel limits allow",
+        "top-2/top-4 MoE with load-balancing auxiliary loss and router entropy monitoring"
+      ]
+    }
+  },
+  "data_governance": "neuromamba/configs/mamba3_data_governance_schema.json",
+  "source_references": {
+    "nemotron_cc": "https://arxiv.org/html/2412.02595v2",
+    "dclm_baseline": "https://arxiv.org/abs/2406.11794",
+    "fineweb_fineweb_edu": "https://arxiv.org/abs/2406.17557",
+    "dolma": "https://arxiv.org/abs/2402.00159",
+    "nemotron_cc_math": "https://arxiv.org/abs/2508.15096",
+    "openthoughts3": "https://github.com/open-thoughts/open-thoughts",
+    "numinamath": "https://huggingface.co/collections/AI-MO/numinamath",
+    "opencodeinstruct": "https://arxiv.org/abs/2504.04030",
+    "tulu3": "https://arxiv.org/abs/2411.15124",
+    "smoltalk2": "https://huggingface.co/datasets/HuggingFaceTB/smoltalk2",
+    "magpie": "https://arxiv.org/abs/2406.08464",
+    "longmagpie": "https://arxiv.org/abs/2505.17134",
+    "helpsteer2": "https://arxiv.org/abs/2406.08673",
+    "skywork_synpref": "https://arxiv.org/abs/2507.01352"
+  },
+  "base_pretraining": {
+    "small_300m": {
+      "tokens": "30B-100B",
+      "mix": {
+        "fineweb_edu": 0.30,
+        "dclm_baseline": 0.30,
+        "nemotron_cc_hq": 0.20,
+        "code": 0.10,
+        "math_science": 0.10
+      }
+    },
+    "one_b": {
+      "tokens": "100B-300B",
+      "mix": {
+        "fineweb_edu": 0.25,
+        "dclm_baseline": 0.30,
+        "nemotron_cc_hq": 0.25,
+        "code": 0.10,
+        "math_science": 0.10
+      }
+    },
+    "three_to_eight_b": {
+      "tokens": "500B-1.5T",
+      "mix": {
+        "nemotron_cc": 0.40,
+        "dclm": 0.25,
+        "fineweb_edu": 0.20,
+        "dolma_books_wiki": 0.05,
+        "code": 0.05,
+        "math_science": 0.05
+      }
+    },
+    "seven_b": {
+      "tokens": "2T-5T",
+      "mix": {
+        "nemotron_cc": 0.45,
+        "dclm": 0.25,
+        "fineweb_edu": 0.15,
+        "code_math_science": 0.12,
+        "books_wiki_other": 0.03
+      }
+    },
+    "thirty_b_plus": {
+      "tokens": "8T-15T+",
+      "mix": {
+        "nemotron_cc": 0.50,
+        "dclm_fineweb": 0.28,
+        "code_math_science": 0.17,
+        "other": 0.05
+      }
+    }
+  },
+  "continued_pretraining": {
+    "mix": {
+      "fineweb_edu_dclm_high_score": 0.35,
+      "nemotron_cc_hq": 0.25,
+      "nemotron_cc_math": 0.15,
+      "code": 0.15,
+      "science_papers_qa": 0.10
+    }
+  },
+  "reasoning_midtraining": {
+    "mix": {
+      "openthoughts3": 0.40,
+      "numinamath": 0.20,
+      "opencodeinstruct": 0.15,
+      "science_qa_gpqa_like": 0.10,
+      "self_generated_verified_reasoning": 0.15
+    },
+    "verification": {
+      "math": "exact answer or symbolic checker",
+      "code": "unit tests",
+      "science": "reference check",
+      "self_generated": "accepted only after verifier pass"
+    }
+  },
+  "sft": {
+    "mix": {
+      "tulu3_sft": 0.25,
+      "smoltalk2_sft": 0.25,
+      "magpie_high_quality": 0.20,
+      "opencodeinstruct": 0.10,
+      "openthoughts_short_long": 0.10,
+      "longmagpie": 0.05,
+      "safety_tool_function": 0.05
+    },
+    "modes": ["normal_answer", "deep_answer", "solve_mode", "tool_mode"]
+  },
+  "preference_optimization": {
+    "mix": {
+      "helpsteer2": 0.15,
+      "skywork_synpref": 0.25,
+      "ultrafeedback_style": 0.15,
+      "tulu_smoltalk_preference": 0.20,
+      "own_teacher_ensemble_preference": 0.25
+    },
+    "methods": ["DPO", "ORPO", "RLVR_for_verifiable_tasks"]
+  },
+  "long_context_curriculum": [
+    {"context": 2048, "stage": "base"},
+    {"context": 4096, "stage": "continued_pretrain"},
+    {"context": 8192, "stage": "sft"},
+    {"context": 16384, "stage": "long_document_qa"},
+    {"context": 32768, "stage": "retrieval_summarization"},
+    {"context": 65536, "stage": "final_stateful_adaptation"},
+    {"context": 131072, "stage": "final_stateful_adaptation"}
+  ],
+  "post_100m_local_decision_gate": {
+    "loss_around_8_and_collapse_free": "extend base to 300M then 1B local tokens before SFT",
+    "loss_down_but_collapse_persists": [
+      "diagnose router/expert usage histogram",
+      "measure router entropy and expert skew",
+      "evaluate need for load-balancing auxiliary loss",
+      "separate greedy decode collapse from model collapse with full-forward and sampling probes",
+      "verify recurrent decode parity and cache stability",
+      "inspect packing and token-length split warnings"
+    ],
+    "loss_plateau_and_collapse_persists": [
+      "compare dense-ish 900M and 1.3B throughput candidates",
+      "test load-balanced top-2/top-4 MoE",
+      "consider optimizer-state preservation via smaller active model or offload"
+    ]
+  },
+  "current_machine_policy": {
+    "rtx_4080_16gb": "runtime, interactive inference, tiny kernel canary, corpus validation",
+    "local_training_reality": "100M-token diagnostic blocks are not enough for dense-class intelligence",
+    "dense_2_4b_quality": "requires roughly 10B-50B high-quality tokens and larger active compute",
+    "sota_proximity": "requires multi-GPU training, hundreds of billions to trillions of tokens, strict evals, and post-training",
+    "paper_scale_training": "requires larger GPU or MIMO backward kernel rewrite"
+  }
+}

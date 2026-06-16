@@ -2,11 +2,11 @@
 
 Current status: LUMA is not the active speaking-model training line. The
 canonical Neurova training/data policy is now
-`docs/neurova_training_data_master_plan.md`; keep this file as the LUMA-specific
+`saneflow/docs/training_data_master_plan.md`; keep this file as the LUMA-specific
 slot-memory research and archive reference.
 
 This is the canonical local plan. Do not promote a checkpoint to
-`runs/luma_current` from any stage unless the final gates pass.
+`luma/runs/luma_current` from any stage unless the final gates pass.
 
 ## Data Contract
 
@@ -27,41 +27,41 @@ Build:
 ```bash
 python -m luma.build_training_data --version v2
 python -m luma.analyze_training_data \
-  data/luma_stage_raw_cont_v2.jsonl \
-  data/luma_stage_chatml_dialogue_v2.jsonl \
-  data/luma_stage_chatml_slotproof_v2.jsonl \
-  --out data/luma_training_data_analysis_v2.json
+  luma/data/luma_stage_raw_cont_v2.jsonl \
+  luma/data/luma_stage_chatml_dialogue_v2.jsonl \
+  luma/data/luma_stage_chatml_slotproof_v2.jsonl \
+  --out luma/data/luma_training_data_analysis_v2.json
 ```
 
 Outputs:
 
-- `data/luma_stage_raw_cont_v2.jsonl`
-- `data/luma_stage_natural_raw_v2.jsonl`
-- `data/luma_stage_natural_speak_raw_v2.jsonl`
-- `data/luma_stage_chatml_sft_v1.jsonl`
-- `data/luma_stage_chatml_reasoning_v1.jsonl`
-- `data/luma_stage_chatml_memory_v1.jsonl`
-- `data/luma_stage_chatml_dialogue_v2.jsonl`
-- `data/luma_stage_chatml_slotproof_v2.jsonl`
-- `data/luma_training_data_manifest_v1.json`
-- `data/luma_training_data_manifest_v2.json`
-- `data/luma_training_data_analysis_v2.json`
+- `luma/data/luma_stage_raw_cont_v2.jsonl`
+- `luma/data/luma_stage_natural_raw_v2.jsonl`
+- `luma/data/luma_stage_natural_speak_raw_v2.jsonl`
+- `luma/data/luma_stage_chatml_sft_v1.jsonl`
+- `luma/data/luma_stage_chatml_reasoning_v1.jsonl`
+- `luma/data/luma_stage_chatml_memory_v1.jsonl`
+- `luma/data/luma_stage_chatml_dialogue_v2.jsonl`
+- `luma/data/luma_stage_chatml_slotproof_v2.jsonl`
+- `luma/data/luma_training_data_manifest_v1.json`
+- `luma/data/luma_training_data_manifest_v2.json`
+- `luma/data/luma_training_data_analysis_v2.json`
 
 ## Source Policy
 
 Use now:
 
-- `data/english_bootstrap.txt` and `data/english_completion_bootstrap.txt` for
+- `luma/data/english_bootstrap.txt` and `luma/data/english_completion_bootstrap.txt` for
   raw continuation.
-- `data/train_dialogues.txt`, `data/english_instruction_bootstrap.txt`, and
-  `data/governed_instruction_sample.jsonl` for small clean chat behavior.
-- `data/deepseek_no_cheat_mcq_sft_v1_pilot.jsonl` and
-  `data/rlvr_verifier_bootstrap.jsonl` for reasoning/verifiable answers.
-- `data/mamba3_programmatic_curriculum.jsonl`,
-  `data/luma_memory_curriculum_v1.jsonl`, and v25-v27 IR corpora for memory
+- `luma/data/train_dialogues.txt`, `luma/data/english_instruction_bootstrap.txt`, and
+  `luma/data/governed_instruction_sample.jsonl` for small clean chat behavior.
+- `luma/data/deepseek_no_cheat_mcq_sft_v1_pilot.jsonl` and
+  `luma/data/rlvr_verifier_bootstrap.jsonl` for reasoning/verifiable answers.
+- `luma/data/mamba3_programmatic_curriculum.jsonl`,
+  `luma/data/luma_memory_curriculum_v1.jsonl`, and v25-v27 IR corpora for memory
   and event-slot extraction.
-- `data/luma_stage_chatml_dialogue_v2.jsonl` for the main dialogue route.
-- `data/luma_stage_chatml_slotproof_v2.jsonl` for the clean slot-proof route.
+- `luma/data/luma_stage_chatml_dialogue_v2.jsonl` for the main dialogue route.
+- `luma/data/luma_stage_chatml_slotproof_v2.jsonl` for the clean slot-proof route.
 
 Do not use as direct chat SFT:
 
@@ -86,10 +86,10 @@ here. Keep document continuation and plain QA as separate streams so the model
 learns language flow from raw text and direct answers from answer-only QA.
 
 ```bash
-RUN_DIR=runs/luma_stage1_qwen_natural_pre_v1 \
+RUN_DIR=luma/runs/luma_stage1_qwen_natural_pre_v1 \
 RECIPE=custom \
-RAW_DATA=data/luma_stage_raw_cont_v2.jsonl \
-QA_DATA=data/luma_stage_natural_speak_raw_v2.jsonl \
+RAW_DATA=luma/data/luma_stage_raw_cont_v2.jsonl \
+QA_DATA=luma/data/luma_stage_natural_speak_raw_v2.jsonl \
 CHAT_DATA= \
 MEMORY_DATA= \
 RAW_WEIGHT=0.75 \
@@ -113,15 +113,15 @@ TOPK=1 \
 COPY_WINDOW=0 \
 RUN_GENERATE=0 \
 RUN_MEMORY_EVAL=0 \
-./scripts/luma_train_dmc8.sh
+./luma/scripts/luma_train_dmc8.sh
 ```
 
 Gate:
 
 ```bash
 python -m luma.eval_natural_sanity \
-  --ckpt runs/luma_stage1_qwen_natural_pre_v1/model.pt \
-  --out runs/luma_stage1_qwen_natural_pre_v1/natural_sanity.json \
+  --ckpt luma/runs/luma_stage1_qwen_natural_pre_v1/model.pt \
+  --out luma/runs/luma_stage1_qwen_natural_pre_v1/natural_sanity.json \
   --device cuda \
   --dtype bf16
 ```
@@ -133,12 +133,12 @@ proof. Keep a small raw stream in the mix so the narrow local chat set does not
 overwrite the language prior learned in Stage 1.
 
 ```bash
-RUN_DIR=runs/luma_stage2_qwen_chat_sft_v1 \
-INIT_FROM=runs/luma_stage1_qwen_natural_pre_v1/model.pt \
+RUN_DIR=luma/runs/luma_stage2_qwen_chat_sft_v1 \
+INIT_FROM=luma/runs/luma_stage1_qwen_natural_pre_v1/model.pt \
 RECIPE=custom \
-RAW_DATA=data/luma_stage_raw_cont_v2.jsonl \
-QA_DATA=data/luma_stage_natural_speak_raw_v2.jsonl \
-CHAT_DATA=data/luma_stage_chatml_dialogue_v2.jsonl \
+RAW_DATA=luma/data/luma_stage_raw_cont_v2.jsonl \
+QA_DATA=luma/data/luma_stage_natural_speak_raw_v2.jsonl \
+CHAT_DATA=luma/data/luma_stage_chatml_dialogue_v2.jsonl \
 MEMORY_DATA= \
 RAW_WEIGHT=0.15 \
 QA_WEIGHT=0.15 \
@@ -159,7 +159,7 @@ TOPK=1 \
 COPY_WINDOW=0 \
 RUN_GENERATE=0 \
 RUN_MEMORY_EVAL=0 \
-./scripts/luma_train_dmc8.sh
+./luma/scripts/luma_train_dmc8.sh
 ```
 
 ### Stage 3: Clean Slot-Proof
@@ -168,13 +168,13 @@ Continue from Stage 2. The objective is slot usefulness. Loss alone is not a
 pass.
 
 ```bash
-RUN_DIR=runs/luma_stage3_qwen_slotproof_v1 \
-INIT_FROM=runs/luma_stage2_qwen_chat_sft_v1/model.pt \
+RUN_DIR=luma/runs/luma_stage3_qwen_slotproof_v1 \
+INIT_FROM=luma/runs/luma_stage2_qwen_chat_sft_v1/model.pt \
 RECIPE=custom \
-RAW_DATA=data/luma_stage_raw_cont_v2.jsonl \
-QA_DATA=data/luma_stage_natural_speak_raw_v2.jsonl \
-CHAT_DATA=data/luma_stage_chatml_dialogue_v2.jsonl \
-MEMORY_DATA=data/luma_stage_chatml_slotproof_v2.jsonl \
+RAW_DATA=luma/data/luma_stage_raw_cont_v2.jsonl \
+QA_DATA=luma/data/luma_stage_natural_speak_raw_v2.jsonl \
+CHAT_DATA=luma/data/luma_stage_chatml_dialogue_v2.jsonl \
+MEMORY_DATA=luma/data/luma_stage_chatml_slotproof_v2.jsonl \
 RAW_WEIGHT=0.15 \
 QA_WEIGHT=0.10 \
 CHAT_WEIGHT=0.35 \
@@ -193,7 +193,7 @@ D_MODEL=768 \
 LAYERS=10 \
 SLOTS=256 \
 COPY_WINDOW=0 \
-./scripts/luma_train_dmc8.sh
+./luma/scripts/luma_train_dmc8.sh
 ```
 
 ## Gates
@@ -203,6 +203,6 @@ COPY_WINDOW=0 \
 - Memory: copy exact > 50%, recall > 60%, json_field > 70%.
 - Slot proof: `normal` must beat `no_slots` and `random_slot_keys`; otherwise
   slots are noise.
-- Promotion: only a run that passes all gates can become `runs/luma_current`.
+- Promotion: only a run that passes all gates can become `luma/runs/luma_current`.
   Use `gate_summary.json` as the source of truth; do not promote from raw loss,
   chat loss, or one-off manual probes.

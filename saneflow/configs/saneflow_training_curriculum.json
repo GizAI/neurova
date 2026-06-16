@@ -1,0 +1,69 @@
+{
+  "name": "saneflow-training-curriculum-v3",
+  "canonical_model_line": "SaneFlowLM",
+  "hard_constraints": {
+    "use_transformers_library_in_model": false,
+    "use_transformer_blocks": true,
+    "use_mamba_kernels": false,
+    "promote_on_loss_only": false,
+    "train_on_mmlu_eval": false
+  },
+  "active_lines": [
+    {
+      "id": "line_a_speak_chat",
+      "profiles": ["dmc8-speak-base-v1", "dmc8-chatml-sft-v9"],
+      "host": "ml-dmc8",
+      "goal": "stable natural continuation, then gated ChatML assistant behavior",
+      "data": [
+        "saneflow/configs/saneflow_speak_pretrain_mix.json",
+        "saneflow/configs/saneflow_chatml_sft_recipe.json"
+      ],
+      "promotion_rule": "run SFT only after speak-base passes generation quality gate"
+    },
+    {
+      "id": "line_b_practical_base",
+      "profiles": ["dmc9-practical-base-100m"],
+      "host": "ml-dmc9",
+      "goal": "best practical 100M-class base from verified continuation data",
+      "data": [
+        "saneflow/configs/saneflow_practical_pretrain_sources.json",
+        "saneflow/configs/saneflow_practical_pretrain_mix.json"
+      ],
+      "promotion_rule": "base checkpoint only; no direct SFT from this line until generation gate passes"
+    },
+    {
+      "id": "line_c_dense_transformer_baseline",
+      "profiles": [
+        "dmc9-dense-0.3b-v1"
+      ],
+      "host": "ml-dmc9",
+      "goal": "Neurova-Dense-0.3B First, a direct PyTorch decoder-only Transformer baseline for fast from-scratch quality",
+      "data": [
+        "saneflow/configs/saneflow_practical_pretrain_sources.json",
+        "saneflow/configs/saneflow_practical_pretrain_mix.json"
+      ],
+      "promotion_rule": "base checkpoint only until generation and reasoning gates both pass"
+    }
+  ],
+  "shared_runtime": {
+    "decode_default": "cache",
+    "dtype": "bf16",
+    "optimizer": "muon",
+    "dataset_device": "cuda",
+    "syntax_mix_version": "v2",
+    "state_mixer_version": "v2_fixed_or_delta_matrix",
+    "attention_policy": "use sparse islands on SaneFlow lines; use full causal SDPA/GQA on dense Transformer baseline",
+    "tf32": true,
+    "decoding_controls": {
+      "repetition_penalty_default": 1.08,
+      "no_repeat_ngram_size_default": 4
+    }
+  },
+  "quality_gate": {
+    "empty_output_rate_max": 0.05,
+    "invalid_output_rate_max": 0.02,
+    "max_repeated_4gram_max": 4,
+    "mean_distinct_1_min": 0.22,
+    "mean_distinct_2_min": 0.45
+  }
+}

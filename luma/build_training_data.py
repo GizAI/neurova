@@ -429,8 +429,8 @@ def quality_filter(rows: list[dict[str, Any]], *, allow_mcq: bool, allow_memory_
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build canonical LUMA training datasets.")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--out-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path, default=Path("luma/data"))
+    parser.add_argument("--out-dir", type=Path, default=Path("luma/data"))
     parser.add_argument("--version", default="v1")
     args = parser.parse_args()
 

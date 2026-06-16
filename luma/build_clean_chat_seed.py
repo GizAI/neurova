@@ -127,7 +127,7 @@ def build_pairs() -> list[tuple[str, str]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a clean single-format ChatML SFT set.")
-    parser.add_argument("--out", default="data/luma_clean_chatml_sft_v1.jsonl")
+    parser.add_argument("--out", default="luma/data/luma_clean_chatml_sft_v1.jsonl")
     parser.add_argument("--repeat", type=int, default=100)
     args = parser.parse_args()
 

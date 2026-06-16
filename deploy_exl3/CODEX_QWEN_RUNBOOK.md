@@ -88,7 +88,7 @@ timeout 180 codex exec --ephemeral --json --sandbox read-only \
   -c model='"neurova/qwen"' \
   -c model_provider='"cliproxyapi"' \
   -c model_reasoning_effort='"low"' \
-  '도구를 사용해서 README.md, neurova_v6.py, deploy_exl3/README_TABBYAPI_EXL3.md를 확인해. 한국어로 8줄 이내로 요약해. 파일은 수정하지 마.'
+  '도구를 사용해서 README.md, neurova/v6.py, deploy_exl3/README_TABBYAPI_EXL3.md를 확인해. 한국어로 8줄 이내로 요약해. 파일은 수정하지 마.'
 ```
 
 Watch TabbyAPI metrics while Codex runs:

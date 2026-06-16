@@ -1,0 +1,84 @@
+{
+  "name": "mamba3-corpus-sources-v1",
+  "default_budget": {
+    "max_docs_per_source": 2000,
+    "max_bytes_per_source": 100000000,
+    "min_chars": 300
+  },
+  "sources": [
+    {
+      "id": "fineweb_edu",
+      "dataset": "HuggingFaceFW/fineweb-edu",
+      "split": "train",
+      "text_field": "text",
+      "license": "ODC-By-1.0+CommonCrawl-ToU",
+      "domain": "edu",
+      "quality_score": 0.85,
+      "out": "neuromamba/data/governed_fineweb_edu_sample.jsonl",
+      "status": "enabled"
+    },
+    {
+      "id": "dclm_baseline",
+      "dataset": "mlfoundations/dclm-baseline-1.0",
+      "split": "train",
+      "text_field": "text",
+      "license": "terms_required",
+      "domain": "web",
+      "quality_score": 0.82,
+      "out": "neuromamba/data/governed_dclm_sample.jsonl",
+      "status": "enabled",
+      "extra_pip": ["zstandard"]
+    },
+    {
+      "id": "open_web_math",
+      "dataset": "open-web-math/open-web-math",
+      "split": "train",
+      "text_field": "text",
+      "license": "CommonCrawl-derived",
+      "domain": "math",
+      "quality_score": 0.8,
+      "out": "neuromamba/data/governed_open_web_math_sample.jsonl",
+      "status": "enabled"
+    },
+    {
+      "id": "arxiv_abstracts",
+      "dataset": "gfissore/arxiv-abstracts-2021",
+      "split": "train",
+      "text_field": "abstract",
+      "license": "arXiv-derived",
+      "domain": "science",
+      "quality_score": 0.78,
+      "out": "neuromamba/data/governed_arxiv_abstracts_sample.jsonl",
+      "status": "enabled"
+    },
+    {
+      "id": "arxiv_summarization_article",
+      "dataset": "ccdv/arxiv-summarization",
+      "split": "train",
+      "text_field": "article",
+      "license": "arXiv-derived",
+      "domain": "science",
+      "quality_score": 0.62,
+      "out": "neuromamba/data/governed_arxiv_science_sample.jsonl",
+      "status": "disabled_artifact_tokens_xmath_xcite"
+    },
+    {
+      "id": "dolma",
+      "dataset": "allenai/dolma",
+      "license": "AI2-ImpACT",
+      "domain": "web",
+      "quality_score": 0.72,
+      "out": "neuromamba/data/governed_dolma_sample.jsonl",
+      "status": "blocked_by_legacy_dataset_script_in_datasets_5"
+    },
+    {
+      "id": "nemotron_cc",
+      "index": "https://data.commoncrawl.org/contrib/Nemotron/Nemotron-CC/index.html",
+      "license": "CommonCrawl-ToU",
+      "domain": "web",
+      "quality_score": 0.86,
+      "out": "neuromamba/data/governed_nemotron_cc_sample.jsonl",
+      "status": "index_available_raw_downloader_needed"
+    }
+  ]
+}

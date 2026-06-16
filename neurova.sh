@@ -23,10 +23,10 @@ if [[ "${1:-}" == "luma" ]]; then
     exit 2
   fi
   shift
-  LUMA_CHECKPOINT="${NEUROVA_LUMA_CHECKPOINT:-runs/luma_current/model.pt}"
+  LUMA_CHECKPOINT="${NEUROVA_LUMA_CHECKPOINT:-luma/runs/luma_current/model.pt}"
   if [[ ! -f "$LUMA_CHECKPOINT" ]]; then
     echo "LUMA checkpoint not found." >&2
-    echo "Expected: ${NEUROVA_LUMA_CHECKPOINT:-runs/luma_current/model.pt}" >&2
+    echo "Expected: ${NEUROVA_LUMA_CHECKPOINT:-luma/runs/luma_current/model.pt}" >&2
     echo "Promote a current strict-tokenizer checkpoint after training finishes." >&2
     exit 2
   fi
@@ -44,7 +44,7 @@ PY
   NO_REPEAT="${NEUROVA_LUMA_NO_REPEAT_NGRAM:-4}"
   DTYPE="${NEUROVA_LUMA_DTYPE:-auto}"
   if [[ $# -gt 0 ]]; then
-    exec python3 scripts/luma_chat.py \
+    exec python3 luma/scripts/luma_chat.py \
       --ckpt "$LUMA_CHECKPOINT" \
       --device "$DEVICE" \
       --dtype "$DTYPE" \
@@ -57,7 +57,7 @@ PY
       --no-repeat-ngram "$NO_REPEAT" \
       --prompt "$*"
   fi
-  exec python3 scripts/luma_chat.py \
+  exec python3 luma/scripts/luma_chat.py \
     --ckpt "$LUMA_CHECKPOINT" \
     --device "$DEVICE" \
     --dtype "$DTYPE" \
@@ -89,9 +89,9 @@ if [[ "${1:-}" == "saneflow" ]]; then
   HOST="${NEUROVA_SANEFLOW_HOST:-ml-dmc8}"
   ROOT="${NEUROVA_SANEFLOW_ROOT:-/home/user/workspace/neurova}"
   ENV_NAME="${NEUROVA_SANEFLOW_ENV:-mamba3_siso}"
-  CHECKPOINT="${NEUROVA_SANEFLOW_CHECKPOINT:-runs/saneflow_current/model.pt}"
-  FALLBACK_CHECKPOINT="${NEUROVA_SANEFLOW_FALLBACK_CHECKPOINT:-runs/saneflow_chatml_sft_v9_assistant/model.pt}"
-  TRAINING_CHECKPOINT="${NEUROVA_SANEFLOW_TRAINING_CHECKPOINT:-runs/saneflow_fineweb_edu_base_v3_100m_muon_mem/latest.pt}"
+  CHECKPOINT="${NEUROVA_SANEFLOW_CHECKPOINT:-saneflow/runs/saneflow_current/model.pt}"
+  FALLBACK_CHECKPOINT="${NEUROVA_SANEFLOW_FALLBACK_CHECKPOINT:-saneflow/runs/saneflow_chatml_sft_v9_assistant/model.pt}"
+  TRAINING_CHECKPOINT="${NEUROVA_SANEFLOW_TRAINING_CHECKPOINT:-saneflow/runs/saneflow_fineweb_edu_base_v3_100m_muon_mem/latest.pt}"
   PROMPT="${*:-Explain what a computer is in simple words:}"
   MAX_NEW="${NEUROVA_SANEFLOW_MAX_NEW:-160}"
   CONTEXT="${NEUROVA_SANEFLOW_CONTEXT:-256}"
@@ -125,19 +125,19 @@ if [[ "${1:-}" == "saneflow" ]]; then
 
   case "$ACTION" in
     chat)
-      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python scripts/saneflow_chat.py --ckpt \"\$CKPT\" --max-new $(q "$MAX_NEW") --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --repetition-penalty $(q "$REP") --no-repeat-ngram-size $(q "$NO_REPEAT") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE") $CHATML_FLAG $CHAT_PROMPT_FLAG"
+      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python saneflow/scripts/saneflow_chat.py --ckpt \"\$CKPT\" --max-new $(q "$MAX_NEW") --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --repetition-penalty $(q "$REP") --no-repeat-ngram-size $(q "$NO_REPEAT") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE") $CHATML_FLAG $CHAT_PROMPT_FLAG"
       ;;
     generate)
-      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python scripts/saneflow_generate.py --ckpt \"\$CKPT\" --prompt $(q "$PROMPT") --max-new $(q "$MAX_NEW") --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --repetition-penalty $(q "$REP") --no-repeat-ngram-size $(q "$NO_REPEAT") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE") $CHATML_FLAG"
+      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python saneflow/scripts/saneflow_generate.py --ckpt \"\$CKPT\" --prompt $(q "$PROMPT") --max-new $(q "$MAX_NEW") --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --repetition-penalty $(q "$REP") --no-repeat-ngram-size $(q "$NO_REPEAT") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE") $CHATML_FLAG"
       ;;
     eval)
-      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python scripts/saneflow_eval_prompts.py --ckpt \"\$CKPT\" --out runs/saneflow_latest_prompt_eval.json --max-new 80 --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE")"
+      remote_exec "CKPT=$(q "$CHECKPOINT"); if [[ ! -f \"\$CKPT\" && -f $(q "$FALLBACK_CHECKPOINT") ]]; then CKPT=$(q "$FALLBACK_CHECKPOINT"); fi; if [[ ! -f \"\$CKPT\" && -f $(q "$TRAINING_CHECKPOINT") ]]; then CKPT=$(q "$TRAINING_CHECKPOINT"); fi; python saneflow/scripts/saneflow_eval_prompts.py --ckpt \"\$CKPT\" --out saneflow/runs/saneflow_latest_prompt_eval.json --max-new 80 --context $(q "$CONTEXT") --temperature $(q "$TEMP") --top-k $(q "$TOP_K") --top-p $(q "$TOP_P") --decode $(q "$DECODE_MODE") --device cuda --dtype $(q "$DTYPE")"
       ;;
     status)
-      remote_exec "pgrep -af 'saneflow_train.py|saneflow_autoresearch_loop.sh' || true; python scripts/saneflow_researchctl_dmc8.sh status 2>/dev/null || true"
+      remote_exec "pgrep -af 'saneflow_train.py|saneflow_autoresearch_loop.sh' || true; bash saneflow/scripts/saneflow_researchctl_dmc8.sh status 2>/dev/null || true"
       ;;
     train)
-      remote_exec "chmod +x scripts/saneflow_researchctl_dmc8.sh scripts/saneflow_autoresearch_loop.sh; scripts/saneflow_researchctl_dmc8.sh start-auto"
+      remote_exec "chmod +x saneflow/scripts/saneflow_researchctl_dmc8.sh saneflow/scripts/saneflow_autoresearch_loop.sh; saneflow/scripts/saneflow_researchctl_dmc8.sh start-auto"
       ;;
   esac
   exit $?
@@ -164,15 +164,15 @@ if [[ "${1:-}" == "mamba3" ]]; then
   ENV_NAME="${NEUROVA_MAMBA3_ENV:-mamba3_siso}"
   MODE="${NEUROVA_MAMBA3_MODE:-mamba3-siso-fast-0.3b-ds128}"
   TOKENIZER="${NEUROVA_MAMBA3_TOKENIZER:-llama31}"
-  CHECKPOINT="${NEUROVA_MAMBA3_CHECKPOINT:-runs/mamba3_current/model.pt}"
-  FALLBACK_CHECKPOINT="${NEUROVA_MAMBA3_FALLBACK_CHECKPOINT:-runs/mamba3_current_training_chat/model.pt}"
-  SECOND_FALLBACK_CHECKPOINT="${NEUROVA_MAMBA3_SECOND_FALLBACK_CHECKPOINT:-runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt}"
+  CHECKPOINT="${NEUROVA_MAMBA3_CHECKPOINT:-neuromamba/runs/mamba3_current/model.pt}"
+  FALLBACK_CHECKPOINT="${NEUROVA_MAMBA3_FALLBACK_CHECKPOINT:-neuromamba/runs/mamba3_current_training_chat/model.pt}"
+  SECOND_FALLBACK_CHECKPOINT="${NEUROVA_MAMBA3_SECOND_FALLBACK_CHECKPOINT:-neuromamba/runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt}"
   SEQ_LEN="${NEUROVA_MAMBA3_SEQ:-128}"
   MAX_NEW="${NEUROVA_MAMBA3_MAX_NEW:-512}"
   DTYPE="${NEUROVA_MAMBA3_DTYPE:-bf16}"
   SERVER_HOST="${NEUROVA_MAMBA3_SERVER_HOST:-127.0.0.1}"
   SERVER_PORT="${NEUROVA_MAMBA3_SERVER_PORT:-8765}"
-  SERVER_RUN_DIR="${NEUROVA_MAMBA3_SERVER_RUN_DIR:-runs/mamba3_chat_server}"
+  SERVER_RUN_DIR="${NEUROVA_MAMBA3_SERVER_RUN_DIR:-neuromamba/runs/mamba3_chat_server}"
   USE_SERVER="${NEUROVA_MAMBA3_USE_SERVER:-1}"
   DECODE_MODE="${NEUROVA_MAMBA3_DECODE_MODE:-cache}"
   if [[ -n "${NEUROVA_MAMBA3_CUDA_GRAPH:-}" ]]; then
@@ -196,7 +196,7 @@ if [[ "${1:-}" == "mamba3" ]]; then
     MAX_NEW="${NEUROVA_MAMBA3_LONG_MAX_NEW:-512}"
     CUDA_GRAPH="${NEUROVA_MAMBA3_LONG_CUDA_GRAPH:-0}"
     SERVER_PORT="${NEUROVA_MAMBA3_LONG_SERVER_PORT:-8767}"
-    SERVER_RUN_DIR="${NEUROVA_MAMBA3_LONG_SERVER_RUN_DIR:-runs/mamba3_chat_server_long}"
+    SERVER_RUN_DIR="${NEUROVA_MAMBA3_LONG_SERVER_RUN_DIR:-neuromamba/runs/mamba3_chat_server_long}"
   fi
   if [[ "$ACTION" == "official" ]]; then
     ACTION="chat"
@@ -239,98 +239,98 @@ if [[ "${1:-}" == "mamba3" ]]; then
         if [[ "${NEUROVA_MAMBA3_STREAM:-$DEFAULT_STREAM}" == "0" ]]; then
           CLIENT_STREAM_FLAG="--no-stream"
         fi
-        remote_exec "$PICK_CHECKPOINT; export NEUROVA_MAMBA3_CHECKPOINT=\"\$CHECKPOINT\" NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") NEUROVA_MAMBA3_SERVER_RUN_DIR=$(q "$SERVER_RUN_DIR") NEUROVA_MAMBA3_MODE=$(q "$MODE") NEUROVA_MAMBA3_TOKENIZER=$(q "$TOKENIZER") NEUROVA_MAMBA3_SEQ=$(q "$SEQ_LEN") NEUROVA_MAMBA3_MAX_NEW=$(q "$MAX_NEW") NEUROVA_MAMBA3_DTYPE=$(q "$DTYPE") NEUROVA_MAMBA3_DECODE_MODE=$(q "$DECODE_MODE") NEUROVA_MAMBA3_CUDA_GRAPH=$(q "$CUDA_GRAPH") NEUROVA_MAMBA3_CACHE_PARITY_GUARD=$(q "$CACHE_PARITY_GUARD"); scripts/mamba3_infer_guard.sh run scripts/mamba3_chat_request.sh --prompt $(q "$PROMPT") $CLIENT_STREAM_FLAG"
+        remote_exec "$PICK_CHECKPOINT; export NEUROVA_MAMBA3_CHECKPOINT=\"\$CHECKPOINT\" NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") NEUROVA_MAMBA3_SERVER_RUN_DIR=$(q "$SERVER_RUN_DIR") NEUROVA_MAMBA3_MODE=$(q "$MODE") NEUROVA_MAMBA3_TOKENIZER=$(q "$TOKENIZER") NEUROVA_MAMBA3_SEQ=$(q "$SEQ_LEN") NEUROVA_MAMBA3_MAX_NEW=$(q "$MAX_NEW") NEUROVA_MAMBA3_DTYPE=$(q "$DTYPE") NEUROVA_MAMBA3_DECODE_MODE=$(q "$DECODE_MODE") NEUROVA_MAMBA3_CUDA_GRAPH=$(q "$CUDA_GRAPH") NEUROVA_MAMBA3_CACHE_PARITY_GUARD=$(q "$CACHE_PARITY_GUARD"); neuromamba/scripts/mamba3_infer_guard.sh run neuromamba/scripts/mamba3_chat_request.sh --prompt $(q "$PROMPT") $CLIENT_STREAM_FLAG"
       else
-        remote_exec "$PICK_CHECKPOINT; scripts/mamba3_infer_guard.sh run python scripts/mamba3_safe_chat.py $COMMON --prompt $(q "$PROMPT") --max-new $(q "$MAX_NEW") $STREAM_FLAG"
+        remote_exec "$PICK_CHECKPOINT; neuromamba/scripts/mamba3_infer_guard.sh run python neuromamba/scripts/mamba3_safe_chat.py $COMMON --prompt $(q "$PROMPT") --max-new $(q "$MAX_NEW") $STREAM_FLAG"
       fi
       ;;
     eval)
-      remote_exec "$PICK_CHECKPOINT; python -m mamba3_kr.cli eval-english $COMMON --max-new $(q "$MAX_NEW") $DECODE"
+      remote_exec "$PICK_CHECKPOINT; python -m neuromamba.cli eval-english $COMMON --max-new $(q "$MAX_NEW") $DECODE"
       ;;
     bench)
-      remote_exec "$PICK_CHECKPOINT; python -m mamba3_kr.cli bench-decode $COMMON --prompt $(q "$PROMPT") --max-new $(q "$MAX_NEW") --repeats 3 $DECODE"
+      remote_exec "$PICK_CHECKPOINT; python -m neuromamba.cli bench-decode $COMMON --prompt $(q "$PROMPT") --max-new $(q "$MAX_NEW") --repeats 3 $DECODE"
       ;;
     bench-mcq)
-      remote_exec "$PICK_CHECKPOINT; scripts/mamba3_exclusive_gpu_guard.sh run python scripts/mamba3_eval_mcq_bench.py --suite smoke --mode $(q "$MODE") --tokenizer $(q "$TOKENIZER") --checkpoint \"\$CHECKPOINT\" --seq-len $(q "$SEQ_LEN") --device cuda --dtype $(q "$DTYPE") --out runs/mamba3_benchmarks/latest_mcq_smoke.json"
+      remote_exec "$PICK_CHECKPOINT; neuromamba/scripts/mamba3_exclusive_gpu_guard.sh run python neuromamba/scripts/mamba3_eval_mcq_bench.py --suite smoke --mode $(q "$MODE") --tokenizer $(q "$TOKENIZER") --checkpoint \"\$CHECKPOINT\" --seq-len $(q "$SEQ_LEN") --device cuda --dtype $(q "$DTYPE") --out neuromamba/runs/mamba3_benchmarks/latest_mcq_smoke.json"
       ;;
     bench-mmlu)
-      remote_exec "$PICK_CHECKPOINT; scripts/mamba3_exclusive_gpu_guard.sh run python scripts/mamba3_eval_mcq_bench.py --suite mmlu --mmlu-subject ${NEUROVA_MMLU_SUBJECT:-all} --limit ${NEUROVA_MMLU_LIMIT:-100} --mode $(q "$MODE") --tokenizer $(q "$TOKENIZER") --checkpoint \"\$CHECKPOINT\" --seq-len $(q "$SEQ_LEN") --device cuda --dtype $(q "$DTYPE") --out runs/mamba3_benchmarks/latest_mmlu.json"
+      remote_exec "$PICK_CHECKPOINT; neuromamba/scripts/mamba3_exclusive_gpu_guard.sh run python neuromamba/scripts/mamba3_eval_mcq_bench.py --suite mmlu --mmlu-subject ${NEUROVA_MMLU_SUBJECT:-all} --limit ${NEUROVA_MMLU_LIMIT:-100} --mode $(q "$MODE") --tokenizer $(q "$TOKENIZER") --checkpoint \"\$CHECKPOINT\" --seq-len $(q "$SEQ_LEN") --device cuda --dtype $(q "$DTYPE") --out neuromamba/runs/mamba3_benchmarks/latest_mmlu.json"
       ;;
     bench-mmlu-redux)
-      remote_exec "$PICK_CHECKPOINT; scripts/mamba3_exclusive_gpu_guard.sh run python scripts/mamba3_eval_mcq_bench.py --suite mmlu_redux --mmlu-subject ${NEUROVA_MMLU_SUBJECT:-all} --redux-filter ${NEUROVA_MMLU_REDUX_FILTER:-ok} --limit ${NEUROVA_MMLU_REDUX_LIMIT:-100} --mode $(q "$MODE") --tokenizer $(q "$TOKENIZER") --checkpoint \"\$CHECKPOINT\" --seq-len $(q "$SEQ_LEN") --device cuda --dtype $(q "$DTYPE") --out runs/mamba3_benchmarks/latest_mmlu_redux.json"
+      remote_exec "$PICK_CHECKPOINT; neuromamba/scripts/mamba3_exclusive_gpu_guard.sh run python neuromamba/scripts/mamba3_eval_mcq_bench.py --suite mmlu_redux --mmlu-subject ${NEUROVA_MMLU_SUBJECT:-all} --redux-filter ${NEUROVA_MMLU_REDUX_FILTER:-ok} --limit ${NEUROVA_MMLU_REDUX_LIMIT:-100} --mode $(q "$MODE") --tokenizer $(q "$TOKENIZER") --checkpoint \"\$CHECKPOINT\" --seq-len $(q "$SEQ_LEN") --device cuda --dtype $(q "$DTYPE") --out neuromamba/runs/mamba3_benchmarks/latest_mmlu_redux.json"
       ;;
     bench-suite)
-      remote_exec "$PICK_CHECKPOINT; scripts/mamba3_exclusive_gpu_guard.sh run env MODE=$(q "$MODE") TOKENIZER=$(q "$TOKENIZER") CHECKPOINT=\"\$CHECKPOINT\" SEQ_LEN=$(q "$SEQ_LEN") MMLU_LIMIT=${NEUROVA_MMLU_LIMIT:-100} MMLU_REDUX_LIMIT=${NEUROVA_MMLU_REDUX_LIMIT:-100} MMLU_SUBJECT=${NEUROVA_MMLU_SUBJECT:-all} MMLU_REDUX_FILTER=${NEUROVA_MMLU_REDUX_FILTER:-ok} scripts/mamba3_benchmark_suite.sh"
+      remote_exec "$PICK_CHECKPOINT; neuromamba/scripts/mamba3_exclusive_gpu_guard.sh run env MODE=$(q "$MODE") TOKENIZER=$(q "$TOKENIZER") CHECKPOINT=\"\$CHECKPOINT\" SEQ_LEN=$(q "$SEQ_LEN") MMLU_LIMIT=${NEUROVA_MMLU_LIMIT:-100} MMLU_REDUX_LIMIT=${NEUROVA_MMLU_REDUX_LIMIT:-100} MMLU_SUBJECT=${NEUROVA_MMLU_SUBJECT:-all} MMLU_REDUX_FILTER=${NEUROVA_MMLU_REDUX_FILTER:-ok} neuromamba/scripts/mamba3_benchmark_suite.sh"
       ;;
     tune)
-      remote_exec "$PICK_CHECKPOINT; python scripts/mamba3_decode_tune.py $COMMON --max-new $(q "$MAX_NEW")"
+      remote_exec "$PICK_CHECKPOINT; python neuromamba/scripts/mamba3_decode_tune.py $COMMON --max-new $(q "$MAX_NEW")"
       ;;
     status)
-      remote_exec "scripts/mamba3_status_dashboard.sh"
+      remote_exec "neuromamba/scripts/mamba3_status_dashboard.sh"
       ;;
     diagnose)
-      remote_exec "$PICK_CHECKPOINT; python -m mamba3_kr.cli diagnose-decode $COMMON --prompt $(q "$PROMPT")"
+      remote_exec "$PICK_CHECKPOINT; python -m neuromamba.cli diagnose-decode $COMMON --prompt $(q "$PROMPT")"
       ;;
     probe)
-      remote_exec "$PICK_CHECKPOINT; python -m mamba3_kr.cli probe-kernel $COMMON --batch-size 1 --data data/english_completion_bootstrap.txt data/english_instruction_bootstrap.txt"
+      remote_exec "$PICK_CHECKPOINT; python -m neuromamba.cli probe-kernel $COMMON --batch-size 1 --data luma/data/english_completion_bootstrap.txt luma/data/english_instruction_bootstrap.txt"
       ;;
     serve)
       if [[ "$USE_SERVER" == "1" ]]; then
-        remote_exec "$PICK_CHECKPOINT; export NEUROVA_MAMBA3_CHECKPOINT=\"\$CHECKPOINT\" NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") NEUROVA_MAMBA3_SERVER_RUN_DIR=$(q "$SERVER_RUN_DIR") NEUROVA_MAMBA3_MODE=$(q "$MODE") NEUROVA_MAMBA3_TOKENIZER=$(q "$TOKENIZER") NEUROVA_MAMBA3_SEQ=$(q "$SEQ_LEN") NEUROVA_MAMBA3_MAX_NEW=$(q "$MAX_NEW") NEUROVA_MAMBA3_DTYPE=$(q "$DTYPE") NEUROVA_MAMBA3_DECODE_MODE=$(q "$DECODE_MODE") NEUROVA_MAMBA3_CUDA_GRAPH=$(q "$CUDA_GRAPH") NEUROVA_MAMBA3_CACHE_PARITY_GUARD=$(q "$CACHE_PARITY_GUARD"); scripts/mamba3_chat_repl.sh"
+        remote_exec "$PICK_CHECKPOINT; export NEUROVA_MAMBA3_CHECKPOINT=\"\$CHECKPOINT\" NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") NEUROVA_MAMBA3_SERVER_RUN_DIR=$(q "$SERVER_RUN_DIR") NEUROVA_MAMBA3_MODE=$(q "$MODE") NEUROVA_MAMBA3_TOKENIZER=$(q "$TOKENIZER") NEUROVA_MAMBA3_SEQ=$(q "$SEQ_LEN") NEUROVA_MAMBA3_MAX_NEW=$(q "$MAX_NEW") NEUROVA_MAMBA3_DTYPE=$(q "$DTYPE") NEUROVA_MAMBA3_DECODE_MODE=$(q "$DECODE_MODE") NEUROVA_MAMBA3_CUDA_GRAPH=$(q "$CUDA_GRAPH") NEUROVA_MAMBA3_CACHE_PARITY_GUARD=$(q "$CACHE_PARITY_GUARD"); neuromamba/scripts/mamba3_chat_repl.sh"
       else
-        remote_exec "$PICK_CHECKPOINT; python scripts/mamba3_safe_chat.py $COMMON --max-new $(q "$MAX_NEW") $STREAM_FLAG"
+        remote_exec "$PICK_CHECKPOINT; python neuromamba/scripts/mamba3_safe_chat.py $COMMON --max-new $(q "$MAX_NEW") $STREAM_FLAG"
       fi
       ;;
     server-start)
-      remote_exec "$PICK_CHECKPOINT; export NEUROVA_MAMBA3_CHECKPOINT=\"\$CHECKPOINT\" NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") NEUROVA_MAMBA3_SERVER_RUN_DIR=$(q "$SERVER_RUN_DIR") NEUROVA_MAMBA3_MODE=$(q "$MODE") NEUROVA_MAMBA3_TOKENIZER=$(q "$TOKENIZER") NEUROVA_MAMBA3_SEQ=$(q "$SEQ_LEN") NEUROVA_MAMBA3_MAX_NEW=$(q "$MAX_NEW") NEUROVA_MAMBA3_DTYPE=$(q "$DTYPE") NEUROVA_MAMBA3_DECODE_MODE=$(q "$DECODE_MODE") NEUROVA_MAMBA3_CUDA_GRAPH=$(q "$CUDA_GRAPH") NEUROVA_MAMBA3_CACHE_PARITY_GUARD=$(q "$CACHE_PARITY_GUARD"); scripts/mamba3_infer_guard.sh run scripts/mamba3_chat_serverctl.sh start"
+      remote_exec "$PICK_CHECKPOINT; export NEUROVA_MAMBA3_CHECKPOINT=\"\$CHECKPOINT\" NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") NEUROVA_MAMBA3_SERVER_RUN_DIR=$(q "$SERVER_RUN_DIR") NEUROVA_MAMBA3_MODE=$(q "$MODE") NEUROVA_MAMBA3_TOKENIZER=$(q "$TOKENIZER") NEUROVA_MAMBA3_SEQ=$(q "$SEQ_LEN") NEUROVA_MAMBA3_MAX_NEW=$(q "$MAX_NEW") NEUROVA_MAMBA3_DTYPE=$(q "$DTYPE") NEUROVA_MAMBA3_DECODE_MODE=$(q "$DECODE_MODE") NEUROVA_MAMBA3_CUDA_GRAPH=$(q "$CUDA_GRAPH") NEUROVA_MAMBA3_CACHE_PARITY_GUARD=$(q "$CACHE_PARITY_GUARD"); neuromamba/scripts/mamba3_infer_guard.sh run neuromamba/scripts/mamba3_chat_serverctl.sh start"
       ;;
     server-stop)
-      remote_exec "NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") scripts/mamba3_chat_serverctl.sh stop"
+      remote_exec "NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") neuromamba/scripts/mamba3_chat_serverctl.sh stop"
       ;;
     server-restart)
-      remote_exec "$PICK_CHECKPOINT; export NEUROVA_MAMBA3_CHECKPOINT=\"\$CHECKPOINT\" NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") NEUROVA_MAMBA3_SERVER_RUN_DIR=$(q "$SERVER_RUN_DIR") NEUROVA_MAMBA3_MODE=$(q "$MODE") NEUROVA_MAMBA3_TOKENIZER=$(q "$TOKENIZER") NEUROVA_MAMBA3_SEQ=$(q "$SEQ_LEN") NEUROVA_MAMBA3_MAX_NEW=$(q "$MAX_NEW") NEUROVA_MAMBA3_DTYPE=$(q "$DTYPE") NEUROVA_MAMBA3_DECODE_MODE=$(q "$DECODE_MODE") NEUROVA_MAMBA3_CUDA_GRAPH=$(q "$CUDA_GRAPH") NEUROVA_MAMBA3_CACHE_PARITY_GUARD=$(q "$CACHE_PARITY_GUARD"); scripts/mamba3_infer_guard.sh run scripts/mamba3_chat_serverctl.sh restart"
+      remote_exec "$PICK_CHECKPOINT; export NEUROVA_MAMBA3_CHECKPOINT=\"\$CHECKPOINT\" NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") NEUROVA_MAMBA3_SERVER_RUN_DIR=$(q "$SERVER_RUN_DIR") NEUROVA_MAMBA3_MODE=$(q "$MODE") NEUROVA_MAMBA3_TOKENIZER=$(q "$TOKENIZER") NEUROVA_MAMBA3_SEQ=$(q "$SEQ_LEN") NEUROVA_MAMBA3_MAX_NEW=$(q "$MAX_NEW") NEUROVA_MAMBA3_DTYPE=$(q "$DTYPE") NEUROVA_MAMBA3_DECODE_MODE=$(q "$DECODE_MODE") NEUROVA_MAMBA3_CUDA_GRAPH=$(q "$CUDA_GRAPH") NEUROVA_MAMBA3_CACHE_PARITY_GUARD=$(q "$CACHE_PARITY_GUARD"); neuromamba/scripts/mamba3_infer_guard.sh run neuromamba/scripts/mamba3_chat_serverctl.sh restart"
       ;;
     server-status)
-      remote_exec "NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") scripts/mamba3_chat_serverctl.sh status"
+      remote_exec "NEUROVA_MAMBA3_SERVER_HOST=$(q "$SERVER_HOST") NEUROVA_MAMBA3_SERVER_PORT=$(q "$SERVER_PORT") neuromamba/scripts/mamba3_chat_serverctl.sh status"
       ;;
     research-start)
-      remote_exec "GPU_POLICY=${NEUROVA_RESEARCH_GPU_POLICY:-train_priority} INTERVAL=${NEUROVA_RESEARCH_INTERVAL:-120} scripts/mamba3_research_autopilotctl.sh start"
+      remote_exec "GPU_POLICY=${NEUROVA_RESEARCH_GPU_POLICY:-train_priority} INTERVAL=${NEUROVA_RESEARCH_INTERVAL:-120} neuromamba/scripts/mamba3_research_autopilotctl.sh start"
       ;;
     research-status)
-      remote_exec "scripts/mamba3_research_autopilotctl.sh status"
+      remote_exec "neuromamba/scripts/mamba3_research_autopilotctl.sh status"
       ;;
     research-stop)
-      remote_exec "scripts/mamba3_research_autopilotctl.sh stop"
+      remote_exec "neuromamba/scripts/mamba3_research_autopilotctl.sh stop"
       ;;
     research-logs)
-      remote_exec "scripts/mamba3_research_autopilotctl.sh logs"
+      remote_exec "neuromamba/scripts/mamba3_research_autopilotctl.sh logs"
       ;;
     research-tail)
-      remote_exec "scripts/mamba3_research_autopilotctl.sh tail"
+      remote_exec "neuromamba/scripts/mamba3_research_autopilotctl.sh tail"
       ;;
     research-hybrid-start)
-      remote_exec "STEPS=${NEUROVA_HYBRID_STEPS:-2500} MMLU_REDUX_LIMIT=${NEUROVA_HYBRID_MMLU_REDUX_LIMIT:-100} MODES_CSV=${NEUROVA_HYBRID_MODES:-mamba3-siso-fast-0.3b-ds128,mamba3-siso-hybrid-0.3b} scripts/mamba3_autonomous_hybrid_researchctl.sh start"
+      remote_exec "STEPS=${NEUROVA_HYBRID_STEPS:-2500} MMLU_REDUX_LIMIT=${NEUROVA_HYBRID_MMLU_REDUX_LIMIT:-100} MODES_CSV=${NEUROVA_HYBRID_MODES:-mamba3-siso-fast-0.3b-ds128,mamba3-siso-hybrid-0.3b} neuromamba/scripts/mamba3_autonomous_hybrid_researchctl.sh start"
       ;;
     research-hybrid-status)
-      remote_exec "scripts/mamba3_autonomous_hybrid_researchctl.sh status"
+      remote_exec "neuromamba/scripts/mamba3_autonomous_hybrid_researchctl.sh status"
       ;;
     research-hybrid-stop)
-      remote_exec "scripts/mamba3_autonomous_hybrid_researchctl.sh stop"
+      remote_exec "neuromamba/scripts/mamba3_autonomous_hybrid_researchctl.sh stop"
       ;;
     research-hybrid-tail)
-      remote_exec "scripts/mamba3_autonomous_hybrid_researchctl.sh tail"
+      remote_exec "neuromamba/scripts/mamba3_autonomous_hybrid_researchctl.sh tail"
       ;;
     teacher-research-start)
-      remote_exec "MAX_ROUNDS=${NEUROVA_TEACHER_MAX_ROUNDS:-3} BOOTSTRAP_EXISTING=${NEUROVA_TEACHER_BOOTSTRAP_EXISTING:-1} DEEPSEEK_RECORDS=${NEUROVA_TEACHER_RECORDS:-20000} DEEPSEEK_RECORDS_CSV=${NEUROVA_TEACHER_RECORDS_CSV:-3000,12000,30000} DEEPSEEK_BATCH_SIZE=${NEUROVA_TEACHER_BATCH_SIZE:-24} MCQ_STEPS=${NEUROVA_TEACHER_MCQ_STEPS:-2500} MMLU_REDUX_LIMIT=${NEUROVA_TEACHER_MMLU_REDUX_LIMIT:-200} CHAT_REPAIR=${NEUROVA_TEACHER_CHAT_REPAIR:-1} CHAT_STEPS=${NEUROVA_TEACHER_CHAT_STEPS:-1200} scripts/mamba3_teacher_researchctl.sh start"
+      remote_exec "MAX_ROUNDS=${NEUROVA_TEACHER_MAX_ROUNDS:-3} BOOTSTRAP_EXISTING=${NEUROVA_TEACHER_BOOTSTRAP_EXISTING:-1} DEEPSEEK_RECORDS=${NEUROVA_TEACHER_RECORDS:-20000} DEEPSEEK_RECORDS_CSV=${NEUROVA_TEACHER_RECORDS_CSV:-3000,12000,30000} DEEPSEEK_BATCH_SIZE=${NEUROVA_TEACHER_BATCH_SIZE:-24} MCQ_STEPS=${NEUROVA_TEACHER_MCQ_STEPS:-2500} MMLU_REDUX_LIMIT=${NEUROVA_TEACHER_MMLU_REDUX_LIMIT:-200} CHAT_REPAIR=${NEUROVA_TEACHER_CHAT_REPAIR:-1} CHAT_STEPS=${NEUROVA_TEACHER_CHAT_STEPS:-1200} neuromamba/scripts/mamba3_teacher_researchctl.sh start"
       ;;
     teacher-research-status)
-      remote_exec "scripts/mamba3_teacher_researchctl.sh status"
+      remote_exec "neuromamba/scripts/mamba3_teacher_researchctl.sh status"
       ;;
     teacher-research-stop)
-      remote_exec "scripts/mamba3_teacher_researchctl.sh stop"
+      remote_exec "neuromamba/scripts/mamba3_teacher_researchctl.sh stop"
       ;;
     teacher-research-tail)
-      remote_exec "scripts/mamba3_teacher_researchctl.sh tail"
+      remote_exec "neuromamba/scripts/mamba3_teacher_researchctl.sh tail"
       ;;
   esac
   exit $?
@@ -338,4 +338,4 @@ fi
 
 MODE="${1:-bf16}"
 export V6_MODE="$MODE"
-exec python3 neurova_v6.py
+exec python3 neurova/v6.py

@@ -213,7 +213,7 @@ class PackedTextDataset:
     seq_len: int = 512
     max_records: int = 0
     seed: int = 17
-    cache_dir: Path | None = Path("data/.luma_cache")
+    cache_dir: Path | None = Path("luma/data/.luma_cache")
 
     def __post_init__(self) -> None:
         tag = _paths_cache_tag(
@@ -263,7 +263,7 @@ class RecordTextDataset:
     seq_len: int = 512
     max_records: int = 0
     answer_only: bool = False
-    cache_dir: Path | None = Path("data/.luma_cache")
+    cache_dir: Path | None = Path("luma/data/.luma_cache")
 
     def __post_init__(self) -> None:
         tag = _paths_cache_tag(

@@ -79,7 +79,7 @@ class TokenStreamDataset:
         paths: list[Path],
         seq_len: int,
         max_records: int = 0,
-        cache_dir: Path = Path("data/saneflow/.cache"),
+        cache_dir: Path = Path("saneflow/data/saneflow/.cache"),
         dataset_device: torch.device | None = None,
         loss_mode: str = "causal",
     ) -> None:

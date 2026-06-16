@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel", "torch>=2.4"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langburst"
+version = "0.5.0"
+description = "Pluggable low-bit multi-model inference runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "LangBurst contributors"}]
+dependencies = [
+  "torch>=2.4",
+  "safetensors>=0.4.5",
+  "numpy>=1.24",
+  "tqdm>=4.66",
+  "transformers>=4.56",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "pydantic>=2",
+]
+
+[project.scripts]
+langburst-qwen-bench-estimate = "langburst.adapters.qwen36_tools.bench_estimate:main"
+langburst-qwen-quantize = "langburst.adapters.qwen36_tools.quantize:main"
+langburst-qwen-smoke = "langburst.adapters.qwen36_tools.smoke:main"
+langburst-doctor = "langburst.doctor:main"
+langburst-infinite-demo = "langburst.research.infinite_demo:main"
+langburst-chat = "langburst.generate:main"
+langburst-qwen-audit = "langburst.adapters.qwen36_tools.audit:main"
+langburst-server = "langburst.server:main"
+langburst-qwen-nextn-bench = "langburst.research.qwen_nextn_bench:main"
+langburst-qwen-graph-audit = "langburst.adapters.qwen36_tools.graph:main"
+langburst-qwen-profile = "langburst.adapters.qwen36_tools.profile:main"
+langburst-bench-profiles = "langburst.bench_profiles:main"
+langburst-bench-serving = "langburst.bench_serving:main"
+langburst-correctness = "langburst.correctness:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["langburst*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

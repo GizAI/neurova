@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PROFILE_CONFIG = ROOT / "configs/saneflow_profiles.json"
+DEFAULT_PROFILE_CONFIG = ROOT / "saneflow/configs/saneflow_profiles.json"
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,7 @@ class RunProfile:
         executable = python or os.environ.get("SANEFLOW_PYTHON", sys.executable)
         cmd = [
             executable,
-            "scripts/saneflow_train.py",
+            "saneflow/scripts/saneflow_train.py",
             "--out", self.out,
             "--train-data", *self.train_data,
             "--valid-data", *self.valid_data,
@@ -161,7 +161,7 @@ class ProfileRegistry:
             choices = ", ".join(sorted(self.profiles))
             raise SystemExit(f"unknown profile {name!r}; choices: {choices}") from exc
 
-    def active_names(self, program_config: Path = ROOT / "configs/saneflow_research_program.json") -> tuple[str, ...]:
+    def active_names(self, program_config: Path = ROOT / "saneflow/configs/saneflow_research_program.json") -> tuple[str, ...]:
         if not program_config.exists():
             return tuple(self.profiles)
         data = json.loads(program_config.read_text(encoding="utf-8"))
