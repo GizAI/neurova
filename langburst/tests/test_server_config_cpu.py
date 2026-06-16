@@ -6,7 +6,7 @@ from pathlib import Path
 from langburst.core.defaults import DEFAULT_SERVING_RECENT_WINDOW
 from langburst.core.features import RuntimeFeatures
 from langburst.engines.native.manager import load_model_specs
-from langburst.server import ChatCompletionRequest, _native_generation_config, _thinking_visible_prefix, _with_visible_prefix_once
+from langburst.server import ChatCompletionRequest, _native_generation_config, _request_messages, _thinking_visible_prefix, _with_visible_prefix_once
 
 
 def test_load_model_specs_from_json(tmp_path: Path):
@@ -153,6 +153,21 @@ def test_visible_thinking_prefix_defaults_on_and_can_be_disabled():
     assert _thinking_visible_prefix(default_req) == "<think>\n"
     assert _thinking_visible_prefix(disabled_req) == ""
     assert _thinking_visible_prefix(non_qwen_req) == ""
+
+
+def test_request_messages_preserves_content_without_hidden_rewrite():
+    req = ChatCompletionRequest(
+        messages=[
+            {"role": "user", "content": "HEAD " + ("x" * 10000) + " TAIL"},
+            {"role": "user", "content": [{"type": "text", "text": "kept"}]},
+        ],
+        max_tokens=16,
+    )
+
+    messages = _request_messages(req)
+
+    assert messages[0]["content"] == "HEAD " + ("x" * 10000) + " TAIL"
+    assert messages[1]["content"] == [{"type": "text", "text": "kept"}]
 
 
 def test_visible_thinking_prefix_is_prepended_once():
