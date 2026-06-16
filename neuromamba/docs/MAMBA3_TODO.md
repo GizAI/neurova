@@ -121,7 +121,7 @@
 
 ## Phase A: 16GB Train-Max
 
-- [x] Keep default runtime interactive through `./neurova.sh`.
+- [x] Keep default Mamba runtime interactive through `./neurova.sh mamba3`.
 - [x] Add quality gate so collapsed checkpoints cannot be promoted.
 - [x] Add promotion script for `neuromamba/runs/mamba3_current/model.pt`.
 - [x] Add 16GB candidate presets:
@@ -692,7 +692,7 @@ MoE is useful only after the dense baseline is stable. The first sparse experime
 - [x] TF32 matmul enabled.
 - [x] Recurrent decode step instead of full-context decode.
 - [x] Make `mimo-r4-tiny` runtime parity-safe by default.
-  - `./neurova.sh` and `neuromamba/scripts/mamba3_chat_serverctl.sh` default to `decode_mode=safe`.
+  - `./neurova.sh mamba3` and `neuromamba/scripts/mamba3_chat_serverctl.sh` default to `decode_mode=safe`.
   - `safe` uses the faster full-forward quality path for interactive serving; direct comparison on the current checkpoint measured about 41-43 tok/s versus about 7-13 tok/s for `exact-cache`.
   - `exact-cache` remains available as an audit path for exact full-forward/cache-step parity checks.
   - Unsafe MIMO recurrent-cache decode remains research-only until `neuromamba/scripts/mamba3_recurrent_parity.py` passes without `--exact-cache`.
@@ -713,17 +713,17 @@ MoE is useful only after the dense baseline is stable. The first sparse experime
   - Script: `neuromamba/scripts/mamba3_decode_tune.py`.
   - User command: `./neurova.sh mamba3 tune`.
   - Purpose: compare full-forward deterministic quality path, recurrent argmax path, and recurrent sampling/CUDA-graph paths on the same prompt suite before changing runtime defaults.
-- [x] Keep `./neurova.sh` default on the parity-safe model path until unsafe recurrent/CUDA-graph decode passes quality and parity.
+- [x] Keep `./neurova.sh mamba3` default on the parity-safe model path until unsafe recurrent/CUDA-graph decode passes quality and parity.
   - Current evidence: latest promoted checkpoint answers basic identity and simple QA through the safe full-forward path.
   - Current limitation: unsafe recurrent-cache decode is faster but diverges from full-forward logits after several generated tokens on `mimo-r4-tiny`.
-- [x] Add real-time streaming to `./neurova.sh`.
+- [x] Add real-time streaming to `./neurova.sh mamba3`.
   - Default one-shot and interactive Mamba-3 chat use the persistent chat server.
-  - One-shot prompts default to non-stream for speed; interactive `./neurova.sh` defaults to streaming.
+  - One-shot prompts default to non-stream for speed; interactive `./neurova.sh mamba3` defaults to streaming.
   - Streaming uses chunked safe full-forward generation, not the broken recurrent fast path.
   - Current measured stream path on `neuromamba/runs/mamba3_current/model.pt`: about 18-25 tok/s on simple QA.
   - Use `NEUROVA_MAMBA3_STREAM=1 ./neurova.sh mamba3 "..."` when one-shot streaming is preferred.
   - Current measured default one-shot path: about 35-36 tok/s over SSH/server CLI.
-- [x] Add operator status view to `./neurova.sh`.
+- [x] Add operator status view to `./neurova.sh mamba3`.
   - Command: `./neurova.sh mamba3 status`.
   - Shows 2.4B training status, Speak v1 status, latest decode-tune winner, and GPU usage.
 - [x] Official Mamba kernel-level backward recomputation is the priority path.
@@ -763,8 +763,8 @@ MoE is useful only after the dense baseline is stable. The first sparse experime
   - state load/save latency,
   - state memory footprint.
 - [x] Raise default interactive runtime token budget.
-  - `./neurova.sh` default input window: 4096 tokens.
-  - `./neurova.sh` default max output: 512 tokens.
+  - `./neurova.sh mamba3` default input window: 4096 tokens.
+  - `./neurova.sh mamba3` default max output: 512 tokens.
   - CUDA graph is disabled automatically for `seq_len > 128` because long-seq graph decode caused illegal memory access.
 - [x] Add context-limit probe script.
   - `neuromamba/scripts/mamba3_probe_context_limits.sh`
@@ -936,14 +936,14 @@ Operational cleanup:
 
 Kept:
 
-- `neuromamba/runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt` is the current default `./neurova.sh` checkpoint.
+- `neuromamba/runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt` is the current default `./neurova.sh mamba3` checkpoint.
 - `d_state=128` pure SISO trunk remains the default fast runtime because it preserves recurrent parity and has no attention/KV-cache growth in decode.
 - Deterministic answer-only SFT data now includes:
   - uncertainty and "do not know" variants,
   - anti-repetition hard negatives with complete non-looping answers,
   - programmatic state/memory curriculum for copy spans, phonebook lookup, JSON field extraction, state summary, and route labels.
 - `START_CHECKPOINT` is supported in `neuromamba/scripts/mamba3_train_siso_hybrid_v1.sh`, so new candidates can seed from a previous checkpoint without overwriting it.
-- `./neurova.sh` now defaults to `neuromamba/runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt`, with v1 as fallback.
+- `./neurova.sh mamba3` now defaults to `neuromamba/runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt`, with v1 as fallback.
 - `/exit` is accepted by the interactive REPL in addition to `/q`, `/quit`, `quit`, and `exit`.
 
 Evidence:
@@ -995,7 +995,7 @@ Evidence:
   - warm full prefill about `0.044s`,
   - compiled question replay about `0.21s`,
   - not a latency win.
-- Direct `./neurova.sh` chat path:
+- Direct `./neurova.sh mamba3` chat path:
   - `What is machine learning inference?` -> correct answer, about `241.7 tok/s`.
   - `What should you do if you do not know?` -> correct answer, about `236.3 tok/s`.
 
@@ -1033,7 +1033,7 @@ Added:
 - `neuromamba/runs/mamba3_current_training_chat/model.pt`
   - Short answer-only chat SFT from the step 7300 SISO research candidate.
   - Step 500 passed the chat quality gate at `15/15`.
-  - `./neurova.sh` now defaults to this path when no `NEUROVA_MAMBA3_CHECKPOINT` override is provided.
+  - `./neurova.sh mamba3` now defaults to this path when no `NEUROVA_MAMBA3_CHECKPOINT` override is provided.
   - This is a usability checkpoint, not proof of MMLU/SOTA intelligence.
 
 Promotion rule:

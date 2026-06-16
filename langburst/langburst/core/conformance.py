@@ -39,7 +39,7 @@ def assert_minimal_adapter_conformance(
     engine.prefill(prompt_ids, state)
     generated = engine.generate_ids_greedy_gpu(
         prompt_ids,
-        GenerationConfig(max_new_tokens=max_new_tokens, eos_token_ids=()),
+        GenerationConfig.greedy(max_new_tokens=max_new_tokens),
     )
     if len(generated) != max_new_tokens:
         raise AssertionError("adapter generation did not produce the requested token count")

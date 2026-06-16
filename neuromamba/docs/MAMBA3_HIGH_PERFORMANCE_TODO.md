@@ -41,7 +41,7 @@ done
 
 - [x] Fix Mamba-3 decode step `tile_D` to follow `headdim`.
 - [x] Keep `mimo-r4-tiny` as the RTX 4080 trainable kernel-validation model.
-- [x] Provide interactive streaming chat via `./neurova.sh`.
+- [x] Provide interactive streaming chat via `./neurova.sh mamba3`.
 - [x] Show response speed at the end of each streamed answer.
 - [x] Provide warmup-excluded decode benchmark.
 - [x] Provide kernel capability probe.
@@ -49,7 +49,7 @@ done
 Commands:
 
 ```bash
-./neurova.sh
+./neurova.sh mamba3
 ./neurova.sh mamba3 bench "The main idea is"
 ./neurova.sh mamba3 probe
 neuromamba/scripts/mamba3_prepare_corpora.sh

@@ -1,13 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Literal
+import os
 import time
 
 import torch
 
 from .config import Qwen36_27B_TextConfig
+from langburst.core.kv_cache import (
+    KVCacheLayout,
+    KVCacheSpec,
+    allocate_kv_cache_tensors,
+    hadamard_transform,
+    pack_int4_rows,
+    unpack_int4_rows,
+)
 
 KVWindowPolicy = Literal["error", "shift", "ring"]
 
@@ -28,6 +37,7 @@ class StateSnapshotInfo:
     max_seq_len: int
     kv_len: int
     kv_window_policy: str
+    kv_cache_dtype: str
     dtype: str
     include_attention_kv: bool
     include_conv_state: bool
@@ -39,6 +49,10 @@ class DecodeStateWriteSnapshot:
     gdn_conv_states: dict[int, torch.Tensor]
     attn_k_rows: dict[int, tuple[list[int], torch.Tensor]]
     attn_v_rows: dict[int, tuple[list[int], torch.Tensor]]
+    attn_k_scale_rows: dict[int, tuple[list[int], torch.Tensor]]
+    attn_v_scale_rows: dict[int, tuple[list[int], torch.Tensor]]
+    attn_k_zero_rows: dict[int, tuple[list[int], torch.Tensor]]
+    attn_v_zero_rows: dict[int, tuple[list[int], torch.Tensor]]
     pos: int
     kv_len: int
 
@@ -53,6 +67,22 @@ class DecodeStateWriteSnapshot:
         for layer, (indices, values) in self.attn_v_rows.items():
             for row, idx in enumerate(indices):
                 state.attn_v[layer][:, idx, :].copy_(values[:, row, :])
+        if state.attn_k_scale is not None:
+            for layer, (indices, values) in self.attn_k_scale_rows.items():
+                for row, idx in enumerate(indices):
+                    state.attn_k_scale[layer][:, idx].copy_(values[:, row])
+        if state.attn_v_scale is not None:
+            for layer, (indices, values) in self.attn_v_scale_rows.items():
+                for row, idx in enumerate(indices):
+                    state.attn_v_scale[layer][:, idx].copy_(values[:, row])
+        if state.attn_k_zero is not None:
+            for layer, (indices, values) in self.attn_k_zero_rows.items():
+                for row, idx in enumerate(indices):
+                    state.attn_k_zero[layer][:, idx].copy_(values[:, row])
+        if state.attn_v_zero is not None:
+            for layer, (indices, values) in self.attn_v_zero_rows.items():
+                for row, idx in enumerate(indices):
+                    state.attn_v_zero[layer][:, idx].copy_(values[:, row])
         state.pos = self.pos
         state.kv_len = self.kv_len
 
@@ -75,10 +105,23 @@ class DecodeState:
     gdn_conv_states: dict[int, torch.Tensor]
     attn_k: dict[int, torch.Tensor]
     attn_v: dict[int, torch.Tensor]
+    attn_k_scale: dict[int, torch.Tensor] | None = None
+    attn_v_scale: dict[int, torch.Tensor] | None = None
+    attn_k_zero: dict[int, torch.Tensor] | None = None
+    attn_v_zero: dict[int, torch.Tensor] | None = None
     pos: int = 0
     max_seq_len: int = 0
     kv_len: int = 0
     kv_window_policy: KVWindowPolicy = "error"
+    kv_cache_spec: KVCacheSpec = field(default_factory=KVCacheSpec)
+
+    @staticmethod
+    def kv_layout(cfg: Qwen36_27B_TextConfig) -> KVCacheLayout:
+        return KVCacheLayout.from_parts(
+            layers=cfg.attention_layers,
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.attention_head_dim,
+        )
 
     @classmethod
     def allocate(
@@ -88,10 +131,12 @@ class DecodeState:
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.float16,
         kv_window_policy: KVWindowPolicy = "error",
+        kv_cache_spec: KVCacheSpec | None = None,
     ) -> "DecodeState":
         if max_seq_len < 1:
             raise ValueError("max_seq_len must be >= 1")
         device = torch.device(device)
+        kv_cache_spec = kv_cache_spec or KVCacheSpec()
         conv_dim = (
             cfg.linear_key_head_dim * cfg.linear_num_key_heads * 2
             + cfg.linear_value_head_dim * cfg.linear_num_value_heads
@@ -115,27 +160,22 @@ class DecodeState:
             )
             for layer in cfg.gdn_layers
         }
-        attn_k = {
-            layer: torch.zeros(
-                cfg.num_key_value_heads,
-                max_seq_len,
-                cfg.attention_head_dim,
-                device=device,
-                dtype=dtype,
-            )
-            for layer in cfg.attention_layers
-        }
-        attn_v = {layer: torch.zeros_like(attn_k[layer]) for layer in cfg.attention_layers}
+        kv = allocate_kv_cache_tensors(cls.kv_layout(cfg), kv_cache_spec, seq_len=max_seq_len, device=device)
         return cls(
             cfg=cfg,
             gdn_states=gdn_states,
             gdn_conv_states=gdn_conv_states,
-            attn_k=attn_k,
-            attn_v=attn_v,
+            attn_k=kv.k,
+            attn_v=kv.v,
+            attn_k_scale=kv.k_scale,
+            attn_v_scale=kv.v_scale,
+            attn_k_zero=kv.k_zero,
+            attn_v_zero=kv.v_zero,
             pos=0,
             max_seq_len=max_seq_len,
             kv_len=0,
             kv_window_policy=kv_window_policy,
+            kv_cache_spec=kv_cache_spec,
         )
 
     @property
@@ -157,9 +197,14 @@ class DecodeState:
 
     @property
     def attention_kv_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self.attn_k.values()) + sum(
+        total = sum(t.numel() * t.element_size() for t in self.attn_k.values()) + sum(
             t.numel() * t.element_size() for t in self.attn_v.values()
         )
+        total += sum(t.numel() * t.element_size() for t in (self.attn_k_scale or {}).values())
+        total += sum(t.numel() * t.element_size() for t in (self.attn_v_scale or {}).values())
+        total += sum(t.numel() * t.element_size() for t in (self.attn_k_zero or {}).values())
+        total += sum(t.numel() * t.element_size() for t in (self.attn_v_zero or {}).values())
+        return total
 
     @property
     def total_bytes(self) -> int:
@@ -196,15 +241,40 @@ class DecodeState:
             gdn_conv_states={k: v.clone() for k, v in self.gdn_conv_states.items()},
             attn_k={k: v.clone() for k, v in self.attn_k.items()} if clone_attention else self.attn_k.copy(),
             attn_v={k: v.clone() for k, v in self.attn_v.items()} if clone_attention else self.attn_v.copy(),
+            attn_k_scale=(
+                {k: v.clone() for k, v in self.attn_k_scale.items()}
+                if clone_attention and self.attn_k_scale is not None
+                else (self.attn_k_scale.copy() if self.attn_k_scale is not None else None)
+            ),
+            attn_v_scale=(
+                {k: v.clone() for k, v in self.attn_v_scale.items()}
+                if clone_attention and self.attn_v_scale is not None
+                else (self.attn_v_scale.copy() if self.attn_v_scale is not None else None)
+            ),
+            attn_k_zero=(
+                {k: v.clone() for k, v in self.attn_k_zero.items()}
+                if clone_attention and self.attn_k_zero is not None
+                else (self.attn_k_zero.copy() if self.attn_k_zero is not None else None)
+            ),
+            attn_v_zero=(
+                {k: v.clone() for k, v in self.attn_v_zero.items()}
+                if clone_attention and self.attn_v_zero is not None
+                else (self.attn_v_zero.copy() if self.attn_v_zero is not None else None)
+            ),
             pos=self.pos,
             max_seq_len=self.max_seq_len,
             kv_len=self.kv_len,
             kv_window_policy=self.kv_window_policy,
+            kv_cache_spec=self.kv_cache_spec,
         )
 
     def copy_from_(self, other: "DecodeState", *, copy_attention: bool = True) -> None:
         """Replace this state with another state under the same allocation contract."""
-        if self.max_seq_len != other.max_seq_len or self.kv_window_policy != other.kv_window_policy:
+        if (
+            self.max_seq_len != other.max_seq_len
+            or self.kv_window_policy != other.kv_window_policy
+            or self.kv_cache_spec != other.kv_cache_spec
+        ):
             raise ValueError("cannot copy DecodeState with different KV allocation contract")
         for k, v in other.gdn_states.items():
             self.gdn_states[k].copy_(v)
@@ -215,13 +285,25 @@ class DecodeState:
                 self.attn_k[k].copy_(v)
             for k, v in other.attn_v.items():
                 self.attn_v[k].copy_(v)
+            if self.attn_k_scale is not None and other.attn_k_scale is not None:
+                for k, v in other.attn_k_scale.items():
+                    self.attn_k_scale[k].copy_(v)
+            if self.attn_v_scale is not None and other.attn_v_scale is not None:
+                for k, v in other.attn_v_scale.items():
+                    self.attn_v_scale[k].copy_(v)
+            if self.attn_k_zero is not None and other.attn_k_zero is not None:
+                for k, v in other.attn_k_zero.items():
+                    self.attn_k_zero[k].copy_(v)
+            if self.attn_v_zero is not None and other.attn_v_zero is not None:
+                for k, v in other.attn_v_zero.items():
+                    self.attn_v_zero[k].copy_(v)
         self.pos = other.pos
         self.kv_len = other.kv_len
 
     def speculative_write_snapshot(self, num_tokens: int) -> DecodeStateWriteSnapshot:
         """Snapshot only state locations a speculative block may overwrite.
 
-        This is the langburst analogue of vLLM's lookahead slot safety: a block
+        This is the langburst analogue of the reference runtime's lookahead slot safety: a block
         verifier may write candidate state into live buffers, then either keep it
         on full accept or restore this snapshot on rejection.
         """
@@ -253,6 +335,22 @@ class DecodeState:
                 layer: (unique_indices, tensor[:, unique_indices, :].detach().clone())
                 for layer, tensor in self.attn_v.items()
             },
+            attn_k_scale_rows={
+                layer: (unique_indices, tensor[:, unique_indices].detach().clone())
+                for layer, tensor in (self.attn_k_scale or {}).items()
+            },
+            attn_v_scale_rows={
+                layer: (unique_indices, tensor[:, unique_indices].detach().clone())
+                for layer, tensor in (self.attn_v_scale or {}).items()
+            },
+            attn_k_zero_rows={
+                layer: (unique_indices, tensor[:, unique_indices].detach().clone())
+                for layer, tensor in (self.attn_k_zero or {}).items()
+            },
+            attn_v_zero_rows={
+                layer: (unique_indices, tensor[:, unique_indices].detach().clone())
+                for layer, tensor in (self.attn_v_zero or {}).items()
+            },
             pos=self.pos,
             kv_len=self.kv_len,
         )
@@ -283,8 +381,32 @@ class DecodeState:
             # Correct but not fast. Prefer ring for infinite streaming.
             self.attn_k[layer][:, :-1, :].copy_(self.attn_k[layer][:, 1:, :])
             self.attn_v[layer][:, :-1, :].copy_(self.attn_v[layer][:, 1:, :])
-        self.attn_k[layer][:, idx, :] = k
-        self.attn_v[layer][:, idx, :] = v
+            if self.attn_k_scale is not None and self.attn_v_scale is not None:
+                self.attn_k_scale[layer][:, :-1].copy_(self.attn_k_scale[layer][:, 1:])
+                self.attn_v_scale[layer][:, :-1].copy_(self.attn_v_scale[layer][:, 1:])
+            if self.attn_k_zero is not None and self.attn_v_zero is not None:
+                self.attn_k_zero[layer][:, :-1].copy_(self.attn_k_zero[layer][:, 1:])
+                self.attn_v_zero[layer][:, :-1].copy_(self.attn_v_zero[layer][:, 1:])
+        if self.kv_cache_spec.is_int4:
+            k_store = hadamard_transform(k, self.kv_cache_spec.hadamard_order) if self.kv_cache_spec.uses_bdr else k
+            v_store = (
+                hadamard_transform(v, self.kv_cache_spec.hadamard_order)
+                if self.kv_cache_spec.uses_bdr and self.kv_cache_spec.rotate_v
+                else v
+            )
+            k_packed, k_scale, k_zero = pack_int4_rows(k_store)
+            v_packed, v_scale, v_zero = pack_int4_rows(v_store)
+            self.attn_k[layer][:, idx, :] = k_packed
+            self.attn_v[layer][:, idx, :] = v_packed
+            if self.attn_k_scale is not None and self.attn_v_scale is not None:
+                self.attn_k_scale[layer][:, idx] = k_scale
+                self.attn_v_scale[layer][:, idx] = v_scale
+            if self.attn_k_zero is not None and self.attn_v_zero is not None:
+                self.attn_k_zero[layer][:, idx] = k_zero
+                self.attn_v_zero[layer][:, idx] = v_zero
+        else:
+            self.attn_k[layer][:, idx, :] = k
+            self.attn_v[layer][:, idx, :] = v
         return idx
 
     def append_attention_kv_at(self, layer: int, k: torch.Tensor, v: torch.Tensor, *, logical_pos: int) -> int:
@@ -297,9 +419,50 @@ class DecodeState:
             raise RuntimeError(f"attention KV window is full at {self.max_seq_len} tokens")
         else:
             idx = self.max_seq_len - 1
-        self.attn_k[layer][:, idx, :] = k
-        self.attn_v[layer][:, idx, :] = v
+        if self.kv_cache_spec.is_int4:
+            k_store = hadamard_transform(k, self.kv_cache_spec.hadamard_order) if self.kv_cache_spec.uses_bdr else k
+            v_store = (
+                hadamard_transform(v, self.kv_cache_spec.hadamard_order)
+                if self.kv_cache_spec.uses_bdr and self.kv_cache_spec.rotate_v
+                else v
+            )
+            k_packed, k_scale, k_zero = pack_int4_rows(k_store)
+            v_packed, v_scale, v_zero = pack_int4_rows(v_store)
+            self.attn_k[layer][:, idx, :] = k_packed
+            self.attn_v[layer][:, idx, :] = v_packed
+            if self.attn_k_scale is not None and self.attn_v_scale is not None:
+                self.attn_k_scale[layer][:, idx] = k_scale
+                self.attn_v_scale[layer][:, idx] = v_scale
+            if self.attn_k_zero is not None and self.attn_v_zero is not None:
+                self.attn_k_zero[layer][:, idx] = k_zero
+                self.attn_v_zero[layer][:, idx] = v_zero
+        else:
+            self.attn_k[layer][:, idx, :] = k
+            self.attn_v[layer][:, idx, :] = v
         return idx
+
+    def _dequant_attention_view(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.kv_cache_spec.is_int4:
+            return k, v
+        if self.attn_k_scale is None or self.attn_v_scale is None or self.attn_k_zero is None or self.attn_v_zero is None:
+            raise RuntimeError("INT4 KV cache is missing token-wise scale/zero tensors")
+        k_scale = self.attn_k_scale[layer]
+        v_scale = self.attn_v_scale[layer]
+        k_zero = self.attn_k_zero[layer]
+        v_zero = self.attn_v_zero[layer]
+        start = (self.pos + 1) % self.max_seq_len
+        if start != 0 and self.kv_window_policy == "ring" and self.kv_len >= self.max_seq_len:
+            k_scale = torch.cat([k_scale[:, start:], k_scale[:, :start]], dim=1)
+            v_scale = torch.cat([v_scale[:, start:], v_scale[:, :start]], dim=1)
+            k_zero = torch.cat([k_zero[:, start:], k_zero[:, :start]], dim=1)
+            v_zero = torch.cat([v_zero[:, start:], v_zero[:, :start]], dim=1)
+        k_fp = unpack_int4_rows(k, k_scale[:, : k.size(1)], k_zero[:, : k.size(1)], head_dim=self.cfg.attention_head_dim)
+        v_fp = unpack_int4_rows(v, v_scale[:, : v.size(1)], v_zero[:, : v.size(1)], head_dim=self.cfg.attention_head_dim)
+        if self.kv_cache_spec.uses_bdr:
+            k_fp = hadamard_transform(k_fp, self.kv_cache_spec.hadamard_order)
+            if self.kv_cache_spec.rotate_v:
+                v_fp = hadamard_transform(v_fp, self.kv_cache_spec.hadamard_order)
+        return k_fp, v_fp
 
     def attention_kv_view(self, layer: int) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Return KV in logical oldest→newest order for baseline attention.
@@ -310,24 +473,34 @@ class DecodeState:
         """
         live = min(self.kv_len + 1, self.max_seq_len)
         if self.kv_window_policy != "ring" or self.kv_len < self.max_seq_len:
-            return self.attn_k[layer], self.attn_v[layer], live
+            k, v = self.attn_k[layer], self.attn_v[layer]
+            k, v = self._dequant_attention_view(layer, k, v)
+            return k, v, live
         start = (self.pos + 1) % self.max_seq_len
         if start == 0:
-            return self.attn_k[layer], self.attn_v[layer], live
+            k, v = self.attn_k[layer], self.attn_v[layer]
+            k, v = self._dequant_attention_view(layer, k, v)
+            return k, v, live
         k = torch.cat([self.attn_k[layer][:, start:, :], self.attn_k[layer][:, :start, :]], dim=1)
         v = torch.cat([self.attn_v[layer][:, start:, :], self.attn_v[layer][:, :start, :]], dim=1)
+        k, v = self._dequant_attention_view(layer, k, v)
         return k, v, live
 
     def attention_kv_view_at(self, layer: int, *, logical_pos: int, live_len: int) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Return KV view after a block-local write at `logical_pos`."""
         live = min(live_len, self.max_seq_len)
         if self.kv_window_policy != "ring" or live < self.max_seq_len:
-            return self.attn_k[layer], self.attn_v[layer], live
+            k, v = self.attn_k[layer], self.attn_v[layer]
+            k, v = self._dequant_attention_view(layer, k, v)
+            return k, v, live
         start = (logical_pos + 1) % self.max_seq_len
         if start == 0:
-            return self.attn_k[layer], self.attn_v[layer], live
+            k, v = self.attn_k[layer], self.attn_v[layer]
+            k, v = self._dequant_attention_view(layer, k, v)
+            return k, v, live
         k = torch.cat([self.attn_k[layer][:, start:, :], self.attn_k[layer][:, :start, :]], dim=1)
         v = torch.cat([self.attn_v[layer][:, start:, :], self.attn_v[layer][:, :start, :]], dim=1)
+        k, v = self._dequant_attention_view(layer, k, v)
         return k, v, live
 
     def finish_token(self) -> None:
@@ -343,6 +516,7 @@ class DecodeState:
             max_seq_len=self.max_seq_len,
             kv_len=self.kv_len,
             kv_window_policy=self.kv_window_policy,
+            kv_cache_dtype=self.kv_cache_spec.dtype,
             dtype=str(self.dtype).replace("torch.", ""),
             include_attention_kv=include_attention_kv,
             include_conv_state=True,
@@ -359,6 +533,14 @@ class DecodeState:
             # warm-boot continuation.
             payload["attn_k"] = {k: v.detach().cpu() for k, v in self.attn_k.items()}
             payload["attn_v"] = {k: v.detach().cpu() for k, v in self.attn_v.items()}
+            if self.attn_k_scale is not None:
+                payload["attn_k_scale"] = {k: v.detach().cpu() for k, v in self.attn_k_scale.items()}
+            if self.attn_v_scale is not None:
+                payload["attn_v_scale"] = {k: v.detach().cpu() for k, v in self.attn_v_scale.items()}
+            if self.attn_k_zero is not None:
+                payload["attn_k_zero"] = {k: v.detach().cpu() for k, v in self.attn_k_zero.items()}
+            if self.attn_v_zero is not None:
+                payload["attn_v_zero"] = {k: v.detach().cpu() for k, v in self.attn_v_zero.items()}
         return payload
 
     def save_snapshot(self, path: str | Path, *, include_attention_kv: bool = True) -> None:
@@ -389,6 +571,7 @@ class DecodeState:
             device=device,
             dtype=dtype,
             kv_window_policy=info.get("kv_window_policy", "error"),
+            kv_cache_spec=KVCacheSpec.resolve(info.get("kv_cache_dtype", "fp16")),
         )
         state.pos = int(info["pos"])
         state.kv_len = min(int(info["kv_len"]), max_seq_len)
@@ -399,15 +582,31 @@ class DecodeState:
         if info.get("include_attention_kv") and "attn_k" in payload:
             for k, v in payload["attn_k"].items():
                 live = min(v.size(1), state.max_seq_len)
-                state.attn_k[int(k)][:, :live, :].copy_(v[:, :live, :].to(device=device, dtype=dtype))
+                state.attn_k[int(k)][:, :live, :].copy_(v[:, :live, :].to(device=device, dtype=state.kv_cache_spec.storage_dtype))
             for k, v in payload["attn_v"].items():
                 live = min(v.size(1), state.max_seq_len)
-                state.attn_v[int(k)][:, :live, :].copy_(v[:, :live, :].to(device=device, dtype=dtype))
+                state.attn_v[int(k)][:, :live, :].copy_(v[:, :live, :].to(device=device, dtype=state.kv_cache_spec.storage_dtype))
+            if state.attn_k_scale is not None and "attn_k_scale" in payload:
+                for k, v in payload["attn_k_scale"].items():
+                    live = min(v.size(1), state.max_seq_len)
+                    state.attn_k_scale[int(k)][:, :live].copy_(v[:, :live].to(device=device, dtype=torch.float16))
+            if state.attn_v_scale is not None and "attn_v_scale" in payload:
+                for k, v in payload["attn_v_scale"].items():
+                    live = min(v.size(1), state.max_seq_len)
+                    state.attn_v_scale[int(k)][:, :live].copy_(v[:, :live].to(device=device, dtype=torch.float16))
+            if state.attn_k_zero is not None and "attn_k_zero" in payload:
+                for k, v in payload["attn_k_zero"].items():
+                    live = min(v.size(1), state.max_seq_len)
+                    state.attn_k_zero[int(k)][:, :live].copy_(v[:, :live].to(device=device, dtype=torch.float16))
+            if state.attn_v_zero is not None and "attn_v_zero" in payload:
+                for k, v in payload["attn_v_zero"].items():
+                    live = min(v.size(1), state.max_seq_len)
+                    state.attn_v_zero[int(k)][:, :live].copy_(v[:, :live].to(device=device, dtype=torch.float16))
         return state
 
 
 class DecodeStateArena:
-    """Slot-indexed state pool for vLLM-style batched serving.
+    """Slot-indexed state pool for continuous-serving batched serving.
 
     Each request gets a lightweight DecodeState view into contiguous
     [slot, ...] buffers. Releasing a request resets its slot and returns it to
@@ -425,6 +624,7 @@ class DecodeStateArena:
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.float16,
         kv_window_policy: KVWindowPolicy = "error",
+        kv_cache_spec: KVCacheSpec | None = None,
     ) -> None:
         if num_slots < 1:
             raise ValueError("num_slots must be >= 1")
@@ -438,6 +638,9 @@ class DecodeStateArena:
         self.device = torch.device(device)
         self.dtype = dtype
         self.kv_window_policy = kv_window_policy
+        self.kv_cache_spec = kv_cache_spec or KVCacheSpec()
+        self.paged_kv_enabled = self.kv_num_blocks > 0 and self.kv_block_size > 0
+        self.kv_layout = DecodeState.kv_layout(cfg)
         conv_dim = (
             cfg.linear_key_head_dim * cfg.linear_num_key_heads * 2
             + cfg.linear_value_head_dim * cfg.linear_num_value_heads
@@ -463,33 +666,46 @@ class DecodeStateArena:
             )
             for layer in cfg.gdn_layers
         }
-        self.attn_k = {
-            layer: torch.zeros(
-                self.num_slots,
-                cfg.num_key_value_heads,
-                self.max_seq_len,
-                cfg.attention_head_dim,
-                device=self.device,
-                dtype=dtype,
-            )
-            for layer in cfg.attention_layers
+        mirror_default = "1" if self.kv_cache_spec.dtype == "fp16" else "0"
+        mirror_paged_kv = os.environ.get("LANGBURST_PAGED_KV_MIRROR", mirror_default).strip().lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
         }
-        self.attn_v = {layer: torch.zeros_like(self.attn_k[layer]) for layer in cfg.attention_layers}
+        arena_kv = allocate_kv_cache_tensors(
+            self.kv_layout,
+            self.kv_cache_spec,
+            seq_len=self.max_seq_len if (not self.paged_kv_enabled or mirror_paged_kv) else 0,
+            device=self.device,
+            leading_shape=(self.num_slots,),
+        )
+        self.attn_k = arena_kv.k
+        self.attn_v = arena_kv.v
+        self.attn_k_scale = arena_kv.k_scale
+        self.attn_v_scale = arena_kv.v_scale
+        self.attn_k_zero = arena_kv.k_zero
+        self.attn_v_zero = arena_kv.v_zero
         self.paged_attn_k = None
         self.paged_attn_v = None
-        if self.kv_num_blocks > 0 and self.kv_block_size > 0:
-            self.paged_attn_k = {
-                layer: torch.zeros(
-                    self.kv_num_blocks,
-                    cfg.num_key_value_heads,
-                    self.kv_block_size,
-                    cfg.attention_head_dim,
-                    device=self.device,
-                    dtype=dtype,
-                )
-                for layer in cfg.attention_layers
-            }
-            self.paged_attn_v = {layer: torch.zeros_like(self.paged_attn_k[layer]) for layer in cfg.attention_layers}
+        self.paged_attn_k_scale = None
+        self.paged_attn_v_scale = None
+        self.paged_attn_k_zero = None
+        self.paged_attn_v_zero = None
+        if self.paged_kv_enabled:
+            paged_kv = allocate_kv_cache_tensors(
+                self.kv_layout,
+                self.kv_cache_spec,
+                seq_len=self.kv_block_size,
+                device=self.device,
+                leading_shape=(self.kv_num_blocks,),
+            )
+            self.paged_attn_k = paged_kv.k
+            self.paged_attn_v = paged_kv.v
+            self.paged_attn_k_scale = paged_kv.k_scale
+            self.paged_attn_v_scale = paged_kv.v_scale
+            self.paged_attn_k_zero = paged_kv.k_zero
+            self.paged_attn_v_zero = paged_kv.v_zero
         self._free_slots = list(range(self.num_slots - 1, -1, -1))
         self._active_slots: set[int] = set()
 
@@ -524,8 +740,18 @@ class DecodeStateArena:
         for tensor in self.gdn_conv_states.values():
             tensor[slot].zero_()
         for tensor in self.attn_k.values():
-            tensor[slot].zero_()
+            if tensor.size(-2) > 0:
+                tensor[slot].zero_()
         for tensor in self.attn_v.values():
+            if tensor.size(-2) > 0:
+                tensor[slot].zero_()
+        for tensor in (self.attn_k_scale or {}).values():
+            tensor[slot].fill_(1.0)
+        for tensor in (self.attn_v_scale or {}).values():
+            tensor[slot].fill_(1.0)
+        for tensor in (self.attn_k_zero or {}).values():
+            tensor[slot].zero_()
+        for tensor in (self.attn_v_zero or {}).values():
             tensor[slot].zero_()
 
     def view(self, slot: int) -> DecodeState:
@@ -538,10 +764,15 @@ class DecodeStateArena:
             gdn_conv_states={layer: tensor[slot] for layer, tensor in self.gdn_conv_states.items()},
             attn_k={layer: tensor[slot] for layer, tensor in self.attn_k.items()},
             attn_v={layer: tensor[slot] for layer, tensor in self.attn_v.items()},
+            attn_k_scale={layer: tensor[slot] for layer, tensor in self.attn_k_scale.items()} if self.attn_k_scale is not None else None,
+            attn_v_scale={layer: tensor[slot] for layer, tensor in self.attn_v_scale.items()} if self.attn_v_scale is not None else None,
+            attn_k_zero={layer: tensor[slot] for layer, tensor in self.attn_k_zero.items()} if self.attn_k_zero is not None else None,
+            attn_v_zero={layer: tensor[slot] for layer, tensor in self.attn_v_zero.items()} if self.attn_v_zero is not None else None,
             pos=0,
             max_seq_len=self.max_seq_len,
             kv_len=0,
             kv_window_policy=self.kv_window_policy,
+            kv_cache_spec=self.kv_cache_spec,
         )
         # Dynamic metadata keeps the public DecodeState shape stable while
         # letting hot CUDA paths address slot-indexed arena buffers directly.
@@ -550,11 +781,17 @@ class DecodeStateArena:
         return state
 
     def summary(self) -> dict[str, int]:
-        return {
+        out = {
             "num_slots": self.num_slots,
             "active_slots": self.active_slot_count,
             "free_slots": self.free_slot_count,
             "max_seq_len": self.max_seq_len,
             "kv_num_blocks": self.kv_num_blocks,
             "kv_block_size": self.kv_block_size,
+            "kv_cache_dtype": self.kv_cache_spec.dtype,
+            "kv_storage_head_dim": self.kv_layout.storage_head_dim(self.kv_cache_spec),
+            "paged_kv_enabled": self.paged_kv_enabled,
         }
+        if self.paged_kv_enabled:
+            out["paged_kv_mirror"] = bool(next(iter(self.attn_k.values())).size(-2) > 0) if self.attn_k else False
+        return out

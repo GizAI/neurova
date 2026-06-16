@@ -7,6 +7,7 @@ from typing import Any, Sequence
 import torch
 
 from .qwen36_impl.config import Qwen36_27B_TextConfig
+from ..core.kv_cache import KVCacheLayout, KVCacheSpec
 from ..core.adapter import AdapterDescriptor, adapter_registry
 from ..core.features import RuntimeCapabilities, RuntimeFeatures
 from ..core.platform import resolve_index_file
@@ -46,7 +47,7 @@ class Qwen36Adapter:
     descriptor = AdapterDescriptor(
         adapter_id="qwen36",
         family="qwen3.6-hybrid-gdn",
-        default_model_name="langburst-qwen3.6-27b-q4-marlin",
+        default_model_name="langburst-qwen3.6-27b-q4",
         capabilities=RuntimeCapabilities.stateful_hybrid(),
         supports_state=True,
         supports_mtp=False,
@@ -90,7 +91,68 @@ class Qwen36Adapter:
             max_seq_len=recent_window,
             device=device,
             kv_window_policy=features.kv_window_policy,
+            kv_cache_spec=KVCacheSpec.resolve(features.kv_cache_dtype),
         )
+
+    def estimate_state_bytes(
+        self,
+        cfg: Qwen36_27B_TextConfig,
+        *,
+        recent_window: int,
+        features: RuntimeFeatures | None = None,
+        ) -> int:
+        dtype_bytes = 2
+        kv_spec = KVCacheSpec.resolve(features.kv_cache_dtype if features is not None else cfg.kv_cache_mode)
+        gdn = (
+            len(cfg.gdn_layers)
+            * cfg.linear_num_value_heads
+            * cfg.linear_key_head_dim
+            * cfg.linear_value_head_dim
+            * dtype_bytes
+        )
+        conv_dim = (
+            cfg.linear_key_head_dim * cfg.linear_num_key_heads * 2
+            + cfg.linear_value_head_dim * cfg.linear_num_value_heads
+        )
+        conv = len(cfg.gdn_layers) * conv_dim * (cfg.linear_conv_kernel_dim - 1) * dtype_bytes
+        kv_layout = KVCacheLayout.from_parts(
+            layers=cfg.attention_layers,
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.attention_head_dim,
+        )
+        kv = kv_layout.total_bytes(kv_spec, int(recent_window))
+        return int(gdn + conv + kv)
+
+    def estimate_arena_state_bytes(
+        self,
+        cfg: Qwen36_27B_TextConfig,
+        *,
+        max_slots: int,
+        kv_num_blocks: int,
+        kv_block_size: int,
+        features: RuntimeFeatures,
+    ) -> int:
+        dtype_bytes = 2
+        kv_spec = KVCacheSpec.resolve(features.kv_cache_dtype if features is not None else cfg.kv_cache_mode)
+        gdn_per_slot = (
+            len(cfg.gdn_layers)
+            * cfg.linear_num_value_heads
+            * cfg.linear_key_head_dim
+            * cfg.linear_value_head_dim
+            * dtype_bytes
+        )
+        conv_dim = (
+            cfg.linear_key_head_dim * cfg.linear_num_key_heads * 2
+            + cfg.linear_value_head_dim * cfg.linear_num_value_heads
+        )
+        conv_per_slot = len(cfg.gdn_layers) * conv_dim * (cfg.linear_conv_kernel_dim - 1) * dtype_bytes
+        kv_layout = KVCacheLayout.from_parts(
+            layers=cfg.attention_layers,
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.attention_head_dim,
+        )
+        paged_kv = kv_layout.total_bytes(kv_spec, int(kv_num_blocks) * int(kv_block_size))
+        return int((gdn_per_slot + conv_per_slot) * int(max_slots) + paged_kv)
 
     def create_state_arena(
         self,
@@ -111,6 +173,7 @@ class Qwen36Adapter:
             kv_block_size=kv_block_size,
             device=device,
             kv_window_policy=features.kv_window_policy,
+            kv_cache_spec=KVCacheSpec.resolve(features.kv_cache_dtype),
         )
 
     def encode_prompt(self, tokenizer, prompt: str, system: str | None = None) -> list[int]:
@@ -155,7 +218,7 @@ class Qwen36A3BAdapter(Qwen36Adapter):
     descriptor = AdapterDescriptor(
         adapter_id="qwen36-a3b",
         family="qwen3.6-hybrid-a3b",
-        default_model_name="langburst-qwen3.6-35b-a3b-q4-marlin",
+        default_model_name="langburst-qwen3.6-35b-a3b-q4",
         capabilities=RuntimeCapabilities.stateful_hybrid(),
         supports_state=True,
         supports_mtp=False,

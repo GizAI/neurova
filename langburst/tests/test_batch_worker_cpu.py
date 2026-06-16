@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from langburst.core.batch_worker import BatchGenerationWorker
 from langburst.core.model_runner import BatchedModelRunner
-from langburst.core.runtime import RuntimeEngine
+from langburst.core.runtime import GenerationConfig, RuntimeEngine
 from langburst.core.scheduler import ContinuousBatchScheduler
 
 from test_adapter_runtime_cpu import ToyAdapter
@@ -15,7 +16,7 @@ class FailingRunner:
         self.engine = type("Engine", (), {"lock": __import__("threading").Lock()})()
         self.finished: list[str] = []
 
-    def add_request(self, request_id, token_ids):
+    def add_request(self, request_id, token_ids, **kwargs):
         return None
 
     def execute_step(self, *, device=None):
@@ -32,7 +33,7 @@ class OneStepRunner:
         self._request_id: str | None = None
         self._sent = False
 
-    def add_request(self, request_id, token_ids):
+    def add_request(self, request_id, token_ids, **kwargs):
         self._request_id = request_id
 
     def execute_step(self, *, device=None):
@@ -59,8 +60,29 @@ class IdleRunner:
         self.added = threading.Event()
         self.finished: list[str] = []
 
-    def add_request(self, request_id, token_ids):
+    def add_request(self, request_id, token_ids, **kwargs):
         self.added.set()
+
+    def execute_step(self, *, device=None):
+        return None
+
+    def finish_request(self, request_id):
+        self.finished.append(request_id)
+
+
+class CapacityRunner:
+    def __init__(self):
+        import threading
+
+        self.engine = type("Engine", (), {"lock": threading.Lock()})()
+        self.scheduler = type("Scheduler", (), {"max_num_requests": 1})()
+        self.added: list[str] = []
+        self.finished: list[str] = []
+
+    def add_request(self, request_id, token_ids, **kwargs):
+        if len(self.added) - len(self.finished) >= 1:
+            raise AssertionError("worker admitted a pending request while capacity was full")
+        self.added.append(request_id)
 
     def execute_step(self, *, device=None):
         return None
@@ -93,6 +115,34 @@ def test_batch_generation_worker_batches_two_requests(tmp_path: Path):
         assert first.metrics()["ttft_s"] is not None
         assert worker.stats()["completed_requests"] == 2
         assert worker.stats()["completed_output_tokens"] == 4
+    finally:
+        worker.shutdown()
+
+
+def test_batch_generation_worker_passes_sampling_config_through_runner(tmp_path: Path):
+    engine = RuntimeEngine(
+        adapter=ToyAdapter(),
+        hf_model=tmp_path,
+        qb_model=tmp_path,
+        device="cpu",
+        recent_window=16,
+        weight_device="cpu",
+    )
+    scheduler = ContinuousBatchScheduler(max_num_requests=1, max_num_batched_tokens=4, prefill_chunk_size=2)
+    runner = BatchedModelRunner(engine=engine, scheduler=scheduler)
+    worker = BatchGenerationWorker(runner=runner, device="cpu", max_wait_s=0.001)
+    try:
+        handle = worker.submit(
+            [1, 2],
+            max_new_tokens=1,
+            generation_config=GenerationConfig(temperature=0.8, top_k=2),
+            request_id="sampled",
+        )
+        assert handle.wait_ids(timeout=2.0)
+        row = scheduler.finish_request("sampled")
+        assert row is None
+        assert handle.generation_config.temperature == 0.8
+        assert handle.generation_config.top_k == 2
     finally:
         worker.shutdown()
 
@@ -134,5 +184,29 @@ def test_batch_generation_worker_cancel_releases_active_request():
         assert handle.wait_ids(timeout=2.0) == []
         assert runner.finished == ["cancel-me"]
         assert worker.stats()["active_requests"] == 0
+    finally:
+        worker.shutdown()
+
+
+def test_batch_generation_worker_does_not_admit_pending_when_active_capacity_is_full():
+    runner = CapacityRunner()
+    worker = BatchGenerationWorker(runner=runner, device="cpu", max_wait_s=0.001)
+    try:
+        first = worker.submit([1], max_new_tokens=8, request_id="first")
+        second = worker.submit([2], max_new_tokens=8, request_id="second")
+        deadline = time.monotonic() + 2.0
+        while runner.added != ["first"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert runner.added == ["first"]
+        first.cancel()
+        assert first.wait_ids(timeout=2.0) == []
+        deadline = time.monotonic() + 2.0
+        while runner.added != ["first", "second"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert runner.added == ["first", "second"]
+        second.cancel()
+        assert second.wait_ids(timeout=2.0) == []
+        assert runner.added == ["first", "second"]
+        assert runner.finished == ["first", "second"]
     finally:
         worker.shutdown()

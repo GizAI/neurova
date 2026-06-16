@@ -15,7 +15,7 @@ langburst-chat \
   --hf-model "$HF_MODEL" \
   --qb-model "$QB_MODEL" \
   --device "$DEVICE" \
-  --recent-window "${RECENT_WINDOW:-16384}" \
+  --recent-window "${RECENT_WINDOW:-${LANGBURST_CONTEXT_WINDOW:-32768}}" \
   --max-new-tokens "${MAX_NEW_TOKENS:-96}" \
   --temperature "${TEMPERATURE:-0}" \
   --prompt "$PROMPT" \

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 
@@ -12,7 +12,7 @@ from .ops import cuda_ops
 class SpeculativeBatchPlan:
     """Single-request spec-decode execution plan.
 
-    This is the langburst equivalent of the vLLM spec-decode input contract:
+    This is the langburst equivalent of the external serving engine spec-decode input contract:
     target verification receives the newly sampled token followed by draft
     tokens, then sampler output is reduced to sampled/rejected counts for state
     post-processing.
@@ -81,7 +81,7 @@ def resolve_speculative_batch(
     """Resolve accepted/rejected counts and exact commit/emission tokens.
 
     `target_token_ids[i]` is the target model token that validates
-    `plan.draft_tokens[i]`.  On reject, vLLM samples the correcting target token
+    `plan.draft_tokens[i]`.  On reject, external serving engine samples the correcting target token
     and treats the remaining candidate logits as rejected; langburst mirrors that
     contract for the single-request path.
     """
@@ -135,6 +135,10 @@ class DecodeRequestState:
     computed_tokens: int = 0
     last_sampled_token: int | None = None
     draft_token_ids: list[int] | None = None
+    prefix_cache_hit_tokens: int = 0
+    prompt_cache_key: str | None = None
+    generation_config: Any | None = None
+    sample_index: int = 0
 
     def __post_init__(self) -> None:
         if self.prefill_len is None:
@@ -155,10 +159,10 @@ class DecodeRequestState:
 
 @dataclass(frozen=True)
 class DecodeBatchPlan:
-    """vLLM-style compact input batch for langburst.
+    """continuous-serving compact input batch for langburst.
 
     `input_ids`, `positions`, `query_start_loc`, `logits_indices`, and
-    `cu_num_logits` mirror the concepts used by vLLM's `InputBatch`, but this
+    `cu_num_logits` mirror the concepts used by the reference runtime's `InputBatch`, but this
     object is pure Python/Torch and small enough to use in CPU tests and as a
     future CUDA Graph/static-buffer contract.
     """
@@ -205,7 +209,7 @@ class DecodeBatchPlan:
 
 
 class DecodeInputBuffers:
-    """Reusable vLLM-style tensors for batch input preparation."""
+    """Reusable continuous-serving tensors for batch input preparation."""
 
     def __init__(self, *, max_num_requests: int, max_num_tokens: int, device: torch.device | str = "cpu") -> None:
         if max_num_requests < 1:
@@ -247,7 +251,7 @@ def build_decode_batch_plan(
     """Build one scheduled target batch from request rows.
 
     Prefill rows schedule the next prompt chunk. Decode rows schedule
-    `last_sampled_token + draft_token_ids`, matching vLLM's speculative target
+    `last_sampled_token + draft_token_ids`, matching the reference runtime's speculative target
     input convention.
     """
 
@@ -365,7 +369,7 @@ def sampled_and_rejected_counts(
     cu_num_logits: torch.Tensor,
     is_prefill: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return vLLM-compatible sampled/rejected counts for each request."""
+    """Return batch-runtime-compatible sampled/rejected counts for each request."""
 
     sampled = sampled_counts.to(dtype=torch.int32).clone()
     logits_per_req = (cu_num_logits[1:] - cu_num_logits[:-1]).to(dtype=torch.int32)
@@ -385,7 +389,7 @@ def apply_decode_post_update(
     sampled_counts: Sequence[int],
     rejected_counts: Sequence[int],
 ) -> None:
-    """Apply vLLM-style sampled/rejected post-update to request rows."""
+    """Apply continuous-serving sampled/rejected post-update to request rows."""
 
     if len(requests) != batch.num_requests:
         raise ValueError("request count and batch row count differ")

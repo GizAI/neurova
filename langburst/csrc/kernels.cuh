@@ -16,6 +16,7 @@
 #define QB_CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be CUDA")
 #define QB_CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 #define QB_CHECK_HALF(x) TORCH_CHECK((x).scalar_type() == at::kHalf, #x " must be fp16")
+#define QB_CHECK_FP8_E4M3(x) TORCH_CHECK((x).scalar_type() == at::kFloat8_e4m3fn, #x " must be fp8_e4m3fn")
 #define QB_CHECK_FLOAT(x) TORCH_CHECK((x).scalar_type() == at::kFloat, #x " must be fp32")
 #define QB_CHECK_UINT8(x) TORCH_CHECK((x).scalar_type() == at::kByte, #x " must be uint8")
 #define QB_CHECK_INT64(x) TORCH_CHECK((x).scalar_type() == at::kLong, #x " must be int64")
@@ -52,6 +53,8 @@ torch::Tensor depthwise_conv_update_batch(torch::Tensor state_arena, torch::Tens
 torch::Tensor attention_decode_fp16(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, int64_t seq_len, double softmax_scale);
 torch::Tensor attention_decode_batch_fp16(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_arena, torch::Tensor v_arena, torch::Tensor state_indices, torch::Tensor write_indices, torch::Tensor live_lengths, torch::Tensor positions, bool use_ring, double softmax_scale);
 torch::Tensor attention_decode_paged_fp16(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor slot_mapping, torch::Tensor block_tables, torch::Tensor seq_lens, int64_t block_size, double softmax_scale);
+torch::Tensor attention_decode_paged_fp8_e4m3(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor slot_mapping, torch::Tensor block_tables, torch::Tensor seq_lens, int64_t block_size, double softmax_scale, double k_scale, double v_scale);
+torch::Tensor attention_decode_paged_int4(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor k_scales, torch::Tensor v_scales, torch::Tensor k_zeros, torch::Tensor v_zeros, torch::Tensor slot_mapping, torch::Tensor block_tables, torch::Tensor seq_lens, int64_t block_size, double softmax_scale, int64_t hadamard_order, bool bdr_k, bool rotate_v);
 torch::Tensor argmax(torch::Tensor logits);
 torch::Tensor argmax_many(torch::Tensor logits);
 void argmax_many_out(torch::Tensor logits, torch::Tensor out);

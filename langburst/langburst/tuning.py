@@ -8,6 +8,7 @@ DEFAULT_MARLIN_DIRECT_MAX_BATCH = 4
 DEFAULT_FAST_RAW_BLOCK = True
 DEFAULT_BATCH_STATE_KERNELS = True
 DEFAULT_BATCH_PREFILL_STEPS = True
+DEFAULT_PAGED_ATTENTION_KERNELS = False
 DEFAULT_VERIFY_NEXTN_MODE = "fused"
 VERIFY_NEXTN_MODE_CHOICES = ("sequential", "block", "fused")
 
@@ -80,6 +81,13 @@ def batch_prefill_steps_enabled(value: str | int | bool | None = None) -> bool:
     if raw is None:
         return DEFAULT_BATCH_PREFILL_STEPS
     return _parse_env_bool(raw, "LANGBURST_BATCH_PREFILL_STEPS")
+
+
+def paged_attention_kernels_enabled(value: str | int | bool | None = None) -> bool:
+    raw = value if value is not None else os.environ.get("LANGBURST_PAGED_ATTENTION_KERNELS")
+    if raw is None:
+        return DEFAULT_PAGED_ATTENTION_KERNELS
+    return _parse_env_bool(raw, "LANGBURST_PAGED_ATTENTION_KERNELS")
 
 
 def _parse_env_bool(raw: str | int | bool, name: str) -> bool:

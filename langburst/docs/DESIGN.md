@@ -19,7 +19,7 @@ langburst target path
 ```
 
 The runtime follows the same separation used by mature editor/server runtimes
-such as VS Code extensions and vLLM model executors, but compressed for this
+such as VS Code extensions and external serving engine model executors, but compressed for this
 single-user engine:
 
 ```text
@@ -41,7 +41,7 @@ policy, or capability checks.
 
 ## Current Architecture Decision
 
-The vLLM/TensorRT-LLM pattern is the inspiration: core runtime separated from
+The production inference-runtime pattern is the inspiration: core runtime separated from
 model executors and capability-specific kernels.  LangBurst keeps the simpler
 shape needed here:
 
@@ -54,7 +54,7 @@ adapter registry
   -> model-specific forward/state implementation
 ```
 
-This is intentionally smaller than vLLM: it has request admission,
+This is intentionally smaller than external serving engine: it has request admission,
 multi-model residency, a partial continuous-batching runner, and paged-KV
 allocation scaffolding. Those stay behind the same manager/scheduler/plan
 boundary rather than becoming Qwen-specific server branches.

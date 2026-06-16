@@ -52,8 +52,6 @@ def test_model_path_args_use_env_defaults(monkeypatch):
 def test_model_path_args_accept_explicit_paths_without_env(monkeypatch):
     monkeypatch.delenv("LANGBURST_HF_MODEL", raising=False)
     monkeypatch.delenv("LANGBURST_QB_MODEL", raising=False)
-    monkeypatch.delenv("LANGBURST_HF_MODEL", raising=False)
-    monkeypatch.delenv("LANGBURST_QB_MODEL", raising=False)
     parser = argparse.ArgumentParser()
     add_model_path_args(parser)
     args = parser.parse_args(["--hf-model", "/models/hf", "--qb-model", "/models/qb"])
@@ -61,6 +59,11 @@ def test_model_path_args_accept_explicit_paths_without_env(monkeypatch):
     assert str(args.hf_model) == "/models/hf"
     assert str(args.qb_model) == "/models/qb"
 
+
+def test_batch_kernel_debug_flags_can_split(monkeypatch):
+    monkeypatch.delenv("LANGBURST_BATCH_STATE_KERNELS", raising=False)
+    monkeypatch.delenv("LANGBURST_BATCH_CONV_KERNELS", raising=False)
+    monkeypatch.delenv("LANGBURST_BATCH_GDN_KERNELS", raising=False)
     monkeypatch.setenv("LANGBURST_BATCH_STATE_KERNELS", "1")
     assert batch_state_kernels_enabled()
     assert batch_conv_kernels_enabled()
@@ -169,9 +172,10 @@ def test_runtime_feature_override_from_request_like_object():
 
 
 def test_runtime_plan_disables_unsupported_features():
-    requested = RuntimeFeatures.from_profile("research").with_overrides(kv_window_policy="ring")
+    requested = RuntimeFeatures.from_profile("research").with_overrides(kv_window_policy="ring", kv_cache_dtype="int4_bdr")
     plan = resolve_runtime_plan(requested, RuntimeCapabilities())
     assert plan.effective.kv_window_policy == "error"
+    assert plan.effective.kv_cache_dtype == "fp16"
     assert not plan.effective.stateful_chat
     assert plan.effective.state_pool
     assert not plan.effective.snapshots
@@ -180,6 +184,7 @@ def test_runtime_plan_disables_unsupported_features():
     assert not plan.effective.episodic_memory
     assert not plan.effective.ttt_sidecar
     assert "kv_window_policy" in plan.disabled
+    assert "kv_cache_dtype" in plan.disabled
     assert "stateful_chat" in plan.disabled
     assert "infinite_streaming" in plan.disabled
     assert "episodic_memory" in plan.disabled
@@ -187,14 +192,14 @@ def test_runtime_plan_disables_unsupported_features():
 
 
 def test_qwen_capabilities_keep_stateful_profile():
-    requested = RuntimeFeatures.from_profile("stateful")
+    requested = RuntimeFeatures.from_profile("stateful").with_overrides(kv_cache_dtype="int4_bdr")
     plan = resolve_runtime_plan(requested, RuntimeCapabilities.stateful_hybrid())
     assert plan.effective == requested
     assert plan.disabled == ()
 
 
 def test_transformer_decoder_caps_disable_model_specific_features():
-    requested = RuntimeFeatures.from_profile("research").with_overrides(kv_window_policy="ring")
+    requested = RuntimeFeatures.from_profile("research").with_overrides(kv_window_policy="ring", kv_cache_dtype="int4")
     plan = resolve_runtime_plan(requested, RuntimeCapabilities.transformer_decoder())
 
     assert plan.effective.stateful_chat
@@ -202,11 +207,13 @@ def test_transformer_decoder_caps_disable_model_specific_features():
     assert plan.effective.snapshots
     assert plan.effective.block_prefill
     assert plan.effective.kv_window_policy == "error"
+    assert plan.effective.kv_cache_dtype == "fp16"
     assert not plan.effective.speculative_decoding
     assert not plan.effective.infinite_streaming
     assert not plan.effective.episodic_memory
     assert not plan.effective.ttt_sidecar
     assert "kv_window_policy" in plan.disabled
+    assert "kv_cache_dtype" in plan.disabled
     assert "speculative_decoding" in plan.disabled
     assert "infinite_streaming" in plan.disabled
     assert "episodic_memory" in plan.disabled

@@ -6,9 +6,10 @@ import queue
 import threading
 import time
 import uuid
-from typing import Sequence
+from typing import Any, Sequence
 
 from .model_runner import BatchedModelRunner
+from .runtime import GenerationConfig
 
 
 _STOP = object()
@@ -19,6 +20,12 @@ class BatchGenerationHandle:
     request_id: str
     max_new_tokens: int
     eos_token_ids: tuple[int, ...] = ()
+    generation_config: GenerationConfig = field(default_factory=GenerationConfig)
+    prompt_tokens: int = 0
+    prompt_cache_key: str | None = None
+    session_record: Any | None = None
+    stop_sequences: tuple[tuple[int, ...], ...] = ()
+    include_stop_str_in_output: bool = False
     output_queue: queue.Queue[object] = field(default_factory=queue.Queue)
     done: threading.Event = field(default_factory=threading.Event)
     cancelled: threading.Event = field(default_factory=threading.Event)
@@ -29,6 +36,9 @@ class BatchGenerationHandle:
     first_token_monotonic: float | None = None
     finished_monotonic: float | None = None
     token_monotonic: list[float] = field(default_factory=list)
+    cached_input_tokens: int = 0
+    accepted_prediction_tokens: int = 0
+    rejected_prediction_tokens: int = 0
 
     def push_tokens(self, token_ids: Sequence[int]) -> bool:
         should_finish = False
@@ -43,7 +53,12 @@ class BatchGenerationHandle:
                 should_finish = True
                 break
             token_id = int(token)
-            if token_id in eos:
+            cfg = self.generation_config
+            can_stop = len(self.generated) >= int(cfg.min_new_tokens)
+            if can_stop and not cfg.ignore_eos and token_id in eos:
+                should_finish = True
+                break
+            if can_stop and token_id in set(int(t) for t in cfg.stop_token_ids):
                 should_finish = True
                 break
             now = time.monotonic()
@@ -52,13 +67,36 @@ class BatchGenerationHandle:
             self.generated.append(token_id)
             self.token_monotonic.append(now)
             self.output_queue.put(token_id)
+            matched_stop = self._matched_stop_sequence()
+            if can_stop and matched_stop:
+                if not self.include_stop_str_in_output:
+                    remove_n = len(matched_stop)
+                    if remove_n:
+                        del self.generated[-remove_n:]
+                    # Streaming cannot retract already emitted token chunks. The
+                    # token list is corrected for non-streaming and accounting;
+                    # callers that need strict string-stop streaming should use
+                    # token stops or include_stop_str_in_output.
+                should_finish = True
+                break
             if len(self.generated) >= self.max_new_tokens:
                 should_finish = True
                 break
         return should_finish
 
+    def _matched_stop_sequence(self) -> tuple[int, ...]:
+        if not self.stop_sequences:
+            return ()
+        for seq in self.stop_sequences:
+            if seq and len(self.generated) >= len(seq) and tuple(self.generated[-len(seq) :]) == tuple(seq):
+                return tuple(seq)
+        return ()
+
     def cancel(self) -> None:
         self.cancelled.set()
+        # Wake any streaming waiter immediately. The worker still owns model
+        # state cleanup, but the HTTP side must not block on a cancelled queue.
+        self.output_queue.put(_STOP)
 
     def finish(self) -> None:
         if not self.done.is_set():
@@ -88,6 +126,25 @@ class BatchGenerationHandle:
                 return
             yield int(item)
 
+    def poll_output(self, timeout: float = 0.25) -> tuple[int | None, bool]:
+        """Return ``(token_id, done)`` without blocking indefinitely.
+
+        Streaming HTTP handlers need a polling boundary so client disconnects
+        can cancel long prefill requests before they pin arena slots or KV
+        blocks. `iter_token_ids()` remains the simple blocking API for tests and
+        non-streaming waiters.
+        """
+
+        try:
+            item = self.output_queue.get(timeout=max(0.0, float(timeout)))
+        except queue.Empty:
+            return None, False
+        if item is _STOP:
+            if self.error is not None:
+                raise self.error
+            return None, True
+        return int(item), False
+
     def metrics(self) -> dict[str, float | int | str | None]:
         end = self.finished_monotonic or time.monotonic()
         admitted = self.admitted_monotonic
@@ -102,7 +159,11 @@ class BatchGenerationHandle:
         ]
         return {
             "request_id": self.request_id,
+            "prompt_tokens": int(self.prompt_tokens),
             "output_tokens": output_tokens,
+            "cached_input_tokens": int(self.cached_input_tokens),
+            "accepted_prediction_tokens": int(self.accepted_prediction_tokens),
+            "rejected_prediction_tokens": int(self.rejected_prediction_tokens),
             "queue_wait_s": queue_wait_s,
             "ttft_s": ttft_s,
             "e2e_s": e2e_s,
@@ -124,7 +185,7 @@ class BatchGenerationHandle:
 class BatchGenerationWorker:
     """Continuous-batching generation worker.
 
-    This is intentionally small, but it mirrors vLLM's serving split: request
+    This is intentionally small, but it mirrors the reference runtime's serving split: request
     handlers enqueue work, the worker owns the model runner, and postprocessing
     is driven by sampled/rejected counts from the runner.
     """
@@ -154,6 +215,11 @@ class BatchGenerationWorker:
         *,
         max_new_tokens: int,
         eos_token_ids: tuple[int, ...] = (),
+        generation_config: GenerationConfig | None = None,
+        prompt_cache_key: str | None = None,
+        session_record: Any | None = None,
+        stop_sequences: tuple[tuple[int, ...], ...] = (),
+        include_stop_str_in_output: bool = False,
         request_id: str | None = None,
     ) -> BatchGenerationHandle:
         if max_new_tokens < 1:
@@ -164,6 +230,12 @@ class BatchGenerationWorker:
             request_id=request_id or f"qb-{uuid.uuid4().hex}",
             max_new_tokens=int(max_new_tokens),
             eos_token_ids=tuple(int(t) for t in eos_token_ids),
+            generation_config=generation_config or GenerationConfig(),
+            prompt_tokens=len(prompt_ids),
+            prompt_cache_key=prompt_cache_key,
+            session_record=session_record,
+            stop_sequences=tuple(tuple(int(t) for t in seq) for seq in stop_sequences),
+            include_stop_str_in_output=bool(include_stop_str_in_output),
         )
         self._pending.put((handle, [int(t) for t in prompt_ids]))
         return handle
@@ -190,7 +262,7 @@ class BatchGenerationWorker:
                 self._drain_pending(wait_for_first=not self._active)
                 if not self._active:
                     continue
-                # The runner thread is the vLLM-style owner for batched greedy
+                # The runner thread is the continuous-serving owner for batched greedy
                 # requests. The engine lock prevents legacy streaming/sampling
                 # paths from mutating the same model/state objects concurrently.
                 with self.runner.engine.lock:
@@ -198,24 +270,42 @@ class BatchGenerationWorker:
                     if not self._active:
                         continue
                     step = self.runner.execute_step(device=self.device)
+                    if step is not None:
+                        for req_id, token_ids in step.tokens_by_request().items():
+                            handle = self._active.get(req_id)
+                            if handle is None:
+                                continue
+                            batch = getattr(step, "batch", None)
+                            try:
+                                if batch is None:
+                                    raise ValueError
+                                row_idx = batch.request_ids.index(req_id)
+                                handle.accepted_prediction_tokens += max(0, int(step.sampled_counts[row_idx]) - 1)
+                                handle.rejected_prediction_tokens += int(step.rejected_counts[row_idx])
+                            except (ValueError, IndexError):
+                                pass
+                            should_finish = handle.push_tokens(token_ids)
+                            if should_finish:
+                                self._finish_active(req_id, handle)
                 if step is None:
                     time.sleep(0.001)
-                    self._release_cancelled_active()
+                    with self.runner.engine.lock:
+                        self._release_cancelled_active()
                     continue
-                for req_id, token_ids in step.tokens_by_request().items():
-                    handle = self._active.get(req_id)
-                    if handle is None:
-                        continue
-                    should_finish = handle.push_tokens(token_ids)
-                    if should_finish:
-                        self._finish_active(req_id, handle)
             except BaseException as exc:
                 for req_id, handle in list(self._active.items()):
                     handle.fail(exc)
                     self.runner.finish_request(req_id)
                 self._active.clear()
+                clear = getattr(self.runner, "clear", None)
+                if callable(clear):
+                    clear()
 
     def _drain_pending(self, *, wait_for_first: bool) -> None:
+        scheduler = getattr(self.runner, "scheduler", None)
+        capacity = int(getattr(scheduler, "max_num_requests", 1))
+        if len(self._active) >= capacity:
+            return
         deadline = time.monotonic() + self.max_wait_s
         first_timeout = self.max_wait_s if wait_for_first else 0
         try:
@@ -223,9 +313,7 @@ class BatchGenerationWorker:
         except queue.Empty:
             return
         self._admit(item)
-        scheduler = getattr(self.runner, "scheduler", None)
-        capacity = int(getattr(scheduler, "max_num_requests", 1))
-        # vLLM admits already-queued requests up to the active batch capacity
+        # external serving engine admits already-queued requests up to the active batch capacity
         # before running a model step. State allocation can be nontrivial on the
         # first request, so a pure wall-clock drain deadline can accidentally
         # split an otherwise ready batch and destroy TTFT/throughput.
@@ -247,14 +335,57 @@ class BatchGenerationWorker:
         if handle.cancelled.is_set():
             handle.finish()
             return
+        release_callback = None
         try:
-            self.runner.add_request(handle.request_id, prompt_ids)
+            external_state = None
+            if handle.session_record is not None:
+                handle.session_record.lock.acquire()
+                external_state = handle.session_record.state
+
+                def release_session_lock(record=handle.session_record):
+                    record.lock.release()
+
+                release_callback = release_session_lock
+            self.runner.add_request(
+                handle.request_id,
+                prompt_ids,
+                generation_config=handle.generation_config,
+                prompt_cache_key=handle.prompt_cache_key,
+                external_state=external_state,
+                release_callback=release_callback,
+            )
+            scheduler = getattr(self.runner, "scheduler", None)
+            get_request = getattr(scheduler, "get_request", None)
+            if callable(get_request):
+                row = get_request(handle.request_id)
+                if row is not None:
+                    handle.cached_input_tokens = int(getattr(row, "prefix_cache_hit_tokens", 0) or 0)
             handle.admitted_monotonic = time.monotonic()
             self._active[handle.request_id] = handle
         except BaseException as exc:
+            if release_callback is not None:
+                try:
+                    release_callback()
+                except RuntimeError:
+                    pass
             handle.fail(exc)
 
     def _finish_active(self, req_id: str, handle: BatchGenerationHandle) -> None:
+        if handle.session_record is not None and handle.generated:
+            # The scheduled decode step consumes the previous sampled token; the
+            # final emitted token has no following step, so commit it explicitly
+            # before detaching the preserved session state.
+            self.runner.engine.forward_one(int(handle.generated[-1]), handle.session_record.state, return_logits=False)
+            handle.session_record.prompt_tokens += int(handle.prompt_tokens)
+            handle.session_record.generated_tokens += len(handle.generated)
+            handle.session_record.turns += 1
+            handle.session_record.touch()
+        self.runner.finish_request(req_id)
+        self._active.pop(req_id, None)
+        handle.finish()
+        self._completed.append(handle.metrics())
+
+    def _cancel_active(self, req_id: str, handle: BatchGenerationHandle) -> None:
         self.runner.finish_request(req_id)
         self._active.pop(req_id, None)
         handle.finish()
@@ -263,7 +394,7 @@ class BatchGenerationWorker:
     def _release_cancelled_active(self) -> None:
         for req_id, handle in list(self._active.items()):
             if handle.cancelled.is_set():
-                self._finish_active(req_id, handle)
+                self._cancel_active(req_id, handle)
 
 
 def _mean_metric(rows: Sequence[dict[str, object]], key: str) -> float | None:

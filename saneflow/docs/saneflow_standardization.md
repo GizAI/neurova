@@ -128,8 +128,8 @@ runs quality gates, and promotes only after the gate.
 
 ## Inference
 
-`./neurova.sh` defaults to SaneFlow chat. Runtime decoding uses the shared
-decoder controls in `saneflow/decoding.py`:
+`./neurova.sh saneflow` starts the SaneFlow chat path. Runtime decoding uses
+the shared decoder controls in `saneflow/decoding.py`:
 
 ```text
 NEUROVA_SANEFLOW_REPETITION_PENALTY=1.08

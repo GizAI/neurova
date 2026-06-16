@@ -134,7 +134,7 @@ The runtime target is:
 - `neuromamba/scripts/mamba3_continue_base_training.sh`: resume a governed base checkpoint for longer base-only training before any recall curriculum.
 - `neuromamba/scripts/mamba3_run_arch_context_compare.sh`: equal-token-budget architecture/context comparison for pure Mamba, MIMO, and recall-hybrid candidates.
 - `neuromamba/scripts/mamba3_promote_if_pass.sh`: only path that promotes a checkpoint to the default runtime.
-- `neurova.sh`: user-facing CLI; no arguments starts interactive Mamba-3 chat.
+- `neurova.sh`: workspace router; Mamba-3 runtime is reached through `./neurova.sh mamba3 ...` or `neuromamba/scripts/run.sh ...`.
 
 ## Scientific Training Order
 
@@ -391,7 +391,7 @@ neuromamba/runs/mamba3_current/model.pt
 neuromamba/runs/mamba3_current/metadata.json
 ```
 
-`./neurova.sh` uses `neuromamba/runs/mamba3_current/model.pt` first and falls back to the last known stable tiny chat checkpoint only when current is missing.
+`./neurova.sh mamba3` uses `neuromamba/runs/mamba3_current/model.pt` first and falls back to the last known stable tiny chat checkpoint only when current is missing.
 
 ### Stage 4: Paper-Scale Escalation
 
@@ -459,7 +459,7 @@ Why this rule exists:
 
 Operationally:
 
-- `./neurova.sh` and `neuromamba/scripts/mamba3_chat_serverctl.sh` default to `NEUROVA_MAMBA3_DECODE_MODE=safe`.
+- `./neurova.sh mamba3` and `neuromamba/scripts/mamba3_chat_serverctl.sh` default to `NEUROVA_MAMBA3_DECODE_MODE=safe`.
 - `NEUROVA_MAMBA3_DECODE_MODE=exact-cache` is retained as a correctness audit path, but it is slower because it verifies exact full-forward logits while maintaining the cache-oriented interface.
 - `decode_mode=cache` keeps a short parity guard and falls back when the cache path is unsafe.
 - Do not promote a fast recurrent runtime for `mimo-r4-tiny` unless the parity script passes without `--exact-cache`.
@@ -470,7 +470,7 @@ The stable interactive checkpoint is now the pure SISO fast line, not the older 
 
 Current inference-speed evidence on `neuromamba/runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt`:
 
-- Default `./neurova.sh` uses `mamba3-siso-fast-0.3b-ds128`, `seq_len=128`, recurrent cache decode, CUDA graph on, and checkpoint `neuromamba/runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt`.
+- Default `./neurova.sh mamba3` uses `mamba3-siso-fast-0.3b-ds128`, `seq_len=128`, recurrent cache decode, CUDA graph on, and checkpoint `neuromamba/runs/mamba3_siso_fast_0_3b_ds128_v3/model.pt`.
 - v3 recurrent parity passed on the promotion probe.
 - Same-condition EOS-limited recurrent benchmark:
   - batch 1: about 159-162 tok/s,

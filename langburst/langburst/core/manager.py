@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import gc
+import os
 import time
 from pathlib import Path
 import json
@@ -12,15 +14,16 @@ import torch
 
 from .adapter import adapter_registry
 from .defaults import (
-    DEFAULT_KV_BLOCK_SIZE,
-    DEFAULT_KV_BLOCKS,
     DEFAULT_MAX_GENERATION_TOKENS,
     DEFAULT_MAX_BATCHED_TOKENS,
-    DEFAULT_MAX_PROMPT_TOKENS,
-    DEFAULT_MAX_STATE_POOL_SIZE,
     DEFAULT_PREFILL_CHUNK_SIZE,
     DEFAULT_RESERVE_FREE_VRAM_MIB,
-    DEFAULT_SERVING_RECENT_WINDOW,
+    kv_block_size_default,
+    kv_blocks_default,
+    max_active_requests_default,
+    max_prompt_tokens_default,
+    max_state_pool_size_default,
+    serving_recent_window_default,
 )
 from .features import RuntimeFeatures, RuntimePlan, resolve_runtime_plan
 from .batch_worker import BatchGenerationWorker
@@ -29,6 +32,7 @@ from .runtime import RuntimeEngine
 from .scheduler import AdmissionController, ContinuousBatchScheduler
 from .block_table import KVBlockTable
 from .cuda_graph import CudaGraphBucketPlanner
+from .session_store import SessionStateRecord, SessionStateStore
 
 
 @dataclass(frozen=True)
@@ -40,7 +44,7 @@ class ModelResourceSpec:
     hf_model: Path
     qb_model: Path
     device: str = "cuda"
-    recent_window: int = DEFAULT_SERVING_RECENT_WINDOW
+    recent_window: int = field(default_factory=serving_recent_window_default)
     weight_device: str = "auto"
     cpu_embed: bool = False
     estimated_vram_mib: int | None = None
@@ -63,10 +67,27 @@ class ModelResourceSpec:
             hf_model=Path(data["hf_model"]),
             qb_model=Path(data["qb_model"]),
             device=str(data.get("device", "cuda")),
-            recent_window=int(data.get("recent_window", DEFAULT_SERVING_RECENT_WINDOW)),
+            recent_window=int(data.get("recent_window", serving_recent_window_default())),
             weight_device=str(data.get("weight_device", "auto")),
             cpu_embed=bool(data.get("cpu_embed", False)),
             estimated_vram_mib=(int(data["estimated_vram_mib"]) if data.get("estimated_vram_mib") is not None else None),
+            runtime_features=features,
+        )
+
+    @classmethod
+    def from_args(cls, args: Any, *, features: RuntimeFeatures) -> "ModelResourceSpec":
+        if args.hf_model is None or args.qb_model is None:
+            raise ValueError("hf_model and qb_model are required for a single model spec")
+        adapter = adapter_registry.get(args.adapter)
+        return cls(
+            model_name=args.model_name or adapter.descriptor.default_model_name,
+            adapter_id=args.adapter,
+            hf_model=args.hf_model,
+            qb_model=args.qb_model,
+            device=args.device,
+            recent_window=args.recent_window,
+            weight_device=args.weight_device,
+            cpu_embed=bool(args.cpu_embed),
             runtime_features=features,
         )
 
@@ -81,17 +102,26 @@ class EngineResourcePolicy:
     """
 
     max_loaded_models: int = 1
-    max_active_requests: int = 1
+    max_active_requests: int = field(default_factory=max_active_requests_default)
     max_queued_requests: int = 0
     admission_timeout_s: float | None = None
     reserve_free_vram_mib: int = DEFAULT_RESERVE_FREE_VRAM_MIB
-    max_state_pool_size: int = DEFAULT_MAX_STATE_POOL_SIZE
-    max_prompt_tokens: int | None = DEFAULT_MAX_PROMPT_TOKENS
+    max_state_pool_size: int = field(default_factory=max_state_pool_size_default)
+    max_prompt_tokens: int | None = field(default_factory=max_prompt_tokens_default)
     max_generation_tokens: int | None = DEFAULT_MAX_GENERATION_TOKENS
     max_num_batched_tokens: int = DEFAULT_MAX_BATCHED_TOKENS
     prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE
-    kv_block_size: int = DEFAULT_KV_BLOCK_SIZE
-    kv_blocks: int = DEFAULT_KV_BLOCKS
+    kv_block_size: int = field(default_factory=kv_block_size_default)
+    kv_blocks: int = field(default_factory=kv_blocks_default)
+    runtime_overhead_mib: int = field(default_factory=lambda: int(os.environ.get("LANGBURST_RUNTIME_OVERHEAD_MIB", "384")))
+    max_sessions: int = field(default_factory=lambda: int(os.environ.get("LANGBURST_MAX_SESSIONS", "16")))
+    session_ttl_s: float | None = field(
+        default_factory=lambda: (
+            None
+            if os.environ.get("LANGBURST_SESSION_TTL_S", "3600").lower() in {"0", "none", "off", "false"}
+            else float(os.environ.get("LANGBURST_SESSION_TTL_S", "3600"))
+        )
+    )
 
     def __post_init__(self) -> None:
         if self.max_loaded_models < 1:
@@ -118,6 +148,10 @@ class EngineResourcePolicy:
             raise ValueError("kv_block_size must be >= 1")
         if self.kv_blocks < 1:
             raise ValueError("kv_blocks must be >= 1")
+        if self.max_sessions < 0:
+            raise ValueError("max_sessions must be >= 0")
+        if self.session_ttl_s is not None and self.session_ttl_s <= 0:
+            raise ValueError("session_ttl_s must be positive when set")
 
     def summary(self) -> dict[str, object]:
         return {
@@ -133,6 +167,9 @@ class EngineResourcePolicy:
             "prefill_chunk_size": self.prefill_chunk_size,
             "kv_block_size": self.kv_block_size,
             "kv_blocks": self.kv_blocks,
+            "runtime_overhead_mib": self.runtime_overhead_mib,
+            "max_sessions": self.max_sessions,
+            "session_ttl_s": self.session_ttl_s,
         }
 
 
@@ -169,17 +206,23 @@ class EngineManager:
         self.policy = policy or EngineResourcePolicy()
         self._engines: OrderedDict[str, RuntimeEngine] = OrderedDict()
         self._status = {name: ModelRuntimeStatus(model_name=name) for name in self.specs}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.admission = AdmissionController(
             max_active_requests=self.policy.max_active_requests,
             max_queued_requests=self.policy.max_queued_requests,
             admission_timeout_s=self.policy.admission_timeout_s,
         )
-        self.kv_block_table = KVBlockTable(
-            num_blocks=self.policy.kv_blocks,
-            block_size=self.policy.kv_block_size,
+        paged_kv_enabled = os.environ.get("LANGBURST_PAGED_KV", "1").strip().lower() not in {"0", "false", "off", "no"}
+        self.kv_block_table = (
+            KVBlockTable(
+                num_blocks=self.policy.kv_blocks,
+                block_size=self.policy.kv_block_size,
+            )
+            if paged_kv_enabled
+            else None
         )
         self.cuda_graph_planner = CudaGraphBucketPlanner()
+        self.sessions = SessionStateStore(max_sessions=self.policy.max_sessions, ttl_s=self.policy.session_ttl_s)
         self.batch_scheduler = ContinuousBatchScheduler(
             max_num_requests=self.policy.max_active_requests,
             max_num_batched_tokens=self.policy.max_num_batched_tokens,
@@ -235,6 +278,7 @@ class EngineManager:
             "batch_scheduler": self.batch_scheduler.stats().summary(),
             "batch_runners": self.batch_runner_summary(),
             "batch_workers": self.batch_worker_summary(),
+            "sessions": self.sessions.summary(),
             "resource": self.resource_summary(),
         }
 
@@ -249,8 +293,9 @@ class EngineManager:
             "batch_scheduler": self.batch_scheduler.stats().summary(),
             "batch_runners": self.batch_runner_summary(),
             "batch_workers": self.batch_worker_summary(),
+            "sessions": self.sessions.summary(),
             "resource": self.resource_summary(),
-            "kv_blocks": self.kv_block_table.summary(),
+            "kv_blocks": self.kv_block_table.summary() if self.kv_block_table is not None else None,
             "state_pools": {
                 name: engine.state_pool_summary()
                 for name, engine in self._engines.items()
@@ -293,6 +338,7 @@ class EngineManager:
                 evicted_name, evicted_engine = self._engines.popitem(last=False)
                 evicted_engine.clear_state_pool()
                 self._drop_batch_runners(evicted_name)
+                self.sessions.delete_model(evicted_name)
                 status = self._status[evicted_name]
                 status.state = "unloaded"
                 status.unload_count += 1
@@ -316,6 +362,14 @@ class EngineManager:
                     features=spec.runtime_features,
                     max_state_pool_size=self.policy.max_state_pool_size,
                 )
+            except torch.cuda.OutOfMemoryError as exc:
+                status.state = "failed"
+                status.last_error = str(exc)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                raise
             except Exception as exc:
                 status.state = "failed"
                 status.last_error = str(exc)
@@ -349,6 +403,7 @@ class EngineManager:
             engine = self._engines.pop(name)
             engine.clear_state_pool()
             self._drop_batch_runners(name)
+            self.sessions.delete_model(name)
             status = self._status[name]
             status.state = "unloaded"
             status.unload_count += 1
@@ -372,29 +427,42 @@ class EngineManager:
         engine = self.get(model_name)
         resolved = engine.resolve_plan(features).effective
         key = (engine.model_name, tuple(sorted(resolved.summary().items())))
-        runner = self._batch_runners.get(key)
-        if runner is None:
-            runner = BatchedModelRunner(
-                engine=engine,
-                scheduler=self.batch_scheduler,
-                features=resolved,
-                max_state_pool_size=self.policy.max_state_pool_size,
-            )
-            self._batch_runners[key] = runner
-        return runner
+        with self._lock:
+            runner = self._batch_runners.get(key)
+            if runner is None:
+                runner = BatchedModelRunner(
+                    engine=engine,
+                    scheduler=self.batch_scheduler,
+                    features=resolved,
+                    max_state_pool_size=self.policy.max_state_pool_size,
+                )
+                self._batch_runners[key] = runner
+            return runner
 
     def create_batch_worker(self, model_name: str | None = None, features: RuntimeFeatures | None = None) -> BatchGenerationWorker:
         engine = self.get(model_name)
         resolved = engine.resolve_plan(features).effective
         key = (engine.model_name, tuple(sorted(resolved.summary().items())))
-        worker = self._batch_workers.get(key)
-        if worker is None:
-            worker = BatchGenerationWorker(
-                runner=self.create_batch_runner(engine.model_name, resolved),
-                device=engine.device,
-            )
-            self._batch_workers[key] = worker
-        return worker
+        with self._lock:
+            worker = self._batch_workers.get(key)
+            if worker is None:
+                worker = BatchGenerationWorker(
+                    runner=self.create_batch_runner(engine.model_name, resolved),
+                    device=engine.device,
+                )
+                self._batch_workers[key] = worker
+            return worker
+
+    def create_session(self) -> str:
+        return self.sessions.new_session_id()
+
+    def get_session(self, *, session_id: str, model_name: str | None = None, features: RuntimeFeatures | None = None) -> SessionStateRecord:
+        engine = self.get(model_name)
+        resolved = engine.resolve_plan(features).effective
+        return self.sessions.get_or_create(session_id=session_id, engine=engine, features=resolved)
+
+    def delete_session(self, session_id: str, *, model_name: str | None = None) -> int:
+        return self.sessions.delete(session_id, model_name=model_name)
 
     def batch_runner_summary(self) -> dict[str, object]:
         return {
@@ -403,6 +471,8 @@ class EngineManager:
                 model_name: {
                     **runner.state_store.stats().summary(),
                     "arena": runner.state_store.arena_summary(),
+                    "reuse_pool": runner.state_store.reuse_pool_summary(),
+                    "prefix_cache": runner.prefix_cache_summary(),
                 }
                 for (model_name, _), runner in self._batch_runners.items()
             },
@@ -422,7 +492,7 @@ class EngineManager:
             self._batch_workers[key].shutdown()
             del self._batch_workers[key]
         for key in [key for key in self._batch_runners if key[0] == model_name]:
-            self._batch_runners[key].state_store.clear()
+            self._batch_runners[key].clear()
             del self._batch_runners[key]
 
     def validate_generation_request(self, *, prompt_tokens: int, generation_tokens: int) -> None:
@@ -440,6 +510,58 @@ class EngineManager:
                 f"max_generation_tokens={self.policy.max_generation_tokens}"
             )
 
+    def validate_runtime_memory(self, engine: RuntimeEngine) -> None:
+        if not str(engine.device).startswith("cuda") or not torch.cuda.is_available():
+            return
+        props = torch.cuda.get_device_properties(torch.device(engine.device))
+        total_mib = props.total_memory // (1024 * 1024)
+        free_bytes, _ = torch.cuda.mem_get_info()
+        free_mib = free_bytes // (1024 * 1024)
+        weight_mib = engine.estimated_weight_bytes() // (1024 * 1024)
+        estimate_arena = getattr(engine.adapter, "estimate_arena_state_bytes", None)
+        if callable(estimate_arena):
+            state_bytes = int(estimate_arena(
+                engine.cfg,
+                max_slots=min(self.policy.max_state_pool_size, self.policy.max_active_requests),
+                kv_num_blocks=self.policy.kv_blocks,
+                kv_block_size=self.policy.kv_block_size,
+                features=engine.features,
+            ))
+        else:
+            state_bytes = engine.estimated_state_bytes()
+        state_mib = state_bytes // (1024 * 1024)
+        loaded_weight = engine.model_name in self._engines
+        arena_allocated = any(key[0] == engine.model_name for key in self._batch_runners)
+        if arena_allocated:
+            required_mib = self.policy.reserve_free_vram_mib
+            if required_mib > free_mib:
+                raise RuntimeError(
+                    f"insufficient free GPU memory for active runtime: free={free_mib} MiB "
+                    f"required={required_mib} MiB reserve={self.policy.reserve_free_vram_mib} MiB. "
+                    "Wait for current requests or lower LANGBURST_CONTEXT_WINDOW."
+                )
+            return
+        if loaded_weight:
+            required_mib = state_mib + self.policy.runtime_overhead_mib + self.policy.reserve_free_vram_mib
+            if required_mib > free_mib:
+                raise RuntimeError(
+                    f"insufficient free GPU memory for runtime arena: free={free_mib} MiB "
+                    f"required={required_mib} MiB state={state_mib} MiB "
+                    f"overhead={self.policy.runtime_overhead_mib} MiB "
+                    f"reserve={self.policy.reserve_free_vram_mib} MiB. "
+                    "Lower LANGBURST_CONTEXT_WINDOW, reduce LANGBURST_MAX_ACTIVE_REQUESTS, or wait for current requests."
+                )
+            return
+        required_mib = weight_mib + state_mib + self.policy.runtime_overhead_mib + self.policy.reserve_free_vram_mib
+        if required_mib > total_mib:
+            raise RuntimeError(
+                f"configuration exceeds GPU memory budget: total={total_mib} MiB "
+                f"required={required_mib} MiB weights={weight_mib} MiB "
+                f"state={state_mib} MiB overhead={self.policy.runtime_overhead_mib} MiB "
+                f"reserve={self.policy.reserve_free_vram_mib} MiB. "
+                "Lower LANGBURST_CONTEXT_WINDOW or use a smaller checkpoint."
+            )
+
     def clear_runtime_pools(self, model_name: str | None = None) -> int:
         with self._lock:
             names = [model_name] if model_name else list(self._engines)
@@ -454,11 +576,29 @@ class EngineManager:
                 torch.cuda.empty_cache()
             return cleared
 
+    def recover_runtime_oom(self, model_name: str | None = None) -> bool:
+        name = model_name or self.default_model_name()
+        recovered = self.unload(name)
+        self.batch_scheduler.clear()
+        if self.kv_block_table is not None:
+            self.kv_block_table.clear()
+        self.sessions.delete_model(name)
+        status = self._status.get(name)
+        if status is not None:
+            status.state = "unloaded"
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        return recovered
+
     def mark_runtime_error(self, model_name: str, exc: BaseException) -> None:
         with self._lock:
             status = self._status.get(model_name)
             if status is not None:
                 status.last_error = str(exc)
+                if status.state != "loaded":
+                    status.state = "unloaded"
 
 
 def load_model_specs(path: Path, default_features: RuntimeFeatures) -> list[ModelResourceSpec]:

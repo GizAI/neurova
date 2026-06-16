@@ -1,8 +1,9 @@
 # LUMA: Ledgered Universal Memory Automaton
 
-Status: stopped archive. LUMA is not the active Neurova model line, not the
-default launcher target, and not eligible for `luma/runs/luma_current` promotion.
-Run it only for explicit archive/debug work with `NEUROVA_ALLOW_LUMA=1`.
+Status: stopped archive. LUMA (Ledgered Universal Memory Automaton) is not the
+active Neurova model line, not the default launcher target, and not eligible for
+`luma/runs/luma_current` promotion. Run it only for explicit archive/debug work
+with `NEUROVA_ALLOW_LUMA=1`.
 
 This folder is a runnable zero-base prototype of the LUMA idea: events are mixed
 locally, sparse persistent memory slots are read and edited, and every useful

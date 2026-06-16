@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from langburst.core.model_runner import BatchedModelRunner
+from langburst.correctness import run_batch_path_parity
+from langburst.core.features import RuntimeFeatures
 from langburst.core.runtime import RuntimeEngine
 from langburst.core.scheduler import ContinuousBatchScheduler
 
@@ -43,6 +45,30 @@ def test_batched_model_runner_prefill_then_decode_step(tmp_path: Path):
     assert decode.tokens_by_request() == {"a": [3], "b": [2]}
     assert a.token_ids[-1] == 3
     assert b.token_ids[-1] == 2
+
+
+def test_batch_path_parity_splits_target_speculative_and_prefix_axes(tmp_path: Path):
+    engine = RuntimeEngine(
+        adapter=ToyAdapter(),
+        hf_model=tmp_path,
+        qb_model=tmp_path,
+        device="cpu",
+        recent_window=16,
+        weight_device="cpu",
+        features=RuntimeFeatures.from_profile("stateful").with_overrides(prefill_chunk_size=2),
+    )
+
+    result = run_batch_path_parity(
+        engine,
+        engine.encode_prompt("abcdefghijklmnopq"),
+        features=engine.features,
+        max_new_tokens=2,
+    )
+
+    assert result.target_only_match
+    assert result.speculative_match
+    assert result.prefix_cache_match
+    assert result.prefix_cache_hit_tokens >= 2
 
 
 def test_batched_model_runner_releases_state_on_finish(tmp_path: Path):
@@ -145,6 +171,7 @@ def test_batched_model_runner_rejects_bad_draft(tmp_path: Path):
     assert step.sampled_counts == [1]
     assert step.rejected_counts == [1]
     assert row.token_ids[-1] == 3
+    assert runner.state_store.get(row.state_index).pos == 3
 
 
 def test_batched_model_runner_uses_state_store_indices(tmp_path: Path):

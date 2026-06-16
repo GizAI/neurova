@@ -13,15 +13,15 @@ plan instead of re-deciding adapter policy.
 
 ## Profiles
 
-| Profile | Intent | KV policy | Stateful chat | State pool | GPU sampling | Block prefill | Snapshots | Speculative / Graph |
+| Profile | Intent | KV policy | Stateful chat | State pool | GPU sampling | Block prefill | Prefix cache | Snapshots | Speculative / Graph |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `original` | Run closest to ordinary adapter decode. No stateful extras. | `error` | off | on | on | on | off | native MTP/NEXTN off, graph off |
-| `stateful` | Default runtime. Bounded exact KV plus recurrent state. | `ring` | on | on | on | on | off | native MTP/NEXTN on, graph off |
-| `research` | Production runtime profile with snapshots enabled for experiments. | `ring` | on | on | on | on | on | native MTP/NEXTN on, graph off |
+| `original` | Run closest to ordinary adapter decode. No stateful extras. | `error` | off | on | on | on | off | off | native MTP/NEXTN off, graph off |
+| `stateful` | Default runtime. Bounded exact KV plus recurrent state. | `ring` | on | on | on | on | on | off | native MTP/NEXTN on, graph off |
+| `research` | Production runtime profile with snapshots enabled for experiments. | `ring` | on | on | on | on | on | on | native MTP/NEXTN on, graph off |
 
-`state_pool`, `gpu_sampling`, public `block_prefill`, and native MTP/NEXTN with
-adaptive fallback are accepted runtime optimizations in the default stateful
-profile. Infinite streaming, episodic memory, and TTT sidecar are common
+`state_pool`, `gpu_sampling`, public `block_prefill`, automatic prefix cache,
+and native MTP/NEXTN with adaptive fallback are accepted runtime optimizations
+in the default stateful profile. Infinite streaming, episodic memory, and TTT sidecar are common
 runtime feature gates now; adapters decide support through `RuntimeCapabilities`
 and the actual implementations can still live under `langburst.research` until
 they graduate. Fast raw block internals remain explicit research toggles until
@@ -62,6 +62,8 @@ The Qwen3.6 adapter declares `RuntimeCapabilities.stateful_hybrid()`:
 - stateful chat supported
 - state pool, GPU greedy sampling, and block prefill supported
 - snapshots supported for research profile state persistence
+- automatic prefix cache supported through shared runner/cache/block-table
+  boundaries
 - infinite streaming, episodic memory, and TTT sidecar supported as adapter
   sidecar gates
 - native MTP1 speculative proposer supported through the shared verifier
@@ -106,10 +108,12 @@ Per-request override is supported by the OpenAI-compatible chat endpoint:
   "temperature": 0,
   "runtime_profile": "original",
   "kv_window_policy": "ring",
+  "kv_cache_dtype": "int4_bdr",
   "stateful_chat": true,
   "state_pool": true,
   "gpu_sampling": true,
   "block_prefill": true,
+  "prefix_cache": true,
   "infinite_streaming": false,
   "episodic_memory": false,
   "ttt_sidecar": false,
@@ -120,9 +124,22 @@ Per-request override is supported by the OpenAI-compatible chat endpoint:
 This changes only runtime state allocation and helper behavior for that request.
 It does not change weights or logits math.
 
-## TensorRT-Style Optimization Contract
+`kv_cache_dtype` is a storage/runtime option, not a model conversion option.
+Supported values are `fp16`, `fp8_e4m3`, `int4`, and `int4_bdr`. `int4` and
+`int4_bdr` use packed UINT4 K/V plus per-token/head scale+zero tensors.
+`int4_bdr` adds K-only block-diagonal Hadamard rotation following the
+SAW-INT4 serving-compatible path; V rotation remains disabled until a separate
+inverse-output transform and parity gate are accepted.
+Support is adapter-gated through `RuntimeCapabilities.kv_cache_dtypes`.
+`KVCacheSpec` defines the requested storage format and `KVCacheLayout` owns the
+model-agnostic tensor shapes, metadata allocation, and byte accounting. If a
+generic adapter such as an HF/Gemma wrapper cannot execute a requested KV dtype,
+`RuntimePlan` disables that request and falls back to the adapter's safe dtype
+before allocation.
 
-LangBurst exposes TensorRT/vLLM-style optimizations through one feature plan,
+## Production Runtime Optimization Contract
+
+LangBurst exposes accelerated runtime/continuous-serving optimizations through one feature plan,
 not scattered server flags:
 
 | Feature | Status | Runtime owner | Default |
@@ -136,17 +153,159 @@ not scattered server flags:
 | VRAM load admission reserve | accepted | `EngineManager` | host policy |
 | Prompt / generation token admission | accepted | `EngineManager` | host policy |
 | Health / OOM pool cleanup | accepted | `EngineManager` + server boundary | on |
+| Automatic prefix cache / Radix-style trie | accepted | `RadixPrefixCache` + `BatchedModelRunner` + `KVBlockTable` | on for stateful adapters |
+| OpenAI-style usage / cached-token accounting | accepted | `RequestUsage` + `BatchGenerationHandle.metrics` + server response builder | on |
+| OpenAI/HF-style generation options | accepted | `GenerationConfig` + `sample_next` + `BatchGenerationWorker` | on |
+| Explicit stateful sessions in continuous batching | accepted | `SessionStateStore` + `BatchGenerationWorker` external state attach | opt-in per request |
 | Native MTP/NEXTN speculative decoding | accepted with adaptive fallback | `RuntimeEngine.generate_decode_result` + `RuntimeEngine.verify_nextn_tokens` + `NativeNextNVerifier` | on |
 | Infinite streaming / episodic memory / TTT sidecar | adapter-gated | `RuntimePlan` + `langburst.research` implementations | off unless research profile/request enables |
 | EAGLE / Medusa proposer | gated | `SpeculativeProposer` | off |
 | CUDA Graph decode | gated | adapter capability | off |
-| Paged KV / continuous batching | partial | `ContinuousBatchScheduler` + `BatchedModelRunner` + state arena | on for greedy batch worker |
+| Paged KV / continuous batching | accepted | `ContinuousBatchScheduler` + `BatchedModelRunner` + `KVBlockTable` + state arena | on for greedy batch worker |
+| FP8 / INT4 / BDR KV storage | adapter-gated | `RuntimeCapabilities.kv_cache_dtypes` + `KVCacheSpec` + `KVCacheLayout` + paged attention kernels | fp16 unless requested |
 
 Accepted features may be enabled by default. Gated features must stay disabled
 until parity and state-safety tests prove they preserve the target model.
 Admission, OOM cleanup, model residency, and state-pool limits are host resource
 policy, not model-family logic; keep them centralized in `EngineManager` and
 `EngineResourcePolicy`.
+
+### Automatic Prefix Cache
+
+LangBurst's prefix cache is model-agnostic. `RadixPrefixCache` indexes token
+prefixes in a trie and stores adapter state snapshots plus optional immutable
+paged KV block IDs. `BatchedModelRunner` is the only execution owner: it looks
+up a reusable prefix before scheduling, skips already-computed prompt tokens,
+and stores new cache entries after prefill chunks complete.
+
+Paged KV sharing is refcounted in `KVBlockTable`. Cache entries pin only full
+block boundaries, so partial prompt blocks are never shared. A hit reuses
+physical KV blocks when available and copies only non-attention state; adapters
+without physical KV sharing fall back to cloned attention state snapshots.
+Full-prompt prefix hits still schedule the last uncached token because the cache
+does not store final logits. `prompt_cache_key` partitions the namespace for
+tenant/workload isolation and better routing. Cache hits are surfaced as
+`usage.prompt_tokens_details.cached_tokens`; they are accounting and latency
+signals, not semantic conversation memory.
+
+### API Usage Accounting
+
+`RequestUsage` is the single server-side accounting object. Non-streaming
+responses always include `usage`; streaming responses include it in the final
+chunk when `stream_options.include_usage=true`.
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 2048,
+    "completion_tokens": 128,
+    "total_tokens": 2176,
+    "prompt_tokens_details": {
+      "cached_tokens": 1024,
+      "uncached_tokens": 1024
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "accepted_prediction_tokens": 3,
+      "rejected_prediction_tokens": 1
+    },
+    "performance": {
+      "queue_wait_s": 0.001,
+      "ttft_s": 0.04,
+      "e2e_s": 1.2,
+      "decode_tok_s": 110.0
+    }
+  }
+}
+```
+
+`reasoning.effort`, `reasoning_effort`, `text.verbosity`, `verbosity`,
+`previous_response_id`, `user`, and `metadata` are accepted at the API boundary
+so clients can use standard request shapes. The current low-level runtime does
+not synthesize hidden reasoning tokens, so `reasoning_tokens` remains 0 unless
+an adapter explicitly reports them. Logprob fields fail fast until a model path
+can return exact scores.
+
+### Generation Options
+
+`GenerationConfig` is the single source of truth for request-level decoding
+behavior. The server normalizes OpenAI/HF/continuous-serving request fields into this
+object, the batch worker stores those values on the scheduled request row, and
+`sample_next` applies the actual constraints.
+
+Implemented end-to-end:
+
+```text
+temperature
+top_p
+top_k
+min_p
+seed
+max_tokens / max_completion_tokens / max_new_tokens
+min_tokens / min_new_tokens
+stop / stop_sequences
+stop_token_ids
+ignore_eos
+include_stop_str_in_output
+repetition_penalty
+presence_penalty
+frequency_penalty
+no_repeat_ngram_size
+logit_bias
+bad_words_ids
+suppress_tokens / begin_suppress_tokens
+```
+
+Not implemented yet, intentionally fail-fast or no-op compatibility only:
+
+```text
+beam_search / best_of / n > 1
+logprobs / top_logprobs / prompt_logprobs
+non-text structured response_format / grammar / regex constrained decoding
+tools / function_call / parallel_tool_calls
+true hidden reasoning token generation
+```
+
+### Explicit Stateful Sessions
+
+OpenAI-compatible `/v1/chat/completions` remains stateless by default: callers
+send the messages they want the model to consider, and LangBurst may reuse
+pooled state objects or prefix-cache blocks only as internal optimizations.
+Those optimizations must not create semantic memory between unrelated requests.
+
+Persistent model state is opt-in. A request enters the stateful path only when
+it provides `session_id` or sets `stateful_session=true`. The session store keeps
+the adapter DecodeState/KV/recurrent state under a per-session lock and keeps it
+until TTL, explicit delete, model unload, OOM recovery, or LRU capacity
+eviction.
+
+Session requests now use the same continuous-batching worker as stateless
+requests. At admission, the worker attaches the preserved DecodeState to the
+scheduled row instead of allocating a resettable pooled state. On finish it
+commits the final generated token, records prompt/completion counters, detaches
+the state, and releases the per-session lock. This keeps the execution path
+batchable/speculative-capable while preserving true low-level state continuity.
+
+```json
+{
+  "model": "langburst-...",
+  "messages": [{"role": "user", "content": "Continue from here."}],
+  "session_id": "sess-...",
+  "max_tokens": 128
+}
+```
+
+Session API:
+
+```text
+POST   /v1/langburst/sessions
+GET    /v1/langburst/sessions
+DELETE /v1/langburst/sessions/{session_id}
+```
+
+For session requests, `messages` should be the next delta turn, not the whole
+conversation transcript, unless the caller intentionally wants to re-ingest that
+transcript into the native state.
 
 ## Correctness Contract
 

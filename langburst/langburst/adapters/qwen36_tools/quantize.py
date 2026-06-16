@@ -100,6 +100,10 @@ def should_use_marlin(name: str, tensor: torch.Tensor, *, layout: str, hybrid_po
         return True
     if hybrid_policy == "q3q4_hot":
         hot_suffixes = (
+            "gate_proj.weight",
+            "up_proj.weight",
+            "gate_up_proj.weight",
+            "down_proj.weight",
             "q_proj.weight",
             "qkv_proj.weight",
             "k_proj.weight",

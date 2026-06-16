@@ -17,6 +17,7 @@ from ...tuning import (
     batch_prefill_steps_enabled,
     fast_raw_block_enabled,
     lowbit_rows_per_cta,
+    paged_attention_kernels_enabled,
     verify_nextn_mode,
 )
 
@@ -356,8 +357,8 @@ def attention_decode_any(
     scale: float,
 ) -> torch.Tensor:
     if q.device.type == "cuda" and length >= 1024:
-        k_live = k_cache[:, :length, :]
-        v_live = v_cache[:, :length, :]
+        k_live = k_cache[:, :length, :].to(dtype=torch.float16)
+        v_live = v_cache[:, :length, :].to(dtype=torch.float16)
         out = F.scaled_dot_product_attention(
             q.unsqueeze(0).unsqueeze(2).contiguous(),
             k_live.unsqueeze(0),
@@ -367,6 +368,10 @@ def attention_decode_any(
             enable_gqa=(q.size(0) != k_live.size(0)),
         )
         return out.squeeze(0).squeeze(1).contiguous()
+    if k_cache.dtype != torch.float16 or v_cache.dtype != torch.float16:
+        k_cache = k_cache[:, :length, :].to(dtype=torch.float16).contiguous()
+        v_cache = v_cache[:, :length, :].to(dtype=torch.float16).contiguous()
+        length = k_cache.size(1)
     return cuda_ops().attention_decode_fp16(q.contiguous(), k_cache, v_cache, length, scale)
 
 
@@ -388,18 +393,79 @@ def attention_decode_paged_batch(
         raise RuntimeError("paged KV block_size is not configured")
     if getattr(plan, "slot_mapping", None) is None or getattr(plan, "block_tables", None) is None:
         raise RuntimeError("paged attention requires slot_mapping and block_tables")
-    out = cuda_ops().attention_decode_paged_fp16(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        k_pages[layer],
-        v_pages[layer],
-        plan.slot_mapping.to(device=q.device, dtype=torch.long).contiguous(),
-        plan.block_tables.to(device=q.device, dtype=torch.int32).contiguous(),
-        plan.seq_lens.to(device=q.device, dtype=torch.int32).contiguous(),
-        block_size,
-        scale,
-    )
+    kv_spec = getattr(arena, "kv_cache_spec")
+    slot_mapping = plan.slot_mapping.to(device=q.device, dtype=torch.long).contiguous()
+    block_tables = plan.block_tables.to(device=q.device, dtype=torch.int32).contiguous()
+    seq_lens = plan.seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
+    if not paged_attention_kernels_enabled():
+        return attention_decode_paged_reference(
+            arena,
+            layer,
+            q,
+            k,
+            v,
+            slot_mapping,
+            block_tables,
+            seq_lens,
+            block_size,
+            scale,
+            getattr(plan, "state_indices", None),
+            getattr(plan, "positions", None),
+        )
+    if kv_spec.is_int4:
+        k_scales = getattr(arena, "paged_attn_k_scale", None)
+        v_scales = getattr(arena, "paged_attn_v_scale", None)
+        k_zeros = getattr(arena, "paged_attn_k_zero", None)
+        v_zeros = getattr(arena, "paged_attn_v_zero", None)
+        if k_scales is None or v_scales is None or k_zeros is None or v_zeros is None:
+            raise RuntimeError("INT4 paged attention requires paged scale/zero tensors")
+        out = cuda_ops().attention_decode_paged_int4(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            k_pages[layer],
+            v_pages[layer],
+            k_scales[layer],
+            v_scales[layer],
+            k_zeros[layer],
+            v_zeros[layer],
+            slot_mapping,
+            block_tables,
+            seq_lens,
+            block_size,
+            scale,
+            int(kv_spec.hadamard_order),
+            bool(kv_spec.uses_bdr),
+            bool(kv_spec.rotate_v),
+        )
+    elif kv_spec.is_fp8:
+        out = cuda_ops().attention_decode_paged_fp8_e4m3(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            k_pages[layer],
+            v_pages[layer],
+            slot_mapping,
+            block_tables,
+            seq_lens,
+            block_size,
+            scale,
+            float(kv_spec.k_scale),
+            float(kv_spec.v_scale),
+        )
+    else:
+        out = cuda_ops().attention_decode_paged_fp16(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            k_pages[layer],
+            v_pages[layer],
+            slot_mapping,
+            block_tables,
+            seq_lens,
+            block_size,
+            scale,
+        )
     # Keep the canonical arena KV view in sync with the paged hot path.  Paged
     # attention is the serving fast path, but snapshots, forks, fallback paths,
     # and parity checks still read DecodeState.attn_k/v.  A stale canonical view
@@ -408,13 +474,136 @@ def attention_decode_paged_batch(
     arena_v = getattr(arena, "attn_v", {}).get(layer)
     state_indices = getattr(plan, "state_indices", None)
     positions = getattr(plan, "positions", None)
-    if arena_k is not None and arena_v is not None and state_indices is not None and positions is not None:
+    if (
+        not kv_spec.is_int4
+        and arena_k is not None
+        and arena_v is not None
+        and state_indices is not None
+        and positions is not None
+    ):
         slots = state_indices.to(device=q.device, dtype=torch.long).contiguous()
         max_seq = int(arena_k.size(2))
-        write_indices = torch.remainder(positions.to(device=q.device, dtype=torch.long), max_seq).contiguous()
-        arena_k[slots, :, write_indices, :] = k.to(device=arena_k.device, dtype=arena_k.dtype)
-        arena_v[slots, :, write_indices, :] = v.to(device=arena_v.device, dtype=arena_v.dtype)
+        if max_seq > 0:
+            write_indices = torch.remainder(positions.to(device=q.device, dtype=torch.long), max_seq).contiguous()
+            arena_k[slots, :, write_indices, :] = k.to(device=arena_k.device, dtype=arena_k.dtype)
+            arena_v[slots, :, write_indices, :] = v.to(device=arena_v.device, dtype=arena_v.dtype)
     return out
+
+
+def attention_decode_paged_reference(
+    arena: object,
+    layer: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    scale: float,
+    state_indices: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Correct paged-KV attention path used as the parity baseline.
+
+    The CUDA paged-attention kernel is a hot path and must be gated by full
+    state-trajectory parity. This reference path still uses paged storage and
+    block tables, but performs the readback with explicit tensor indexing so
+    prefill/decode semantics match the canonical state path.
+    """
+
+    kv_spec = getattr(arena, "kv_cache_spec")
+    k_pages = getattr(arena, "paged_attn_k")[layer]
+    v_pages = getattr(arena, "paged_attn_v")[layer]
+    mirror_k = getattr(arena, "attn_k", {}).get(layer)
+    mirror_v = getattr(arena, "attn_v", {}).get(layer)
+    mirror_enabled = mirror_k is not None and mirror_v is not None and int(mirror_k.size(-2)) > 0
+    if state_indices is not None:
+        state_indices = state_indices.to(device=q.device, dtype=torch.long).contiguous()
+    if positions is not None:
+        positions = positions.to(device=q.device, dtype=torch.long).contiguous()
+    out_rows: list[torch.Tensor] = []
+    for row in range(q.size(0)):
+        slot = int(slot_mapping[row].detach().cpu().item())
+        block = slot // int(block_size)
+        offset = slot % int(block_size)
+        logical_pos = int(positions[row].detach().cpu().item()) if positions is not None else int(seq_lens[row].detach().cpu().item()) - 1
+        arena_slot = int(state_indices[row].detach().cpu().item()) if state_indices is not None else 0
+        if kv_spec.is_int4:
+            k_store = hadamard_transform(k[row], kv_spec.hadamard_order) if kv_spec.uses_bdr else k[row]
+            v_store = (
+                hadamard_transform(v[row], kv_spec.hadamard_order)
+                if kv_spec.uses_bdr and kv_spec.rotate_v
+                else v[row]
+            )
+            k_packed, k_scale, k_zero = pack_int4_rows(k_store)
+            v_packed, v_scale, v_zero = pack_int4_rows(v_store)
+            k_pages[block, :, offset, :].copy_(k_packed)
+            v_pages[block, :, offset, :].copy_(v_packed)
+            getattr(arena, "paged_attn_k_scale")[layer][block, :, offset].copy_(k_scale)
+            getattr(arena, "paged_attn_v_scale")[layer][block, :, offset].copy_(v_scale)
+            getattr(arena, "paged_attn_k_zero")[layer][block, :, offset].copy_(k_zero)
+            getattr(arena, "paged_attn_v_zero")[layer][block, :, offset].copy_(v_zero)
+        else:
+            k_pages[block, :, offset, :].copy_(k[row].to(device=k_pages.device, dtype=k_pages.dtype))
+            v_pages[block, :, offset, :].copy_(v[row].to(device=v_pages.device, dtype=v_pages.dtype))
+
+        live = int(seq_lens[row].detach().cpu().item())
+        if mirror_enabled and not kv_spec.is_int4:
+            max_seq = int(mirror_k.size(-2))
+            write_idx = logical_pos % max_seq if max_seq > 0 else 0
+            mirror_k[arena_slot, :, write_idx, :].copy_(k[row].to(device=mirror_k.device, dtype=mirror_k.dtype))
+            mirror_v[arena_slot, :, write_idx, :].copy_(v[row].to(device=mirror_v.device, dtype=mirror_v.dtype))
+            if live <= max_seq or logical_pos < max_seq:
+                k_cache = mirror_k[arena_slot, :, :live, :].contiguous()
+                v_cache = mirror_v[arena_slot, :, :live, :].contiguous()
+            else:
+                start = (logical_pos + 1) % max_seq
+                if start == 0:
+                    k_cache = mirror_k[arena_slot].contiguous()
+                    v_cache = mirror_v[arena_slot].contiguous()
+                else:
+                    k_cache = torch.cat([mirror_k[arena_slot, :, start:, :], mirror_k[arena_slot, :, :start, :]], dim=1).contiguous()
+                    v_cache = torch.cat([mirror_v[arena_slot, :, start:, :], mirror_v[arena_slot, :, :start, :]], dim=1).contiguous()
+                live = max_seq
+            out_rows.append(attention_decode_any(q[row].contiguous(), k_cache, v_cache, live, scale))
+            continue
+
+        k_rows: list[torch.Tensor] = []
+        v_rows: list[torch.Tensor] = []
+        k_scale_rows: list[torch.Tensor] = []
+        v_scale_rows: list[torch.Tensor] = []
+        k_zero_rows: list[torch.Tensor] = []
+        v_zero_rows: list[torch.Tensor] = []
+        row_blocks = block_tables[row]
+        for pos in range(live):
+            block_index, block_offset = divmod(pos, int(block_size))
+            block_id = int(row_blocks[block_index].detach().cpu().item())
+            k_rows.append(k_pages[block_id, :, block_offset, :])
+            v_rows.append(v_pages[block_id, :, block_offset, :])
+            if kv_spec.is_int4:
+                k_scale_rows.append(getattr(arena, "paged_attn_k_scale")[layer][block_id, :, block_offset])
+                v_scale_rows.append(getattr(arena, "paged_attn_v_scale")[layer][block_id, :, block_offset])
+                k_zero_rows.append(getattr(arena, "paged_attn_k_zero")[layer][block_id, :, block_offset])
+                v_zero_rows.append(getattr(arena, "paged_attn_v_zero")[layer][block_id, :, block_offset])
+        k_cache = torch.stack(k_rows, dim=1).contiguous()
+        v_cache = torch.stack(v_rows, dim=1).contiguous()
+        if kv_spec.is_int4:
+            k_scale = torch.stack(k_scale_rows, dim=1).contiguous()
+            v_scale = torch.stack(v_scale_rows, dim=1).contiguous()
+            k_zero = torch.stack(k_zero_rows, dim=1).contiguous()
+            v_zero = torch.stack(v_zero_rows, dim=1).contiguous()
+            k_cache = unpack_int4_rows(k_cache, k_scale, k_zero, head_dim=k[row].size(-1))
+            v_cache = unpack_int4_rows(v_cache, v_scale, v_zero, head_dim=v[row].size(-1))
+            if kv_spec.uses_bdr:
+                k_cache = hadamard_transform(k_cache, kv_spec.hadamard_order)
+                if kv_spec.rotate_v:
+                    v_cache = hadamard_transform(v_cache, kv_spec.hadamard_order)
+        elif k_cache.dtype != torch.float16 or v_cache.dtype != torch.float16:
+            k_cache = k_cache.to(dtype=torch.float16)
+            v_cache = v_cache.to(dtype=torch.float16)
+        out_rows.append(attention_decode_any(q[row].contiguous(), k_cache.contiguous(), v_cache.contiguous(), live, scale))
+    return torch.stack(out_rows, dim=0).contiguous()
 
 
 def sync_state_kv_to_paged(
@@ -436,6 +625,8 @@ def sync_state_kv_to_paged(
     paged_v = getattr(arena, "paged_attn_v", None)
     block_tables = getattr(plan, "block_tables", None)
     if paged_k is None or paged_v is None or block_tables is None:
+        return
+    if not state.attn_k or next(iter(state.attn_k.values())).size(1) == 0:
         return
     block_size = int(getattr(arena, "kv_block_size", 0))
     if block_size <= 0 or state.kv_len <= 0:
@@ -460,6 +651,28 @@ def sync_state_kv_to_paged(
         for layer in state.cfg.attention_layers:
             paged_k[layer][block_id, :, offset, :].copy_(state.attn_k[layer][:, src, :])
             paged_v[layer][block_id, :, offset, :].copy_(state.attn_v[layer][:, src, :])
+            if (
+                state.attn_k_scale is not None
+                and state.attn_v_scale is not None
+                and getattr(arena, "paged_attn_k_scale", None) is not None
+                and getattr(arena, "paged_attn_v_scale", None) is not None
+            ):
+                arena.paged_attn_k_scale[layer][block_id, :, offset].copy_(state.attn_k_scale[layer][:, src])
+                arena.paged_attn_v_scale[layer][block_id, :, offset].copy_(state.attn_v_scale[layer][:, src])
+            if (
+                state.attn_k_zero is not None
+                and state.attn_v_zero is not None
+                and getattr(arena, "paged_attn_k_zero", None) is not None
+                and getattr(arena, "paged_attn_v_zero", None) is not None
+            ):
+                arena.paged_attn_k_zero[layer][block_id, :, offset].copy_(state.attn_k_zero[layer][:, src])
+                arena.paged_attn_v_zero[layer][block_id, :, offset].copy_(state.attn_v_zero[layer][:, src])
+
+
+def has_canonical_attention_kv(state: DecodeState) -> bool:
+    if not state.attn_k:
+        return False
+    return next(iter(state.attn_k.values())).size(1) > 0
 
 
 def split_gdn_qkv(cfg: Qwen36_27B_TextConfig, mixed_qkv: torch.Tensor):
@@ -1164,6 +1377,7 @@ class Qwen36Model:
             if hidden_tap_layers is not None:
                 return logits, [], hidden_taps
             return logits, []
+        state.last_raw_hidden = raw_hidden.contiguous().clone()
         if hidden_tap_layers is not None:
             return logits, hidden_taps
         return logits
@@ -1239,7 +1453,7 @@ class Qwen36Model:
     ) -> list[torch.Tensor | None]:
         """Execute a multi-request decode batch plan.
 
-        The public contract mirrors vLLM's model runner: request scheduling is
+        The public contract mirrors the reference runtime's model runner: request scheduling is
         represented by one batch plan, while each row owns independent state.
         Rows use the block path so chunked prefill and spec-verify spans avoid
         token-by-token Python loops inside RuntimeEngine.
@@ -1254,9 +1468,9 @@ class Qwen36Model:
         if (
             return_logits
             and row_spans is not None
-            and all(not bool(v) for v in prefill_flags)
             and all((end - start) == 1 for start, end in row_spans)
             and all(int(v) == 0 for v in draft_counts)
+            and all(not bool(v) for v in prefill_flags)
         ):
             return self._forward_single_token_batch(getattr(plan, "input_ids"), row_spans, states, plan=plan)
         if (
@@ -1265,8 +1479,6 @@ class Qwen36Model:
             and all(bool(v) for v in prefill_flags)
             and all(int(v) == 0 for v in draft_counts)
             and any((end - start) > 1 for start, end in row_spans)
-            and getattr(plan, "block_tables", None) is None
-            and getattr(plan, "slot_mapping", None) is None
         ):
             return self._forward_prefill_timestep_batch(
                 getattr(plan, "input_ids"),
@@ -1320,9 +1532,9 @@ class Qwen36Model:
         prefill_flags = getattr(plan, "is_prefill", [False] * num_requests)
         if (
             row_spans is not None
-            and all(not bool(v) for v in prefill_flags)
             and all((end - start) == 1 for start, end in row_spans)
             and all(int(v) == 0 for v in draft_counts)
+            and all(not bool(v) for v in prefill_flags)
         ):
             return [[logit] for logit in self._forward_single_token_batch(getattr(plan, "input_ids"), row_spans, states, plan=plan)]
         if (
@@ -1331,8 +1543,6 @@ class Qwen36Model:
             and all(bool(v) for v in prefill_flags)
             and all(int(v) == 0 for v in draft_counts)
             and any((end - start) > 1 for start, end in row_spans)
-            and getattr(plan, "block_tables", None) is None
-            and getattr(plan, "slot_mapping", None) is None
         ):
             outputs = self._forward_prefill_timestep_batch(
                 getattr(plan, "input_ids"),
@@ -1397,6 +1607,8 @@ class Qwen36Model:
             x = forward_decode_batch(x, states, plan)
         for state in states:
             state.finish_token()
+        for state, row_hidden in zip(states, x, strict=True):
+            state.last_raw_hidden = row_hidden.contiguous().clone()
         h = qwen_rmsnorm(x.contiguous(), self.final_norm, self.cfg.rms_norm_eps)
         logits = linear_any(self.lm_head, h)
         return [row.contiguous() for row in logits]
@@ -1436,11 +1648,12 @@ class Qwen36Model:
             x = embed_lookup_batch(self.embed, step_tokens, self.device)
             active_states = [states[row] for row in active_rows]
             subplan = self._verify_subplan(plan, states, active_rows, step)
-            # Existing serving correctness computes prefill against canonical
-            # per-state KV, then publishes the completed chunk to paged KV.
-            # The paged decode kernel is a hot decode path; using it while
-            # prefill is still building the prompt state changes continuation.
-            subplan = replace(subplan, block_tables=None, slot_mapping=None)
+            if all(has_canonical_attention_kv(state) for state in active_states):
+                # Non-paged states build canonical KV during prefill and publish
+                # it once the chunk is complete. Paged-only arena states have
+                # zero-length canonical KV by design, so they must stay on the
+                # paged hot path instead of falling through to append_attention_kv.
+                subplan = replace(subplan, block_tables=None, slot_mapping=None)
             for layer in self.layers:
                 forward_decode_batch = getattr(layer, "forward_decode_batch", None)
                 if not callable(forward_decode_batch):
@@ -1448,6 +1661,8 @@ class Qwen36Model:
                 x = forward_decode_batch(x, active_states, subplan)
             for row in active_rows:
                 states[row].finish_token()
+            for local_row, global_row in enumerate(active_rows):
+                states[global_row].last_raw_hidden = x[local_row].contiguous().clone()
 
             if not return_logits:
                 continue
@@ -1533,7 +1748,7 @@ class Qwen36Model:
 
         The verifier needs argmax IDs for candidate positions and full logits
         only for the continuation after the final accepted token. Keeping every
-        248K-vocab row as a Python list is substantially slower than vLLM-style
+        248K-vocab row as a Python list is substantially slower than continuous-serving
         rejection metadata, so this path stores scalar target IDs for checks.
         """
         token_list = [int(t) for t in tokens]
@@ -1619,7 +1834,7 @@ class Qwen36Model:
         plan: object,
         states: Sequence[DecodeState],
     ) -> list[VerifyBlockResult]:
-        """Verify speculative rows through the shared vLLM-style batch plan.
+        """Verify speculative rows through the shared continuous-serving batch plan.
 
         Rows are advanced by timestep, batching all active requests through the
         regular decode-batch layer path.  That gives the verifier the same state
@@ -1667,6 +1882,7 @@ class Qwen36Model:
                 x = forward_decode_batch(x, active_states, subplan)
             for local_row, global_row in enumerate(active_rows):
                 states[global_row].finish_token()
+                states[global_row].last_raw_hidden = x[local_row].contiguous().clone()
                 h = qwen_rmsnorm(x[local_row].contiguous(), self.final_norm, self.cfg.rms_norm_eps)
                 logits = linear_any(self.lm_head, h).contiguous()
                 if step < int(draft_counts[global_row]):

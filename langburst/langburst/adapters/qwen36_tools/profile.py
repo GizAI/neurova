@@ -10,9 +10,14 @@ from typing import Callable, Iterator
 import torch
 import torch.nn.functional as F
 
-from ...cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, runtime_features_from_args
-from ...core.adapter import adapter_registry
-from ...core.runtime import GenerationConfig, RuntimeEngine, sample_next_tensor
+from ...cli_features import (
+    add_adapter_arg,
+    add_model_path_args,
+    add_runtime_feature_args,
+    create_runtime_engine_from_args,
+    runtime_features_from_args,
+)
+from ...core.runtime import GenerationConfig, sample_next_tensor
 from ...loader import LowBitMarlinTensor, LowBitTensor
 from ...ops import cuda_ops
 from langburst.adapters.qwen36_impl import model as model_mod
@@ -190,17 +195,9 @@ def main() -> None:
         parser.error("langburst-qwen-profile currently supports only qwen36 adapters")
     features = runtime_features_from_args(args)
 
-    engine = RuntimeEngine(
-        adapter=adapter_registry.get(args.adapter),
-        hf_model=args.hf_model,
-        qb_model=args.qb_model,
-        device=args.device,
-        recent_window=args.recent_window,
-        weight_device=args.weight_device,
-        features=features,
-    )
+    engine = create_runtime_engine_from_args(args, features=features)
     prompt_ids = engine.encode_prompt(args.prompt)
-    cfg = GenerationConfig(max_new_tokens=args.max_new_tokens, temperature=0.0, top_k=0, eos_token_ids=())
+    cfg = GenerationConfig.greedy(max_new_tokens=args.max_new_tokens)
     state = engine.new_state()
     prefill_logits: torch.Tensor | None = None
     prefill_next: torch.Tensor | None = None

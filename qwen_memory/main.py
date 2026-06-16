@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neurova V6 — Pure embedding memory. Zero hardcoded language rules.
+"""Qwen Memory — Qwen-backed embedding memory. Zero hardcoded language rules.
 
 인지 prior만 제공:
   - Entity embedding (embed_tokens + USearch)
@@ -26,19 +26,23 @@ from transformers import (
     BitsAndBytesConfig
 )
 
-MODE = os.environ.get("V6_MODE", "bf16")
-EFFORT = os.environ.get("V6_EFFORT", "low").lower()
-MAX_CTX = int(os.environ.get("V6_CTX", "16384"))
-MAX_NEW = int(os.environ.get("V6_MAX", "4096"))
-SEARCH_K = int(os.environ.get("V6_K", "7"))
-HIST_CUT = int(os.environ.get("V6_HIST", "4"))
-AUTO_MEM = os.environ.get("V6_AUTO", "1") == "1"
+def env_value(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+MODE = env_value("QWEN_MEMORY_MODE", "bf16")
+EFFORT = env_value("QWEN_MEMORY_EFFORT", "low").lower()
+MAX_CTX = int(env_value("QWEN_MEMORY_CTX", "16384"))
+MAX_NEW = int(env_value("QWEN_MEMORY_MAX", "4096"))
+SEARCH_K = int(env_value("QWEN_MEMORY_K", "7"))
+HIST_CUT = int(env_value("QWEN_MEMORY_HIST", "4"))
+AUTO_MEM = env_value("QWEN_MEMORY_AUTO", "1") == "1"
 H = 2560
 
-BASE_DIR = Path(os.path.expanduser("~/.neurova_v6"))
+BASE_DIR = Path(os.path.expanduser(env_value("QWEN_MEMORY_HOME", "~/.qwen_memory")))
 BASE_DIR.mkdir(exist_ok=True)
-V6_USER = os.environ.get("V6_USER", "default")
-MEM_DIR = BASE_DIR / "users" / V6_USER
+CURRENT_USER = env_value("QWEN_MEMORY_USER", "default")
+MEM_DIR = BASE_DIR / "users" / CURRENT_USER
 MEM_DIR.mkdir(parents=True, exist_ok=True)
 MEM_PATH = str(MEM_DIR / "memory")
 HIST_PATH = str(MEM_DIR / "history")
@@ -163,7 +167,7 @@ class Engine:
         self.model = None; self.tokenizer = None; self.mem = None
         self.loaded = False; self.history: List[Dict] = []
         self.n_gen = 0; self.effort = EFFORT; self.auto_mem = AUTO_MEM
-        self.current_user = V6_USER
+        self.current_user = CURRENT_USER
 
     @property
     def dev(self): return next(self.model.parameters()).device if self.model else 'cpu'
@@ -187,7 +191,7 @@ class Engine:
     def load(self):
         if self.loaded: return
         t0 = time.time()
-        print(f'[V6] {MODE} effort={self.effort} user={self.current_user}', flush=True)
+        print(f'[QwenMemory] {MODE} effort={self.effort} user={self.current_user}', flush=True)
         kw = {'trust_remote_code': True, 'attn_implementation': 'sdpa', 'device_map': 'auto'}
         if MODE == '4bit':
             kw['quantization_config'] = BitsAndBytesConfig(
@@ -290,7 +294,7 @@ class Engine:
     def status(self) -> str:
         if not self.loaded: return '[!]'
         v = torch.cuda.memory_allocated() / 1024**3
-        return (f'V6 user={self.current_user} effort={self.effort}\n'
+        return (f'QwenMemory user={self.current_user} effort={self.effort}\n'
                 f'Mem: {self.mem.stats()} | Replies: {self.n_gen}\n'
                 f'VRAM: {v:.1f}GB ctx={MAX_CTX} max={MAX_NEW}')
 

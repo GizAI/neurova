@@ -136,7 +136,7 @@ class QwenNativeMTP1:
     ) -> torch.Tensor:
         """Generate NEXTN-style draft tokens with the native Qwen MTP layer.
 
-        vLLM feeds the sampled first token and current target hidden into the
+        external serving engine feeds the sampled first token and current target hidden into the
         Qwen3Next MTP module, then repeatedly feeds each draft token with the
         previous MTP hidden. Qwen3.6-27B ships one MTP layer, so the same layer is
         reused for each speculative step.

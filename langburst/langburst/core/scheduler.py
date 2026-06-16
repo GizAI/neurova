@@ -38,7 +38,7 @@ class AdmissionController:
     """Minimal request admission layer.
 
     This is not continuous batching yet.  It is the serving boundary that lets
-    LangBurst evolve toward vLLM-style scheduling without scattering semaphores
+    LangBurst evolve toward continuous-serving scheduling without scattering semaphores
     through server handlers.
     """
 
@@ -150,7 +150,7 @@ class ContinuousBatchSchedulerStats:
 
 
 class ContinuousBatchScheduler:
-    """vLLM-style request scheduler boundary.
+    """continuous-serving request scheduler boundary.
 
     It owns request rows and produces `DecodeBatchPlan` objects.  Model adapters
     own the actual DecodeState tensors; this scheduler only decides which token
@@ -212,7 +212,6 @@ class ContinuousBatchScheduler:
             if self.block_table is not None:
                 self.block_table.release(request_id)
             self._total_finished += 1
-            self._admit_waiting()
         return row
 
     def get_request(self, request_id: str) -> DecodeRequestState | None:
@@ -226,7 +225,7 @@ class ContinuousBatchScheduler:
         scheduled_tokens: list[int] = []
         token_budget = self.max_num_batched_tokens
 
-        # Decode first, then prefill. This mirrors vLLM's scheduling shape and
+        # Decode first, then prefill. This mirrors the reference runtime's scheduling shape and
         # prevents long prefill chunks from starving active decoders.
         active_rows = list(self._active.values())
         for row in [r for r in active_rows if not r.is_prefilling]:
@@ -237,6 +236,14 @@ class ContinuousBatchScheduler:
                 selected.append(row)
                 scheduled_tokens.append(n)
                 token_budget -= n
+        # Stateful hybrid adapters cannot safely mix decode rows and multi-token
+        # prefill rows in one target-model call until every layer consumes a
+        # unified paged/block plan. Keep the external serving engine decode-priority rule strict:
+        # decode ticks batch decode rows only, then prefill resumes on the next
+        # tick. This avoids falling through to per-row legacy KV writes for
+        # paged-KV arena states.
+        if selected:
+            token_budget = 0
         for row in [r for r in active_rows if r.is_prefilling]:
             n = min(row.prefill_remaining, self.prefill_chunk_size, token_budget)
             if n <= 0:
@@ -261,7 +268,7 @@ class ContinuousBatchScheduler:
                 )
                 graph_bucket = (bucket.batch_size, bucket.query_len, bucket.speculative_tokens)
             except ValueError:
-                # vLLM falls back to eager for shapes outside captured buckets.
+                # external serving engine falls back to eager for shapes outside captured buckets.
                 # LangBurst graph capture is still optional; scheduling must not
                 # reject valid prefill/decode work because no graph bucket fits.
                 graph_bucket = None
@@ -308,6 +315,13 @@ class ContinuousBatchScheduler:
             total_scheduled_batches=self._total_scheduled_batches,
             total_scheduled_tokens=self._total_scheduled_tokens,
         )
+
+    def clear(self) -> None:
+        self._waiting.clear()
+        self._active.clear()
+        self._buffers = None
+        if self.block_table is not None:
+            self.block_table.clear()
 
     def _admit_waiting(self) -> None:
         while self._waiting and len(self._active) < self.max_num_requests:

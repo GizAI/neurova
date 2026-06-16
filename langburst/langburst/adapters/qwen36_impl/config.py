@@ -42,7 +42,7 @@ class Qwen36_27B_TextConfig:
     # Default engine choices for 16GB Ada.
     group_size: int = 128
     weight_mode: Literal["q4", "q3q4-hybrid"] = "q4"
-    kv_cache_mode: Literal["fp16", "q8", "q4"] = "fp16"
+    kv_cache_mode: Literal["fp16", "fp8_e4m3", "int4", "int4_bdr"] = "fp16"
     mtp_max_steps: int = 4
 
     @classmethod

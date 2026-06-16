@@ -25,7 +25,7 @@ one-token decoding.
 langburst.adapters.qwen36_mtp.QwenNativeMTP1
   loads mtp.* checkpoint tensors
   predicts draft tokens from raw target hidden + first greedy token
-  can run a vLLM-style NEXTN loop by feeding each accepted draft token and the
+  can run a continuous-serving NEXTN loop by feeding each accepted draft token and the
   previous MTP hidden back through the checkpoint's single native MTP layer
 
 langburst.adapters.qwen36_mtp.QwenNativeMTP1Proposer
@@ -43,7 +43,7 @@ RuntimeEngine.generate_native_nextn_result
   prefill returns logits + raw_hidden
   samples first token from target logits
   asks Native MTP/NEXTN for one or more candidates using the current target raw
-  hidden and the first token id, matching vLLM's Qwen3NextMTP shift
+  hidden and the first token id, matching the reference runtime's Qwen3NextMTP shift
   preserves target logits before running MTP because Marlin lm_head buffers are
   reused
   routes target verification through RuntimeEngine.verify_nextn_tokens
@@ -115,7 +115,7 @@ sync and accept-path fork/copy:
             by identity and measured speed-positive suites.
 ```
 
-Latest vLLM-style NEXTN recheck:
+Latest continuous-serving NEXTN recheck:
 
 ```text
 2026-06-16, 128-token suite, recent_window=2048:
@@ -141,7 +141,7 @@ Latest decode-only auto-adopt sweep:
 This is not yet a large speculative win.  More draft tokens alone do not help
 while the target verifier still advances the target model token by token.  The
 next speed work must reduce verifier and proposer overhead without changing the
-vLLM-compatible contract:
+batch-runtime-compatible contract:
 
 1. exact state-trajectory parity audit for the fused verify path on the real model
 2. lower-overhead MTP lm_head candidate selection

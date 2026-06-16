@@ -1,6 +1,6 @@
 # LangBurst Performance Log
 
-## 2026-06-16 vLLM MTP Comparison and Verifier Contract
+## 2026-06-16 external serving engine MTP Comparison and Verifier Contract
 
 Current accepted conclusion:
 
@@ -22,10 +22,10 @@ EAGLE / Medusa:
   speed win on a prompt suite.
 ```
 
-Follow-up vLLM gap check:
+Follow-up external serving engine gap check:
 
 ```text
-vLLM Qwen3NextMTP pattern:
+external serving engine Qwen3NextMTP pattern:
   - MTP layer is a real full_attention decoder layer.
   - Draft prefill/decode keeps draft hidden state and slot mappings.
   - Multi-step speed comes from target block verification, not from MTP1 alone.
@@ -40,7 +40,7 @@ LangBurst measured limit:
 Fast raw verifier experiment with LANGBURST_FAST_RAW_BLOCK=1:
   sky 128:       target 41.16 tok/s, rawspec 44.88 tok/s, speedup 1.09, identical true
   technical 128: target 41.38 tok/s, rawspec 40.41 tok/s, speedup 0.98, identical true
-  interpretation: this is the right direction for vLLM-like speed, but it is
+  interpretation: this is the right direction for production-like speed, but it is
   prompt-dependent and still lacks full state trajectory parity.
 
 Kernel/primitive checks:
@@ -52,7 +52,7 @@ Kernel/primitive checks:
     target decode.
 ```
 
-vLLM comparison pass:
+external serving engine comparison pass:
 
 ```text
 source checked: /tmp/vllm-qwen-mtp, latest main fast-forwarded on 2026-06-16
@@ -89,12 +89,12 @@ Latest dmc8 128-token suite after kept fixes:
   adaptive fallback.
 ```
 
-Native NEXTN follow-up after matching vLLM's recurrent MTP proposer loop:
+Native NEXTN follow-up after matching the reference runtime's recurrent MTP proposer loop:
 
 ```text
 implementation:
   - QwenNativeMTP1.argmax_sequence now reuses the checkpoint's single MTP layer
-    for multiple draft steps, matching vLLM's Qwen3NextMTP decode pattern.
+    for multiple draft steps, matching the reference runtime's Qwen3NextMTP decode pattern.
   - RuntimeEngine and langburst.research.qwen_nextn_bench now share the same max_draft
     candidate loop.
   - n-gram/prompt lookup remains absent from the runtime path.
@@ -119,7 +119,7 @@ decision:
   should become a recommended serving policy.
 
 next real speed boundary:
-  vLLM's proposer loop is not enough. The missing piece is a state-safe target
+  the reference runtime's proposer loop is not enough. The missing piece is a state-safe target
   block verifier with commit-able per-token GDN/conv/KV trajectory, so accepted
   speculative tokens reduce target work instead of only adding MTP proposal
   overhead.
@@ -1184,7 +1184,7 @@ silu_mul is a small positive cleanup, not a main 100 tok/s lever.
 The projection wall remains unchanged: mlp_gate_up + mlp_down + gdn_qkvz + gdn_out.
 ```
 
-Historical Native MTP1 adaptive recheck before the vLLM-shift, Marlin aliasing,
+Historical Native MTP1 adaptive recheck before the external serving engine-shift, Marlin aliasing,
 state-copy, and GDN block-scan fixes:
 
 ```text
@@ -1452,10 +1452,10 @@ batch model path.
 
 ## 2026-06-16 Serving Metrics and Multi-User Throughput Split
 
-vLLM comparison point:
+external serving engine comparison point:
 
 ```text
-vLLM tracks request scheduled_ts, first_token_ts, last_token_ts, TTFT, ITL,
+external serving engine tracks request scheduled_ts, first_token_ts, last_token_ts, TTFT, ITL,
 scheduled token counts, and prefill/decode work separately. LangBurst numbers
 were previously mixed between:
   - direct decode-only target path

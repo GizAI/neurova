@@ -53,7 +53,7 @@ Do not promote ordinary attention-hybrid layers into the fast serving trunk.
   - `state-roundtrip` passed restored-cache/full-forward argmax parity.
   - prefix 512: first-token parity passed, but warm full prefill was about 0.053s and compiled question replay about 0.24s.
   - prefix 4096: first-token parity passed, but warm full prefill was about 0.044s and compiled question replay about 0.21s.
-  - Direct `./neurova.sh` chat path stayed fast at about 236-242 tok/s on basic QA.
+  - Direct `./neurova.sh mamba3` chat path stayed fast at about 236-242 tok/s on basic QA.
   - Verdict unchanged: state compile is useful for persisted recurrent state, not yet for lower latency.
 - Batched CUDA graph recurrent decode reaches thousands tok/s aggregate on RTX 4080:
   - batch 16: about 2.6K tok/s,

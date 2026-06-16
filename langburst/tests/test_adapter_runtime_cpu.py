@@ -9,8 +9,11 @@ import torch
 import langburst.adapters  # noqa: F401 - registers built-in adapters
 from langburst.core.adapter import AdapterDescriptor, adapter_registry
 from langburst.core.conformance import assert_minimal_adapter_conformance
-from langburst.core.features import RuntimeFeatures
+from langburst.core.features import RuntimeCapabilities, RuntimeFeatures
+from langburst.core.block_table import KVBlockTable
+from langburst.core.model_runner import BatchedModelRunner
 from langburst.core.runtime import GenerationConfig, RuntimeEngine
+from langburst.core.scheduler import ContinuousBatchScheduler
 from langburst.adapters.hf_causal import HFCausalState
 from langburst.adapters.qwen36_impl.model import Qwen36Model
 from langburst.speculative_batch import DecodeRequestState, build_decode_batch_plan
@@ -23,6 +26,22 @@ class ToyState:
 
     def reset(self, *, reset_attention: bool = True) -> None:
         self.pos = 0
+
+    def fork(self, *, clone_attention: bool = True) -> "ToyState":
+        return replace(self)
+
+    def copy_from_(self, other: "ToyState", *, copy_attention: bool = True) -> None:
+        self.pos = int(other.pos)
+        self.profile = other.profile
+
+    def speculative_write_snapshot(self, num_tokens: int):
+        pos = self.pos
+
+        class Snapshot:
+            def restore_(self, state: "ToyState") -> None:
+                state.pos = pos
+
+        return Snapshot()
 
 
 class ToyTokenizer:
@@ -68,6 +87,7 @@ class ToyAdapter:
         adapter_id="toy",
         family="toy-decoder",
         default_model_name="toy-model",
+        capabilities=RuntimeCapabilities.transformer_decoder(max_concurrency=2),
         supports_state=True,
     )
 
@@ -435,6 +455,45 @@ def test_runtime_engine_forward_batch_prefers_native_model_batch(tmp_path: Path)
     assert len(logits) == 2
     assert torch.equal(logits[0], torch.full((8,), 1000.0))
     assert torch.equal(logits[1], torch.full((8,), 1001.0))
+
+
+def test_batched_runner_reuses_prefix_cache_blocks_and_state(tmp_path: Path):
+    engine = RuntimeEngine(
+        adapter=ToyAdapter(),
+        hf_model=tmp_path,
+        qb_model=tmp_path,
+        device="cpu",
+        recent_window=16,
+        weight_device="cpu",
+        features=RuntimeFeatures.from_profile("stateful").with_overrides(prefix_cache=True),
+    )
+    blocks = KVBlockTable(num_blocks=8, block_size=2)
+    scheduler = ContinuousBatchScheduler(
+        max_num_requests=2,
+        max_num_batched_tokens=2,
+        prefill_chunk_size=2,
+        block_table=blocks,
+    )
+    runner = BatchedModelRunner(engine=engine, scheduler=scheduler, features=engine.features)
+
+    first = runner.add_request("first", [1, 2, 3])
+    out = runner.execute_step(device="cpu")
+    assert out is not None
+    assert first.computed_tokens == 2
+    assert runner.prefix_cache_summary()["entries"] == 1
+    first_blocks = tuple(blocks.get("first").block_ids[:1])
+    runner.finish_request("first")
+    assert blocks.summary()["used_blocks"] == 1
+
+    second = runner.add_request("second", [1, 2, 4])
+    assert second.prefix_cache_hit_tokens == 2
+    assert second.computed_tokens == 2
+    assert tuple(blocks.get("second").block_ids[:1]) == first_blocks
+    out = runner.execute_step(device="cpu")
+    assert out is not None
+    assert second.computed_tokens == 3
+    assert int(runner.state_store.get(second.state_index).pos) == 3
+    assert runner.prefix_cache_summary()["hits"] == 1
 
 
 def test_runtime_engine_verify_nextn_prefers_native_batch_verifier(tmp_path: Path):

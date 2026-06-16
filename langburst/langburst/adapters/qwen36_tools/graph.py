@@ -95,7 +95,7 @@ def inspect_decode1_graph_safety(
     state: Any,
     gen_cfg: GenerationConfig | None = None,
 ) -> GraphSafetyReport:
-    gen_cfg = gen_cfg or GenerationConfig(max_new_tokens=1, temperature=0.0, top_k=0)
+    gen_cfg = gen_cfg or GenerationConfig.greedy(max_new_tokens=1)
     notes: list[str] = []
 
     greedy_argmax_device_safe = gen_cfg.temperature <= 0 and gen_cfg.top_k == 0
@@ -156,7 +156,7 @@ def verify_graph_safe_argmax() -> bool:
     if not torch.cuda.is_available():
         return True
     logits = torch.tensor([0.1, 2.0, 1.0], device="cuda", dtype=torch.float16)
-    token = sample_next_tensor(logits, GenerationConfig(max_new_tokens=1, temperature=0.0, top_k=0))
+    token = sample_next_tensor(logits, GenerationConfig.greedy(max_new_tokens=1))
     return torch.is_tensor(token) and token.device.type == "cuda" and int(token.detach().cpu()) == 1
 
 

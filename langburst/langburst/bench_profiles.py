@@ -6,8 +6,13 @@ from dataclasses import dataclass
 
 import torch
 
-from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, runtime_feature_override_from_args
-from .core.adapter import adapter_registry
+from .cli_features import (
+    add_adapter_arg,
+    add_model_path_args,
+    add_runtime_feature_args,
+    create_runtime_engine_from_args,
+    runtime_feature_override_from_args,
+)
 from .core.features import RuntimeFeatureOverride, RuntimeFeatures, RuntimeProfile
 from .core.runtime import GenerationConfig, RuntimeEngine
 
@@ -67,17 +72,9 @@ def main() -> None:
     args = parser.parse_args()
     override = runtime_feature_override_from_args(args)
 
-    engine = RuntimeEngine(
-        adapter=adapter_registry.get(args.adapter),
-        hf_model=args.hf_model,
-        qb_model=args.qb_model,
-        device=args.device,
-        recent_window=args.recent_window,
-        weight_device=args.weight_device,
-        features=RuntimeFeatures.from_profile("stateful"),
-    )
+    engine = create_runtime_engine_from_args(args, features=RuntimeFeatures.from_profile("stateful"))
     prompt_ids = engine.encode_prompt(args.prompt)
-    cfg = GenerationConfig(max_new_tokens=args.max_new_tokens, temperature=0.0, top_k=0, eos_token_ids=())
+    cfg = GenerationConfig.greedy(max_new_tokens=args.max_new_tokens)
     summary_keys = tuple(RuntimeFeatures().summary().keys())
     print("profile,generated,elapsed_s,tok_s,disabled," + ",".join(summary_keys))
     for raw in args.profiles.split(","):

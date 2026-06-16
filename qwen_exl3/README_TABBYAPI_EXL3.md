@@ -30,7 +30,7 @@
 
 5. **Codex/CLI Proxy에서 응답이 비어 보이는 이슈**
    - **증상**: `/v1/chat/completions`는 200을 반환하지만 `content`가 `null`이고 `reasoning_content`만 흘러 Codex CLI에서 응답이 없는 것처럼 보임.
-   - **해결**: 모델의 `chat_template.jinja`와 `tokenizer_config.json`에서 `enable_thinking` 기본값을 no-think로 패치함. 명시적으로 `chat_template_kwargs: {"enable_thinking": true}`를 보낼 때만 thinking을 켬. 완성 템플릿은 `deploy_exl3/templates/qwen3_coder_neurova_chat_template.jinja`에 보관함.
+   - **해결**: 모델의 `chat_template.jinja`와 `tokenizer_config.json`에서 `enable_thinking` 기본값을 no-think로 패치함. 명시적으로 `chat_template_kwargs: {"enable_thinking": true}`를 보낼 때만 thinking을 켬. 완성 템플릿은 `qwen_exl3/templates/qwen3_coder_neurova_chat_template.jinja`에 보관함.
 
 6. **Codex에서 말만 하고 작업을 멈추는 이슈**
    - **증상**: Qwen이 `이제 cleanly 다시 시작합니다.` 같은 진행 멘트만 최종 응답으로 내고 도구 호출 없이 턴을 끝냄.
@@ -49,4 +49,4 @@
 - **시작/중지/재시작**: `sudo systemctl [start|stop|restart] neurova-tabbyapi`
 - **포트**: `http://127.0.0.1:5000/v1` (OpenAI 호환 API)
 
-Codex/CLI Proxy 실사용 검증 절차와 원격 패치 목록은 `deploy_exl3/CODEX_QWEN_RUNBOOK.md`에 정리되어 있습니다.
+Codex/CLI Proxy 실사용 검증 절차와 원격 패치 목록은 `qwen_exl3/CODEX_QWEN_RUNBOOK.md`에 정리되어 있습니다.

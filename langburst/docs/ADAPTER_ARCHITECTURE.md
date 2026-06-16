@@ -127,7 +127,7 @@ Required gates before a Gemma adapter is considered working:
 
 ## Serving Roadmap
 
-The vLLM/TensorRT-LLM pattern has four layers:
+The production inference-runtime pattern has four layers:
 
 ```text
 model registry
@@ -173,7 +173,7 @@ Example model config:
 guess a default adapter from registry order because third-party adapters can be
 installed through entry points.
 
-Still required before calling it vLLM-class serving:
+Still required before calling it production-class serving:
 
 - iteration-level scheduler that separates prefill and decode work;
 - paged/ring KV allocator shared across requests;

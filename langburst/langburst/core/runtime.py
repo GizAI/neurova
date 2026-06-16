@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import inspect
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ import torch
 
 from .adapter import ModelAdapter
 from .features import RuntimeFeatures, RuntimePlan, resolve_runtime_plan
+from .platform import resolve_index_file
 from .policy import ExecutionPolicy
 from .text_stream import StreamingTextDecoder
 from ..speculative_batch import DecodeBatchPlan
@@ -22,29 +24,158 @@ from ..speculative_verifier import NativeNextNVerifier, TargetVerification
 @dataclass
 class GenerationConfig:
     max_new_tokens: int = 128
+    min_new_tokens: int = 0
     temperature: float = 0.0
     top_k: int = 0
+    top_p: float = 1.0
+    min_p: float = 0.0
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    no_repeat_ngram_size: int = 0
+    logit_bias: dict[int, float] | None = None
+    bad_token_ids: tuple[int, ...] = ()
+    suppress_tokens: tuple[int, ...] = ()
+    seed: int | None = None
     eos_token_ids: tuple[int, ...] = ()
+    stop_token_ids: tuple[int, ...] = ()
+    ignore_eos: bool = False
+
+    @classmethod
+    def greedy(cls, *, max_new_tokens: int, eos_token_ids: Sequence[int] = ()) -> "GenerationConfig":
+        return cls(
+            max_new_tokens=int(max_new_tokens),
+            temperature=0.0,
+            top_k=0,
+            eos_token_ids=tuple(int(t) for t in eos_token_ids),
+        )
 
 
-def sample_next(logits: torch.Tensor, cfg: GenerationConfig) -> int:
+def _apply_generation_constraints(
+    logits: torch.Tensor,
+    cfg: GenerationConfig,
+    *,
+    history: Sequence[int] = (),
+    generated: Sequence[int] = (),
+) -> torch.Tensor:
+    if not _has_generation_constraints(cfg, generated=generated):
+        return logits
+    scores = logits.float().clone()
+    if cfg.logit_bias:
+        for token, bias in cfg.logit_bias.items():
+            idx = int(token)
+            if 0 <= idx < scores.numel():
+                scores[idx] += float(bias)
+    for token in tuple(cfg.bad_token_ids) + tuple(cfg.suppress_tokens):
+        idx = int(token)
+        if 0 <= idx < scores.numel():
+            scores[idx] = -torch.inf
+    if generated:
+        counts: dict[int, int] = {}
+        for token in generated:
+            counts[int(token)] = counts.get(int(token), 0) + 1
+        for token, count in counts.items():
+            if 0 <= token < scores.numel():
+                if cfg.repetition_penalty and cfg.repetition_penalty != 1.0:
+                    if scores[token] < 0:
+                        scores[token] *= float(cfg.repetition_penalty)
+                    else:
+                        scores[token] /= float(cfg.repetition_penalty)
+                if cfg.presence_penalty:
+                    scores[token] -= float(cfg.presence_penalty)
+                if cfg.frequency_penalty:
+                    scores[token] -= float(cfg.frequency_penalty) * int(count)
+    if cfg.no_repeat_ngram_size and cfg.no_repeat_ngram_size > 1:
+        n = int(cfg.no_repeat_ngram_size)
+        seq = [int(t) for t in history]
+        if len(seq) >= n - 1:
+            prefix = tuple(seq[-(n - 1) :])
+            banned: set[int] = set()
+            for i in range(0, len(seq) - n + 1):
+                if tuple(seq[i : i + n - 1]) == prefix:
+                    banned.add(seq[i + n - 1])
+            for token in banned:
+                if 0 <= token < scores.numel():
+                    scores[token] = -torch.inf
+    return scores
+
+
+def _has_generation_constraints(cfg: GenerationConfig, *, generated: Sequence[int] = ()) -> bool:
+    return any(
+        (
+            bool(cfg.logit_bias),
+            bool(cfg.bad_token_ids),
+            bool(cfg.suppress_tokens),
+            bool(generated)
+            and (
+                (cfg.repetition_penalty and cfg.repetition_penalty != 1.0)
+                or bool(cfg.presence_penalty)
+                or bool(cfg.frequency_penalty)
+            ),
+            bool(cfg.no_repeat_ngram_size and cfg.no_repeat_ngram_size > 1),
+        )
+    )
+
+
+def _filter_top_p_min_p(scores: torch.Tensor, cfg: GenerationConfig) -> torch.Tensor:
+    filtered = scores
+    if cfg.top_k and cfg.top_k > 0 and cfg.top_k < filtered.numel():
+        vals, idx = torch.topk(filtered, int(cfg.top_k))
+        next_scores = torch.full_like(filtered, -torch.inf)
+        next_scores[idx] = vals
+        filtered = next_scores
+    if cfg.min_p and cfg.min_p > 0:
+        probs = torch.softmax(filtered, dim=-1)
+        max_prob = torch.max(probs)
+        filtered = torch.where(probs >= max_prob * float(cfg.min_p), filtered, torch.full_like(filtered, -torch.inf))
+    if cfg.top_p and 0 < cfg.top_p < 1.0:
+        sorted_scores, sorted_idx = torch.sort(filtered, descending=True)
+        sorted_probs = torch.softmax(sorted_scores, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        remove = cumulative > float(cfg.top_p)
+        if remove.numel() > 0:
+            remove[0] = False
+        sorted_scores = sorted_scores.masked_fill(remove, -torch.inf)
+        next_scores = torch.full_like(filtered, -torch.inf)
+        next_scores[sorted_idx] = sorted_scores
+        filtered = next_scores
+    return filtered
+
+
+def sample_next(
+    logits: torch.Tensor,
+    cfg: GenerationConfig,
+    *,
+    history: Sequence[int] = (),
+    generated: Sequence[int] = (),
+    sample_index: int = 0,
+) -> int:
+    scores = _apply_generation_constraints(logits, cfg, history=history, generated=generated)
     if cfg.temperature <= 0:
-        return int(torch.argmax(logits, dim=-1).item())
-    scores = logits.float() / max(cfg.temperature, 1e-6)
-    if cfg.top_k and cfg.top_k > 0:
-        vals, idx = torch.topk(scores, min(cfg.top_k, scores.numel()))
-        probs = torch.softmax(vals, dim=-1)
-        return int(idx[torch.multinomial(probs, 1)].item())
+        return int(torch.argmax(scores, dim=-1).item())
+    scores = _filter_top_p_min_p(scores / max(cfg.temperature, 1e-6), cfg)
     probs = torch.softmax(scores, dim=-1)
-    return int(torch.multinomial(probs, 1).item())
+    generator = None
+    if cfg.seed is not None:
+        generator = torch.Generator(device=probs.device)
+        generator.manual_seed(int(cfg.seed) + int(sample_index))
+    return int(torch.multinomial(probs, 1, generator=generator).item())
 
 
-def sample_next_tensor(logits: torch.Tensor, cfg: GenerationConfig) -> torch.Tensor:
+def sample_next_tensor(
+    logits: torch.Tensor,
+    cfg: GenerationConfig,
+    *,
+    history: Sequence[int] = (),
+    generated: Sequence[int] = (),
+    sample_index: int = 0,
+) -> torch.Tensor:
     if cfg.temperature <= 0:
-        if logits.device.type == "cuda":
-            return cuda_ops().argmax(logits.contiguous()).reshape(()).to(device=logits.device, dtype=torch.long)
-        return torch.argmax(logits, dim=-1).reshape(()).to(dtype=torch.long)
-    token = sample_next(logits, cfg)
+        scores = _apply_generation_constraints(logits, cfg, history=history, generated=generated)
+        if logits.device.type == "cuda" and scores.data_ptr() == logits.data_ptr():
+            return cuda_ops().argmax(scores.contiguous()).reshape(()).to(device=logits.device, dtype=torch.long)
+        return torch.argmax(scores, dim=-1).reshape(()).to(device=logits.device, dtype=torch.long)
+    token = sample_next(logits, cfg, history=history, generated=generated, sample_index=sample_index)
     return torch.tensor(token, device=logits.device, dtype=torch.long)
 
 
@@ -148,6 +279,33 @@ class RuntimeEngine:
             kv_block_size=kv_block_size,
         )
 
+    def estimated_state_bytes(self) -> int:
+        estimate = getattr(self.adapter, "estimate_state_bytes", None)
+        if callable(estimate):
+            features = self.resolve_plan(self.features).effective
+            try:
+                return int(estimate(self.cfg, recent_window=self.recent_window, features=features))
+            except TypeError:
+                return int(estimate(self.cfg, recent_window=self.recent_window))
+        return 0
+
+    def estimated_weight_bytes(self) -> int:
+        try:
+            index = json.loads(resolve_index_file(self.qb_model).read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        total = 0
+        for meta in index.get("tensors", {}).values():
+            for field_name in ("qweight", "scales", "path"):
+                rel = meta.get(field_name)
+                if not rel:
+                    continue
+                try:
+                    total += (self.qb_model / rel).stat().st_size
+                except FileNotFoundError:
+                    pass
+        return total
+
     @contextmanager
     def pooled_state(self, features: RuntimeFeatures | None = None):
         plan = self.resolve_plan(features)
@@ -208,7 +366,7 @@ class RuntimeEngine:
         *,
         return_logits: bool = True,
     ) -> list[torch.Tensor | None]:
-        """Execute a vLLM-style decode batch plan.
+        """Execute a continuous-serving decode batch plan.
 
         If the adapter/model exposes a native `forward_batch(plan, states)`, use
         it.  Otherwise this correctness-preserving fallback executes each row's
@@ -256,7 +414,7 @@ class RuntimeEngine:
         """Execute a batch and return every row's scheduled logits.
 
         Rows without draft tokens return only the final logit row. Rows with
-        draft tokens return one logit row per scheduled token, matching vLLM's
+        draft tokens return one logit row per scheduled token, matching the reference runtime's
         rejection-sampler input shape.
         """
 
@@ -351,16 +509,28 @@ class RuntimeEngine:
     ) -> Iterator[int]:
         state = self.new_state(features) if state is None else state
         features = self.resolve_plan(features).effective
-        logits = self.prefill(prompt_ids, state, features)
-        next_id = sample_next(logits, gen_cfg)
+        prompt_list = [int(t) for t in prompt_ids]
+        logits = self.prefill(prompt_list, state, features)
+        generated: list[int] = []
+        next_id = sample_next(logits, gen_cfg, history=prompt_list, generated=generated)
         for i in range(gen_cfg.max_new_tokens):
-            if gen_cfg.eos_token_ids and next_id in gen_cfg.eos_token_ids:
+            can_stop = len(generated) >= int(gen_cfg.min_new_tokens)
+            if can_stop and not gen_cfg.ignore_eos and gen_cfg.eos_token_ids and next_id in gen_cfg.eos_token_ids:
+                break
+            if can_stop and gen_cfg.stop_token_ids and next_id in gen_cfg.stop_token_ids:
                 break
             yield next_id
+            generated.append(int(next_id))
             if i == gen_cfg.max_new_tokens - 1:
                 break
             logits = self.forward_one(next_id, state, return_logits=True)
-            next_id = sample_next(logits, gen_cfg)
+            next_id = sample_next(
+                logits,
+                gen_cfg,
+                history=prompt_list + generated,
+                generated=generated,
+                sample_index=len(generated),
+            )
 
     @torch.no_grad()
     def generate_ids_greedy_gpu(
@@ -439,16 +609,35 @@ class RuntimeEngine:
         if len(prefix) >= gen_cfg.max_new_tokens:
             return [int(t) for t in prefix[: gen_cfg.max_new_tokens]]
         remaining = gen_cfg.max_new_tokens - len(prefix)
-        next_token = sample_next_tensor(logits, gen_cfg) if first_token is None else first_token
+        prompt_history = [int(t) for t in prefix]
+        next_token = (
+            sample_next_tensor(logits, gen_cfg, history=prompt_history, generated=prompt_history)
+            if first_token is None
+            else first_token
+        )
         out = torch.empty((remaining,), device=next_token.device, dtype=torch.long)
         produced = 0
         for i in range(remaining):
+            next_id = int(next_token.detach().cpu().item())
+            can_stop = len(prefix) + produced >= int(gen_cfg.min_new_tokens)
+            if can_stop and not gen_cfg.ignore_eos and gen_cfg.eos_token_ids and next_id in set(gen_cfg.eos_token_ids):
+                break
+            if can_stop and gen_cfg.stop_token_ids and next_id in set(gen_cfg.stop_token_ids):
+                break
             out[i] = next_token
             produced += 1
             if i == remaining - 1:
                 break
             logits = self.forward_one(next_token, state, return_logits=True)
-            next_token = sample_next_tensor(logits, gen_cfg)
+            generated_so_far = [int(t) for t in prefix]
+            generated_so_far.extend(int(t) for t in out[:produced].detach().cpu().tolist())
+            next_token = sample_next_tensor(
+                logits,
+                gen_cfg,
+                history=generated_so_far,
+                generated=generated_so_far,
+                sample_index=len(generated_so_far),
+            )
         if torch.cuda.is_available() and str(self.device).startswith("cuda"):
             torch.cuda.synchronize()
         ids = [int(t) for t in prefix]
@@ -560,7 +749,7 @@ class RuntimeEngine:
         """Verify a sampled token plus native MTP/NEXTN drafts in one target call.
 
         This is the runtime-owned verifier boundary.  LangBurst routes it
-        through a vLLM-style batch plan first, then falls back to the older
+        through a continuous-serving batch plan first, then falls back to the older
         single-request block/scalar paths only when an adapter has not exposed
         `forward_verify_batch`.
         """

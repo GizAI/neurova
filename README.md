@@ -13,20 +13,20 @@ Neurova는 하나의 모델만 담은 저장소가 아니다. 저사양 GPU부�
 
 | 프로젝트 | 한 줄 개념 | 현재 의미 |
 | --- | --- | --- |
-| `langburst/` | vLLM 같은 범용 저비트/stateful 모델 서빙 엔진 | 메인 프로젝트 |
+| `langburst/` | external serving engine 같은 범용 저비트/stateful 모델 서빙 엔진 | 메인 프로젝트 |
 | `saneflow/` | Neurova 자체 LM을 학습해보는 연구 라인 | 별도 학습 연구 |
 | `neuromamba/` | Mamba-3 계열을 Neurova 모델 후보로 검증하는 연구 라인 | 별도 아키텍처 연구 |
-| `deploy_exl3/` | Qwen EXL3/TabbyAPI 실서빙 운영 기록 | 배포 런북 |
-| `luma/` | 외부 슬롯 메모리를 쓰는 attention-free LM 실험 | 보관된 연구 |
-| `neurova/` | Qwen + embedding retrieval 개인 기억 CLI | 레거시 CLI |
+| `luma/` | LUMA(Ledgered Universal Memory Automaton), 외부 슬롯 메모리를 쓰는 attention-free LM 실험 | 보관된 연구 |
+| `qwen_exl3/` | Qwen3.6 EXL3/TabbyAPI 실서빙 운영 기록 | 배포 런북 |
+| `qwen_memory/` | Qwen embed_tokens + USearch 기반 개인 기억 레이어 | 레거시 참고 구현 |
 
-루트는 작업공간 인덱스와 공통 런처만 담당한다. 새 문서, 스크립트, 설정,
+루트는 작업공간 인덱스와 공통 라우터만 담당한다. 새 문서, 스크립트, 설정,
 데이터, 체크포인트, 논문 자료는 각 프로젝트 안에 둔다.
 
 ## `langburst/`: 메인 서빙 엔진
 
 LangBurst는 이 저장소의 중심 프로젝트다. 목표는 16GB RTX 4080/4090급
-GPU 하나에 갇힌 특화 런타임이 아니라, vLLM처럼 여러 모델 family를 같은
+GPU 하나에 갇힌 특화 런타임이 아니라, external serving engine처럼 여러 모델 family를 같은
 서버/스케줄러/런타임 계약 위에서 서빙하는 범용 엔진이다. 다만 방향은
 “대형 서버 GPU 전용”이 아니라 저사양 GPU에서도 쓸 수 있는 저비트,
 stateful, 긴 문맥, 멀티 요청 엔진이다.
@@ -50,7 +50,7 @@ langburst/langburst/core/
   RuntimeEngine: prefill, decode, sampling, state pool, generation contract
   EngineManager: lazy model load, LRU unload, model residency, health/status
   AdmissionController: active/queued request 제한과 timeout/reject 카운터
-  ContinuousBatchScheduler: vLLM-style batching으로 가기 위한 scheduler 경계
+  ContinuousBatchScheduler: continuous-serving batching으로 가기 위한 scheduler 경계
   RuntimeFeatures/RuntimePlan: 기능 요청과 adapter capability를 합쳐 실행 계획 결정
   KVBlockTable / BatchStateStore: paged KV와 state arena를 위한 자원 경계
 
@@ -125,7 +125,7 @@ stateful / 긴 문맥 기능
   queue timeout/reject counters
 ```
 
-아직 vLLM급 완성품이라고 말하면 안 된다. 현재 정체성은 “vLLM-class를
+아직 external serving engine급 완성품이라고 말하면 안 된다. 현재 정체성은 “production-class를
 목표로 하는 범용 저비트/stateful 서빙 엔진”이다. Qwen3.6은 첫 번째 강한
 adapter이고, continuous batching, paged/ring KV, state arena, speculative
 decode, multi-model residency, 저사양 GPU 대응은 모두 LangBurst 본체의
@@ -141,6 +141,7 @@ langburst-qwen-quantize /path/to/hf-model /path/to/converted-runtime-model --bit
 langburst-qwen-audit /path/to/converted-runtime-model --hf-model /path/to/hf-model
 langburst-chat --adapter qwen36 --hf-model /path/to/hf-model --qb-model /path/to/qb-model --prompt "안녕"
 langburst-server --adapter qwen36 --hf-model /path/to/hf-model --qb-model /path/to/qb-model --port 8008
+./neurova.sh langburst server --adapter qwen36 --hf-model /path/to/hf-model --qb-model /path/to/qb-model --port 8008
 ```
 
 먼저 읽을 문서:
@@ -151,7 +152,7 @@ langburst/docs/DESIGN.md
 langburst/docs/ADAPTER_ARCHITECTURE.md
 langburst/docs/RUNTIME_FEATURES.md
 langburst/docs/PERFORMANCE_LOG.md
-langburst/docs/VLLM_PARITY_TODO.md
+langburst/docs/SERVING_ENGINE_TODO.md
 ```
 
 ## `saneflow/`: 자체 LM 학습 연구
@@ -163,8 +164,9 @@ Neurova 자체 언어 모델을 직접 학습해보는 연구 라인이다. 여�
 
 개념적으로 SaneFlow는 “작고 통제 가능한 자체 LM을 만들어 언어 prior,
 state mixer, dense Transformer baseline, ChatML SFT 품질 게이트를 연구하는
-라인”이다. 루트의 `./neurova.sh`가 인자 없이 실행될 때 SaneFlow chat으로
-들어가지만, 작업공간의 메인 프로젝트는 LangBurst다.
+라인”이다. 실행은 `./neurova.sh saneflow ...` 또는
+`saneflow/scripts/run.sh ...`로 명시한다. 작업공간의 메인 프로젝트는
+LangBurst다.
 
 SaneFlow가 실제로 담고 있는 것:
 
@@ -270,9 +272,9 @@ neuromamba/docs/MAMBA3_KERNEL_BACKWARD_NOTES.md
 neuromamba/docs/MAMBA3_OPTIMIZATION_RESEARCH.md
 ```
 
-## `deploy_exl3/`: 실서빙 런북
+## `qwen_exl3/`: Qwen EXL3 실서빙 런북
 
-`deploy_exl3/`는 모델 코드 프로젝트가 아니라 운영 기록이다. ml-dmc8에서
+`qwen_exl3/`는 모델 코드 프로젝트가 아니라 운영 기록이다. ml-dmc8에서
 Qwen3.6-27B를 EXL3 + DFlash + TabbyAPI로 실제 OpenAI-compatible 서버로
 띄우면서 생긴 설치, 패치, 장애 대응 절차를 보관한다.
 
@@ -283,14 +285,14 @@ Qwen3.6-27B를 EXL3 + DFlash + TabbyAPI로 실제 OpenAI-compatible 서버로
 담고 있는 내용:
 
 ```text
-README_TABBYAPI_EXL3.md
+qwen_exl3/README_TABBYAPI_EXL3.md
   Qwen3.6-27B EXL3 3.08bpw
   DFlash draft model
   100K context 근처 운영값
   KV cache quantization
   ExLlamaV3 / TabbyAPI 문제 해결 기록
 
-CODEX_QWEN_RUNBOOK.md
+qwen_exl3/CODEX_QWEN_RUNBOOK.md
   Codex/CLI proxy 실사용 검증
   no-think template
   tool-call 종료 문제
@@ -300,9 +302,9 @@ templates/
   Qwen chat template
 ```
 
-## `luma/`: 슬롯 메모리 LM 보관 연구
+## `luma/`: LUMA(Ledgered Universal Memory Automaton) 슬롯 메모리 LM 보관 연구
 
-LUMA는 현재 주력 경로가 아니라 보관된 연구다. 하지만 단순 폐기물이
+LUMA(Ledgered Universal Memory Automaton)는 현재 주력 경로가 아니라 보관된 연구다. 하지만 단순 폐기물이
 아니라, “LM 내부에 외부 슬롯 메모리를 붙이면 실제로 기억을 쓰는가”를
 검증하려던 프로토타입이다.
 
@@ -355,36 +357,53 @@ python3 -m luma.train --help
 python3 -m luma.eval_memory --help
 ```
 
-## `neurova/`: V6 개인 기억 CLI
+## `qwen_memory/`: Qwen 기반 개인 기억 레이어
 
-`neurova/`는 V6 Pure Embedding Memory CLI의 레거시 프로젝트다. LangBurst나
-SaneFlow의 하위 모듈이 아니라, “기존 Qwen 모델에 학습 없이 개인 기억을
-붙이는 가장 단순한 방법”을 실험한 독립 CLI다.
+`qwen_memory/`는 기존 혼동되던 개인 기억 경로를 정리한 이름이다. 이 프로젝트는
+독립 LLM도 아니고 새 symbolic LM도 아니다. 실제 성격은
+`Qwen/Qwen3.5-4B`에 embedding/USearch 기반 개인 기억 레이어를 붙인
+레거시 참고 구현이다.
 
-개념적으로 V6는 문법 규칙, 질문 유형 규칙, 1인칭/3인칭 변환 같은
-하드코딩을 제거하고, 모델의 `embed_tokens` 평균 embedding으로 raw text를
-USearch에 저장/검색한다. 검색된 원문 기억은 system prompt에 붙고, 실제
-귀속과 표현은 Qwen 모델이 처리한다.
+이름을 `qwen_memory`로 둔 이유는 코드 성격이 그대로 드러나기 때문이다.
+생성은 Qwen이 하고, 기억 embedding도 Qwen의 `embed_tokens`를 쓰며,
+저장/검색은 USearch memory slot이 맡는다. CLI는 실행 표면일 뿐 프로젝트
+정체성이 아니다.
 
-V6가 실제로 담고 있는 것:
+개념적으로는 심볼릭한 언어획득 가설을 시도한 흔적이 있다. 문서상 핵심
+prior는 `entity/event/relation exist`, `event/situation model`,
+`memory slots`이고, 구현은 이를 명시적인 symbol table이나 grammar rule이
+아니라 Qwen의 `embed_tokens` 평균 embedding과 USearch memory slot으로
+대체한다.
+
+즉 `qwen_memory`는 규칙 기반 symbolic parser가 아니다. 문법 규칙, 질문 유형 규칙,
+1인칭/3인칭 변환 같은 하드코딩을 제거하고, “비슷한 사건/개체/관계는
+embedding 공간에서 가깝다”는 prior만 둔 뒤 raw text를 저장/검색한다.
+검색된 원문 기억은 system prompt에 붙고, 실제 귀속과 표현은 Qwen 모델이
+처리한다.
+
+`qwen_memory`가 실제로 담고 있는 것:
 
 ```text
-neurova/v6.py
+qwen_memory/main.py
   Qwen3.5-4B loader
   bf16/4bit mode
   TextIteratorStreamer 기반 streaming CLI
   Memory class
   MemSlot raw text storage
+  entity/event/relation prior를 USearch slot으로 표현
   embed_tokens mean pooling
   USearch cosine index
-  per-user ~/.neurova_v6/users/<user>/ namespace
+  per-user ~/.qwen_memory/users/<user>/ namespace
   /think, /nothink, /effort, /user, /clear, /status, remember:
 
-neurova/docs/ARCHITECTURE_v6.md
-  V6 구조 설명
+qwen_memory/docs/ARCHITECTURE.md
+  구조 설명
 
-neurova/scripts/deploy_v6.sh
+qwen_memory/scripts/deploy.sh
   ml-dmc8 배포 스크립트
+
+qwen_memory/scripts/run.sh
+  bf16/4bit 실행 모드 선택 후 qwen_memory/main.py 실행
 ```
 
 의도적으로 하지 않는 것:
@@ -400,7 +419,10 @@ template extractor
 
 ## 루트와 아티팩트 원칙
 
-루트에는 작업공간 인덱스와 공통 런처만 둔다.
+루트에는 작업공간 인덱스와 얇은 라우터만 둔다. 프로젝트별 실행 로직은
+루트 스크립트에 넣지 않고 각 프로젝트의 `scripts/run.sh`가 소유한다.
+`./neurova.sh`를 인자 없이 실행하면 특정 레거시 프로젝트로 진입하지 않고
+사용법만 보여준다.
 
 ```text
 README.md
@@ -413,10 +435,13 @@ neurova.sh
 
 ```text
 langburst/docs/
+langburst/scripts/run.sh
 saneflow/configs/
+saneflow/scripts/run.sh
 neuromamba/scripts/
 luma/data/
-neurova/docs/
+qwen_memory/docs/
+qwen_memory/scripts/run.sh
 ```
 
 대용량 데이터, 다운로드 토크나이저, 논문 PDF, 학습 결과, 평가 결과는
@@ -429,8 +454,11 @@ neurova/docs/
 
 ```bash
 bash -n neurova.sh
-find luma/scripts saneflow/scripts neuromamba/scripts neurova/scripts -maxdepth 1 -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-python -m compileall -q langburst luma saneflow neuromamba neurova
+find langburst/scripts luma/scripts saneflow/scripts neuromamba/scripts qwen_memory/scripts -maxdepth 1 -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+./neurova.sh help
+./neurova.sh langburst help
+./neurova.sh qwen-memory help
+python -m compileall -q langburst luma saneflow neuromamba qwen_memory
 python saneflow/scripts/saneflow_run.py list
 python -m neuromamba.cli model-info --mode mimo-r4-tiny --tokenizer byte --device cpu
 ```

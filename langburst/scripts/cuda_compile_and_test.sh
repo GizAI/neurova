@@ -9,6 +9,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 export LANGBURST_REQUIRE_CUDA_EXT=1
+source scripts/langburst_cuda_env.sh
 export LANGBURST_CUDA_ARCH_LIST="${LANGBURST_CUDA_ARCH_LIST:-8.9}"
 
 python -m langburst.doctor --require-cuda

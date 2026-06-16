@@ -1,6 +1,6 @@
 # LangBurst
 
-LangBurst is a vLLM-class serving engine target for low-bit, stateful, and
+LangBurst is a production-class serving engine target for low-bit, stateful, and
 resource-constrained model serving. It is not limited to one 16GB GPU shape:
 the design goal is a generic adapter-based runtime that can serve different
 model families, scale down to modest GPUs with quantization/offload policies,
@@ -12,7 +12,7 @@ The current champion measured path is Qwen3.6-27B text inference on a
 DeltaNet kernels, ring-KV attention, paged/state-arena serving work, and
 streaming decode state.
 
-This is not yet a complete vLLM replacement. The runtime is split into a common
+This is not yet a complete external serving engine replacement. The runtime is split into a common
 `RuntimeEngine`, `EngineManager`, `AdmissionController`,
 `ContinuousBatchScheduler`, `RuntimePlan`, and model adapters so future
 Gemma/Llama/MoE-style targets do not fork the server/decode loop. The current
@@ -32,16 +32,21 @@ canonical adapter contract is:
   admission, state pooling, OpenAI-compatible streaming, health/model/feature
   introspection, and OOM pool cleanup.
 - Stateful/long-context features: `kv_window_policy=error|shift|ring`, ring KV,
-  snapshots, boundary decay, infinite streaming gate, episodic memory gate, and
-  TTT sidecar gate through `RuntimeFeatures -> RuntimeCapabilities -> RuntimePlan`.
-- vLLM-style execution work: continuous-batching scheduler, slot-indexed state
-  arena, paged KV/block table, batch-state CUDA kernels, native MTP/NEXTN
-  speculative decoding with adaptive fallback, and CUDA Graph bucket scaffolding.
+  snapshots, boundary decay, `kv_cache_dtype=fp16|fp8_e4m3|int4|int4_bdr`,
+  infinite streaming gate, episodic memory gate, and TTT sidecar gate through
+  `RuntimeFeatures -> RuntimeCapabilities -> RuntimePlan`.
+- continuous-serving execution work: continuous-batching scheduler, slot-indexed state
+  arena, paged KV/block table, automatic prefix cache with Radix-style token
+  trie and shared immutable KV blocks, batch-state CUDA kernels, native
+  MTP/NEXTN speculative decoding with adaptive fallback, and CUDA Graph bucket
+  scaffolding.
 - CUDA extension symbols: Marlin W4A16 GEMM, rowwise low-bit fallback,
-  RMSNorm, GDN recurrence, attention decode, and sampling helpers.
+  RMSNorm, GDN recurrence, fp16/fp8/int4 paged attention decode, and sampling
+  helpers.
 
 The adapter split is documented in `docs/ADAPTER_ARCHITECTURE.md`.
 Runtime feature profiles are documented in `docs/RUNTIME_FEATURES.md`.
+Current duplicate/fragmentation boundaries are documented in `docs/STRUCTURE_AUDIT.md`.
 
 ## Environment
 
@@ -95,7 +100,7 @@ langburst-chat \
   --hf-model /path/to/hf-model \
   --qb-model /path/to/converted-runtime-model \
   --prompt "안녕. 너는 누구야?" \
-  --recent-window 16384 \
+  --recent-window "${LANGBURST_CONTEXT_WINDOW:-8192}" \
   --max-new-tokens 96 \
   --temperature 0 \
   --stream \
@@ -123,6 +128,7 @@ Run once and keep the model resident:
 
 ```bash
 LANGBURST_LOWBIT_ROWS_PER_CTA=8 \
+LANGBURST_CONTEXT_WINDOW=8192 \
 langburst-server \
   --adapter qwen36 \
   --runtime-profile stateful \
@@ -130,7 +136,7 @@ langburst-server \
   --qb-model /path/to/converted-runtime-model \
   --host 0.0.0.0 \
   --port 8008 \
-  --recent-window 16384
+  --recent-window "$LANGBURST_CONTEXT_WINDOW"
 ```
 
 Smoke:
@@ -138,10 +144,12 @@ Smoke:
 ```bash
 curl -sS http://127.0.0.1:8008/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"langburst-qwen3.6-27b-q4-marlin","messages":[{"role":"user","content":"Say hello."}],"max_tokens":16,"temperature":0}'
+  -d '{"model":"langburst-qwen3.6-27b-q3","messages":[{"role":"user","content":"Say hello."}],"max_tokens":16,"temperature":0}'
 ```
 
-SSE streaming is supported with `"stream": true`.
+SSE streaming is supported with `"stream": true`. Add
+`"stream_options": {"include_usage": true}` to receive the final usage object in
+the last stream chunk.
 
 Inspect the resolved runtime plan:
 
@@ -153,12 +161,130 @@ The response includes requested features, adapter capabilities, effective
 features, and unsupported fields disabled by `RuntimePlan`. The
 OpenAI-compatible chat endpoint also accepts per-request runtime overrides such
 as `"runtime_profile": "original"`, `"kv_window_policy": "ring"`,
+`"kv_cache_dtype": "fp8_e4m3"`, `"kv_cache_dtype": "int4_bdr"`,
 `"state_pool": true`, `"gpu_sampling": true`, `"block_prefill": true`, or
-`"prefill_chunk_size": 64`.
+`"prefix_cache": true`, or `"prefill_chunk_size": 64`.
 `block_prefill` is the default serving path. Its accepted implementation uses
 exact decode semantics internally; faster batched internals must clear final
 logit parity, continuation-state parity, and recall gates before becoming
 default.
+
+The chat endpoint accepts common modern LLM API controls. These are wired into
+the shared generation contract:
+
+- Sampling/decoding: `temperature`, `top_p`, `top_k`, `min_p`, `seed`.
+- Length/termination: `max_tokens`, `max_completion_tokens`,
+  `max_new_tokens`, `min_tokens`, `min_new_tokens`, `stop`,
+  `stop_sequences`, `stop_token_ids`, `ignore_eos`,
+  `include_stop_str_in_output`.
+- Repetition/logit controls: `repetition_penalty`, `presence_penalty`,
+  `frequency_penalty`, `no_repeat_ngram_size`, `logit_bias`,
+  `bad_words_ids`, `suppress_tokens`, `begin_suppress_tokens`.
+- State/cache/observability: `session_id`, `stateful_session`,
+  `reset_session`, `prompt_cache_key`, `prompt_cache_retention`,
+  `stream_options.include_usage`, `previous_response_id`, `user`,
+  `metadata`.
+- Reasoning/text compatibility fields: `reasoning.effort`,
+  `reasoning_effort`, `text.verbosity`, `verbosity`.
+
+Unsupported scoring, structured output, and tool-calling options such as
+`logprobs`, non-text `response_format`, and `tools` fail fast instead of
+silently returning misleading data.
+
+Responses include OpenAI-style usage accounting plus local performance metrics:
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 2048,
+    "completion_tokens": 128,
+    "total_tokens": 2176,
+    "prompt_tokens_details": {
+      "cached_tokens": 1024,
+      "uncached_tokens": 1024
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    },
+    "performance": {
+      "queue_wait_s": 0.001,
+      "ttft_s": 0.04,
+      "e2e_s": 1.2,
+      "decode_tok_s": 110.0
+    }
+  }
+}
+```
+
+### Automatic Prefix Cache
+
+The stateful serving path includes automatic prefix caching for repeated system
+prompts, shared chat templates, and repeated document prefixes. LangBurst uses a
+shared `RadixPrefixCache` over token IDs and stores adapter state snapshots plus
+optional pinned paged KV block IDs. Cache hits skip already-computed prompt
+tokens and reuse immutable full KV blocks through `KVBlockTable` refcounts.
+Partial blocks are intentionally not shared, and unsupported adapters have the
+feature disabled by `RuntimePlan`.
+
+`prompt_cache_key` partitions the prefix-cache namespace. Use the same key for
+traffic with a stable shared prefix and different keys for tenants or workloads
+that must not share cache state. Cache hits are reported as
+`usage.prompt_tokens_details.cached_tokens`; they are a latency/cost accounting
+signal, not persistent conversation memory.
+
+### Explicit Stateful Sessions
+
+The OpenAI-compatible chat endpoint is stateless by default. Pooled states and
+prefix cache are internal speed optimizations and do not imply persistent memory
+between unrelated requests. To keep native model state across turns, create or
+provide a session id:
+
+```bash
+curl -sS http://127.0.0.1:8008/v1/langburst/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"langburst-qwen3.6-27b-q3"}'
+```
+
+Then send only the next turn delta with `session_id`:
+
+```bash
+curl -sS http://127.0.0.1:8008/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"langburst-qwen3.6-27b-q3","session_id":"sess-...","messages":[{"role":"user","content":"Continue."}],"max_tokens":64}'
+```
+
+Sessions are bounded by `--max-sessions` and `--session-ttl-s`, and can be
+deleted with `DELETE /v1/langburst/sessions/{session_id}`. Session requests use
+the same continuous-batching worker as stateless requests: the worker attaches
+the preserved DecodeState for the lifetime of the request, locks the session
+row, and commits the final generated token before releasing it so the next turn
+sees the real low-level model state.
+
+### KV Cache Dtypes
+
+LangBurst keeps KV storage behind one model-agnostic `KVCacheSpec` contract.
+`RuntimeCapabilities.kv_cache_dtypes` declares what each adapter can execute
+without changing model semantics; unsupported requests are resolved back to the
+adapter's safe dtype by `RuntimePlan` before state allocation. Physical shapes,
+metadata tensors, and byte accounting live in the shared `KVCacheLayout` helper,
+not in individual model adapters.
+
+| dtype | Storage | Intended use |
+| --- | --- | --- |
+| `fp16` | fp16 K/V | Highest compatibility baseline. |
+| `fp8_e4m3` | fp8 K/V with fixed scale | Existing long-context memory saver for 16K-class serving. |
+| `int4` | packed UINT4 K/V + per-token/head scale+zero | SAW/serving-compatible 4-bit KV memory reduction without rotation. |
+| `int4_bdr` | packed UINT4 K/V + per-token/head scale+zero + K-only block Hadamard rotation | SAW-INT4 default accuracy-preserving path. |
+
+`int4_bdr` follows the SAW-INT4 paper's serving-compatible path: K is rotated
+with a block-diagonal Hadamard transform before token-wise INT4 write, and Q is
+rotated inside decode before the dot product. V rotation is intentionally not
+enabled in the default LangBurst path because it requires an inverse transform
+on the attention output and needs separate parity/speed gates. The source paper
+and implementation snapshot used for this port live under
+`../papers/2604.19157.pdf` and `../third_party/research/saw-int4/`.
 
 Multi-model serving uses a declarative resource file instead of server-side
 branches:
@@ -167,12 +293,12 @@ branches:
 {
   "models": [
     {
-      "model_name": "langburst-qwen3.6-27b-q4-marlin",
+      "model_name": "langburst-qwen3.6-27b-q3",
       "adapter": "qwen36",
       "hf_model": "/path/to/hf-model",
       "qb_model": "/path/to/converted-runtime-model",
       "device": "cuda",
-      "recent_window": 16384,
+      "recent_window": 8192,
       "runtime_profile": "stateful",
       "estimated_vram_mib": 14000
     }
@@ -211,7 +337,7 @@ oversized requests fail fast instead of pushing a constrained server into OOM.
 
 Current serving status is intentionally conservative: the server has lazy
 multi-model residency, LRU unload, bounded request admission, pooled
-DecodeState reuse, and a partial vLLM-style greedy batch worker. Further
+DecodeState reuse, and a partial continuous-serving greedy batch worker. Further
 continuous-batching work must stay behind the same
 `EngineManager`/`AdmissionController` boundary.
 Serving defaults such as recent window, VRAM reserve, state-pool size, prompt
@@ -307,6 +433,7 @@ Latest dmc8 result:
 Detailed per-change speed history is in `docs/PERFORMANCE_LOG.md`.
 State/runtime feature coverage is in `docs/V05_FEATURE_TEST_MATRIX.md`.
 Native MTP speculative decoding notes are in `docs/SPECULATIVE_RESEARCH.md`.
+Structure cleanup boundaries are in `docs/STRUCTURE_AUDIT.md`.
 
 Break down decode bottlenecks without changing the serving path:
 

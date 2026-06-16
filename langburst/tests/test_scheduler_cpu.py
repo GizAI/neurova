@@ -57,10 +57,19 @@ def test_continuous_batch_scheduler_prioritizes_decode_rows():
     batch = scheduler.schedule()
 
     assert batch is not None
-    assert batch.request_ids == ["decode", "prefill"]
-    assert batch.input_ids.tolist() == [3, 4, 10, 11]
-    assert batch.num_draft_tokens_per_request == [1, 0]
-    assert batch.cu_num_logits.tolist() == [0, 2, 3]
+    assert batch.request_ids == ["decode"]
+    assert batch.input_ids.tolist() == [3, 4]
+    assert batch.num_draft_tokens_per_request == [1]
+    assert batch.cu_num_logits.tolist() == [0, 2]
+
+    decode.computed_tokens += 1
+    decode.last_sampled_token = 5
+    scheduler.finish_request("decode")
+    next_batch = scheduler.schedule()
+
+    assert next_batch is not None
+    assert next_batch.request_ids == ["prefill"]
+    assert next_batch.input_ids.tolist() == [10, 11, 12, 13]
 
 
 def test_continuous_batch_scheduler_updates_block_table_and_graph_bucket():
@@ -87,6 +96,37 @@ def test_continuous_batch_scheduler_updates_block_table_and_graph_bucket():
     assert blocks.summary()["used_blocks"] == 3
     assert scheduler.finish_request("a") is not None
     assert blocks.summary()["used_blocks"] == 1
+
+
+def test_kv_block_table_refcounts_cached_prefix_blocks():
+    blocks = KVBlockTable(num_blocks=4, block_size=2)
+    blocks.ensure_tokens("a", 4)
+    assert blocks.summary()["used_blocks"] == 2
+
+    pinned = blocks.pin_prefix_blocks("a", 4)
+    assert pinned == (0, 1)
+    assert blocks.summary()["pinned_or_shared_blocks"] == 2
+
+    blocks.release("a")
+    assert blocks.summary()["used_blocks"] == 2
+    blocks.attach_prefix_blocks("b", pinned)
+    assert blocks.summary()["used_blocks"] == 2
+    blocks.release("b")
+    assert blocks.summary()["used_blocks"] == 2
+    blocks.release_pinned_blocks(pinned)
+    assert blocks.summary()["used_blocks"] == 0
+
+
+def test_kv_block_table_can_replace_preallocated_blocks_with_prefix_blocks():
+    blocks = KVBlockTable(num_blocks=8, block_size=2)
+    blocks.ensure_tokens("cached", 4)
+    pinned = blocks.pin_prefix_blocks("cached", 4)
+    blocks.ensure_tokens("new", 6)
+
+    blocks.reset_to_prefix_blocks("new", pinned)
+
+    assert blocks.get("new").block_ids == [0, 1]
+    assert blocks.summary()["used_blocks"] == 2
 
 
 def test_continuous_batch_scheduler_reuses_input_buffers():

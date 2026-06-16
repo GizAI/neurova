@@ -8,10 +8,18 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
-from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, runtime_features_from_args
-from .core.adapter import adapter_registry
+from .cli_features import (
+    add_adapter_arg,
+    add_model_path_args,
+    add_runtime_feature_args,
+    create_runtime_engine_from_args,
+    runtime_features_from_args,
+)
+from .core.defaults import serving_recent_window_default
 from .core.features import RuntimeFeatures
+from .core.model_runner import BatchedModelRunner
 from .core.runtime import RuntimeEngine, sample_next
+from .core.scheduler import ContinuousBatchScheduler
 
 
 @dataclass(frozen=True)
@@ -45,8 +53,23 @@ class RecallCaseResult:
 
 
 @dataclass(frozen=True)
+class BatchPathParityResult:
+    prompt_tokens: int
+    max_new_tokens: int
+    direct_target_only: list[int]
+    batch_target_only: list[int]
+    batch_speculative: list[int]
+    batch_prefix_second_hit: list[int]
+    target_only_match: bool
+    speculative_match: bool
+    prefix_cache_match: bool
+    prefix_cache_hit_tokens: int
+
+
+@dataclass(frozen=True)
 class CorrectnessReport:
     path_parity: PathParityResult
+    batch_path_parity: BatchPathParityResult
     recall: list[RecallCaseResult]
     require_block_prefill_parity: bool = False
 
@@ -63,7 +86,12 @@ class CorrectnessReport:
             if self.require_block_prefill_parity
             else True
         )
-        return block_ok and all(case.passed for case in self.recall)
+        batch_ok = (
+            self.batch_path_parity.target_only_match
+            and self.batch_path_parity.speculative_match
+            and self.batch_path_parity.prefix_cache_match
+        )
+        return block_ok and batch_ok and all(case.passed for case in self.recall)
 
 
 def _filler(repeats: int) -> str:
@@ -177,7 +205,101 @@ def run_path_parity(
 def engine_generation_greedy():
     from .core.runtime import GenerationConfig
 
-    return GenerationConfig(max_new_tokens=1, temperature=0.0, top_k=0, eos_token_ids=())
+    return GenerationConfig.greedy(max_new_tokens=1)
+
+
+def _batch_generate_ids_once(
+    engine: RuntimeEngine,
+    prompt_ids: Sequence[int],
+    gen_cfg,
+    features: RuntimeFeatures,
+    *,
+    runner: BatchedModelRunner | None = None,
+    request_id: str = "batch-parity",
+) -> tuple[list[int], int]:
+    local_runner = runner
+    if local_runner is None:
+        scheduler = ContinuousBatchScheduler(
+            max_num_requests=1,
+            max_num_batched_tokens=max(2, int(features.prefill_chunk_size), len(prompt_ids)),
+            prefill_chunk_size=max(1, int(features.prefill_chunk_size)),
+        )
+        local_runner = BatchedModelRunner(engine=engine, scheduler=scheduler, features=features, max_state_pool_size=0)
+    row = local_runner.add_request(request_id, prompt_ids, generation_config=gen_cfg)
+    out: list[int] = []
+    eos = set(int(t) for t in gen_cfg.eos_token_ids)
+    stop_ids = set(int(t) for t in gen_cfg.stop_token_ids)
+    try:
+        while len(out) < int(gen_cfg.max_new_tokens):
+            step = local_runner.execute_step(device=engine.device)
+            if step is None:
+                break
+            for token in step.tokens_by_request().get(request_id, []):
+                token_id = int(token)
+                can_stop = len(out) >= int(gen_cfg.min_new_tokens)
+                if can_stop and not gen_cfg.ignore_eos and token_id in eos:
+                    return out, int(getattr(row, "prefix_cache_hit_tokens", 0) or 0)
+                if can_stop and token_id in stop_ids:
+                    return out, int(getattr(row, "prefix_cache_hit_tokens", 0) or 0)
+                out.append(token_id)
+                if len(out) >= int(gen_cfg.max_new_tokens):
+                    return out, int(getattr(row, "prefix_cache_hit_tokens", 0) or 0)
+    finally:
+        local_runner.finish_request(request_id)
+    return out, int(getattr(row, "prefix_cache_hit_tokens", 0) or 0)
+
+
+@torch.no_grad()
+def run_batch_path_parity(
+    engine: RuntimeEngine,
+    prompt_ids: Sequence[int],
+    *,
+    features: RuntimeFeatures,
+    max_new_tokens: int,
+) -> BatchPathParityResult:
+    from .core.runtime import GenerationConfig
+
+    gen_cfg = GenerationConfig.greedy(max_new_tokens=max_new_tokens, eos_token_ids=engine.eos_token_ids())
+    target_features = features.with_overrides(speculative_decoding=False, prefix_cache=False)
+    direct_target = engine.generate_ids_greedy_gpu(prompt_ids, gen_cfg, features=target_features)
+    batch_target, _ = _batch_generate_ids_once(engine, prompt_ids, gen_cfg, target_features, request_id="target")
+
+    speculative_features = features.with_overrides(prefix_cache=False)
+    batch_spec, _ = _batch_generate_ids_once(engine, prompt_ids, gen_cfg, speculative_features, request_id="spec")
+
+    prefix_features = features.with_overrides(speculative_decoding=False, prefix_cache=True)
+    scheduler = ContinuousBatchScheduler(
+        max_num_requests=1,
+        max_num_batched_tokens=max(2, int(prefix_features.prefill_chunk_size), len(prompt_ids)),
+        prefill_chunk_size=max(1, int(prefix_features.prefill_chunk_size)),
+    )
+    runner = BatchedModelRunner(engine=engine, scheduler=scheduler, features=prefix_features, max_state_pool_size=0)
+    _batch_generate_ids_once(engine, prompt_ids, gen_cfg, prefix_features, runner=runner, request_id="prefix-warm")
+    batch_prefix, hit_tokens = _batch_generate_ids_once(
+        engine,
+        prompt_ids,
+        gen_cfg,
+        prefix_features,
+        runner=runner,
+        request_id="prefix-hit",
+    )
+
+    direct = [int(t) for t in direct_target]
+    target = [int(t) for t in batch_target]
+    spec = [int(t) for t in batch_spec]
+    prefix = [int(t) for t in batch_prefix]
+    return BatchPathParityResult(
+        prompt_tokens=len(prompt_ids),
+        max_new_tokens=int(max_new_tokens),
+        direct_target_only=direct,
+        batch_target_only=target,
+        batch_speculative=spec,
+        batch_prefix_second_hit=prefix,
+        target_only_match=direct == target,
+        speculative_match=direct == spec,
+        prefix_cache_match=direct == prefix,
+        prefix_cache_hit_tokens=int(hit_tokens),
+    )
 
 
 @torch.no_grad()
@@ -213,18 +335,16 @@ def run_recall_suite(
 
 def run_report(args: argparse.Namespace) -> CorrectnessReport:
     features = runtime_features_from_args(args)
-    engine = RuntimeEngine(
-        adapter=adapter_registry.get(args.adapter),
-        hf_model=args.hf_model,
-        qb_model=args.qb_model,
-        device=args.device,
-        recent_window=args.recent_window,
-        weight_device=args.weight_device,
-        cpu_embed=args.cpu_embed,
-        features=features,
-    )
+    engine = create_runtime_engine_from_args(args, features=features)
     parity_prompt = recall_prompt("NX-1742-ALPHA", filler_repeats=args.parity_filler_repeats)
-    parity = run_path_parity(engine, engine.encode_prompt(parity_prompt), chunk_size=args.prefill_chunk_size or features.prefill_chunk_size)
+    parity_ids = engine.encode_prompt(parity_prompt)
+    parity = run_path_parity(engine, parity_ids, chunk_size=args.prefill_chunk_size or features.prefill_chunk_size)
+    batch_parity = run_batch_path_parity(
+        engine,
+        parity_ids,
+        features=features,
+        max_new_tokens=args.batch_parity_new_tokens,
+    )
     recall = run_recall_suite(
         engine,
         features=features,
@@ -232,6 +352,7 @@ def run_report(args: argparse.Namespace) -> CorrectnessReport:
     )
     return CorrectnessReport(
         path_parity=parity,
+        batch_path_parity=batch_parity,
         recall=recall,
         require_block_prefill_parity=bool(args.require_block_prefill_parity),
     )
@@ -243,9 +364,10 @@ def main() -> None:
     add_adapter_arg(parser)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--weight-device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--recent-window", type=int, default=16384)
+    parser.add_argument("--recent-window", type=int, default=serving_recent_window_default())
     parser.add_argument("--cpu-embed", action="store_true")
     parser.add_argument("--parity-filler-repeats", type=int, default=8)
+    parser.add_argument("--batch-parity-new-tokens", type=int, default=16)
     parser.add_argument("--recall-filler-repeats", default="0,8,32")
     parser.add_argument(
         "--require-block-prefill-parity",
@@ -260,6 +382,7 @@ def main() -> None:
         "ok": report.ok,
         "require_block_prefill_parity": report.require_block_prefill_parity,
         "path_parity": asdict(report.path_parity),
+        "batch_path_parity": asdict(report.batch_path_parity),
         "recall": [asdict(case) for case in report.recall],
     }
     if args.json:
@@ -267,6 +390,7 @@ def main() -> None:
     else:
         print(f"ok={payload['ok']}")
         print("path_parity", json.dumps(payload["path_parity"], ensure_ascii=False))
+        print("batch_path_parity", json.dumps(payload["batch_path_parity"], ensure_ascii=False))
         for case in payload["recall"]:
             print("recall", json.dumps(case, ensure_ascii=False))
     raise SystemExit(0 if report.ok else 1)

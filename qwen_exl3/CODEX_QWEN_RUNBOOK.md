@@ -45,7 +45,7 @@ Why this setting:
 
 ## Required Patches
 
-These are captured in `deploy_exl3/setup_tabbyapi_exl3.sh` so the setup can be replayed.
+These are captured in `qwen_exl3/setup_tabbyapi_exl3.sh` so the setup can be replayed.
 
 1. Model config compatibility:
    - File: `/home/user/tabby-models/models/Qwen3.6-27B-exl3-3.08bpw/config.json`
@@ -54,7 +54,7 @@ These are captured in `deploy_exl3/setup_tabbyapi_exl3.sh` so the setup can be r
 
 2. Chat template no-think default and final language guard:
    - Files: `chat_template.jinja`, `tokenizer_config.json`
-   - Local source of truth: `deploy_exl3/templates/qwen3_coder_neurova_chat_template.jinja`.
+   - Local source of truth: `qwen_exl3/templates/qwen3_coder_neurova_chat_template.jinja`.
    - Default `enable_thinking` to false unless explicitly enabled.
    - Add short final-answer guard: `Final answer must be in Korean unless the user asks otherwise. Do not include Chinese text in final answer. Never end with a promise of future action; if work remains, call tools in the same reply, otherwise provide completed results.`
    - The tool instruction block also says that if the model says it will run/check/edit/verify/retry/execute, it must include the matching tool call in the same reply.
@@ -88,7 +88,7 @@ timeout 180 codex exec --ephemeral --json --sandbox read-only \
   -c model='"neurova/qwen"' \
   -c model_provider='"cliproxyapi"' \
   -c model_reasoning_effort='"low"' \
-  '도구를 사용해서 README.md, neurova/v6.py, deploy_exl3/README_TABBYAPI_EXL3.md를 확인해. 한국어로 8줄 이내로 요약해. 파일은 수정하지 마.'
+  '도구를 사용해서 README.md, qwen_memory/main.py, qwen_exl3/README_TABBYAPI_EXL3.md를 확인해. 한국어로 8줄 이내로 요약해. 파일은 수정하지 마.'
 ```
 
 Watch TabbyAPI metrics while Codex runs:
@@ -103,8 +103,8 @@ Expected explicit-Qwen complex read-only result from 2026-05-31:
 - Follow-up request: `Context: 22254`, `Generate: 46.15 T/s`, about 15 seconds.
 - 71K recovery request after restoring 100K context: `Context: 71017`, completed in about 145 seconds.
 - Output JSONL: `fffd 0`, `has_efbfbd False`.
-- Progress-only guard verification after Tabby restart: `guard_present True`; explicit Codex read-only test called `/bin/bash -lc 'head -30 deploy_exl3/CODEX_QWEN_RUNBOOK.md ...'` and completed normally.
-- Follow-up guard verification after Tabby restart: `same_reply_guard True`, `future_action_guard True`; explicit Codex test executed both `ls deploy_exl3/templates` and `pwd`, then returned final results instead of ending with `다시 실행한다`.
+- Progress-only guard verification after Tabby restart: `guard_present True`; explicit Codex read-only test called `/bin/bash -lc 'head -30 qwen_exl3/CODEX_QWEN_RUNBOOK.md ...'` and completed normally.
+- Follow-up guard verification after Tabby restart: `same_reply_guard True`, `future_action_guard True`; explicit Codex test executed both `ls qwen_exl3/templates` and `pwd`, then returned final results instead of ending with `다시 실행한다`.
 
 ## Practical Limit
 

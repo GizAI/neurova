@@ -9,10 +9,10 @@ from typing import Sequence
 
 import torch
 
-from .cli_features import add_adapter_arg, add_model_path_args
-from .core.adapter import adapter_registry
+from .cli_features import add_adapter_arg, add_model_path_args, create_runtime_engine_from_args
 from .core.batch_worker import BatchGenerationWorker, BatchGenerationHandle
 from .core.block_table import KVBlockTable
+from .core.defaults import kv_block_size_default, kv_blocks_default, serving_recent_window_default
 from .core.features import RuntimeFeatures
 from .core.model_runner import BatchedModelRunner
 from .core.runtime import GenerationConfig, RuntimeEngine
@@ -174,7 +174,7 @@ def run_single_decode_case(
 ) -> dict[str, object]:
     del timeout_s
     prompt_ids = _prompt_ids_near(engine, prompt_tokens)
-    cfg = GenerationConfig(max_new_tokens=max_new_tokens, temperature=0.0, top_k=0, eos_token_ids=())
+    cfg = GenerationConfig.greedy(max_new_tokens=max_new_tokens)
     if torch.cuda.is_available() and str(engine.device).startswith("cuda"):
         torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -207,14 +207,14 @@ def main() -> None:
     add_adapter_arg(parser)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--weight-device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--recent-window", type=int, default=16384)
+    parser.add_argument("--recent-window", type=int, default=serving_recent_window_default())
     parser.add_argument("--prompt-tokens", type=int, default=256)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--requests", default="1,2,4")
     parser.add_argument("--max-num-batched-tokens", type=int, default=256)
     parser.add_argument("--prefill-chunk-size", type=int, default=64)
-    parser.add_argument("--kv-block-size", type=int, default=16)
-    parser.add_argument("--kv-blocks", type=int, default=1024)
+    parser.add_argument("--kv-block-size", type=int, default=kv_block_size_default())
+    parser.add_argument("--kv-blocks", type=int, default=kv_blocks_default())
     parser.add_argument("--max-wait-ms", type=float, default=2.0)
     parser.add_argument("--no-paged-kv", action="store_true")
     parser.add_argument("--timeout-s", type=float, default=300.0)
@@ -222,13 +222,8 @@ def main() -> None:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    engine = RuntimeEngine(
-        adapter=adapter_registry.get(args.adapter),
-        hf_model=args.hf_model,
-        qb_model=args.qb_model,
-        device=args.device,
-        recent_window=args.recent_window,
-        weight_device=args.weight_device,
+    engine = create_runtime_engine_from_args(
+        args,
         features=RuntimeFeatures.from_profile("stateful"),
         max_state_pool_size=0,
     )

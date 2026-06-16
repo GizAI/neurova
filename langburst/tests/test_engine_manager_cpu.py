@@ -52,6 +52,8 @@ def test_server_models_endpoint_uses_manager(tmp_path: Path):
     assert "/v1/models" in route_paths
     assert "/v1/langburst/models" in route_paths
     assert "/v1/langburst/health" in route_paths
+    assert "/v1/langburst/sessions" in route_paths
+    assert "/v1/langburst/sessions/{session_id}" in route_paths
     assert "/v1/langburst/models/{model_name}" in route_paths
 
 
@@ -95,9 +97,147 @@ def test_server_non_stream_greedy_uses_batch_worker(tmp_path: Path):
     )
 
     assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "23"
+    payload = response.json()
+    assert payload["choices"][0]["message"]["content"] == "23"
+    assert payload["usage"]["prompt_tokens"] >= 1
+    assert payload["usage"]["completion_tokens"] == 2
+    assert payload["usage"]["total_tokens"] == payload["usage"]["prompt_tokens"] + 2
+    assert payload["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    assert payload["usage"]["completion_tokens_details"]["reasoning_tokens"] == 0
+    assert payload["usage"]["performance"]["e2e_tok_s"] is not None
     assert manager.health()["batch_workers"]["workers"] == 1
     assert manager.health()["batch_scheduler"]["total_scheduled_batches"] >= 1
+
+
+def test_server_reports_prefix_cache_usage_tokens(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2, kv_block_size=2),
+    )
+    client = TestClient(create_app(manager))
+    body = {
+        "model": "toy-a",
+        "messages": [{"role": "user", "content": "abc"}],
+        "max_tokens": 1,
+        "temperature": 0,
+        "prompt_cache_key": "shared-test",
+        "prefix_cache": True,
+    }
+    first = client.post("/v1/chat/completions", json=body)
+    second = client.post("/v1/chat/completions", json=body)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    assert second.json()["usage"]["prompt_tokens_details"]["cached_tokens"] >= 2
+
+
+def test_server_generation_options_are_applied_end_to_end(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2),
+    )
+    client = TestClient(create_app(manager))
+
+    biased = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "toy-a",
+            "messages": [{"role": "user", "content": "ab"}],
+            "max_tokens": 1,
+            "temperature": 0,
+            "logit_bias": {"5": 3000},
+        },
+    )
+    assert biased.status_code == 200
+    assert biased.json()["choices"][0]["message"]["content"] == "5"
+
+    stopped = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "toy-a",
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": 3,
+            "temperature": 0,
+            "stop": "2",
+        },
+    )
+    assert stopped.status_code == 200
+    assert stopped.json()["choices"][0]["message"]["content"] == "1"
+
+
+def test_server_default_chat_is_stateless_but_explicit_session_persists_state(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2, max_sessions=2),
+    )
+    client = TestClient(create_app(manager))
+
+    stateless_a = client.post(
+        "/v1/chat/completions",
+        json={"model": "toy-a", "messages": [{"role": "user", "content": "a"}], "max_tokens": 1},
+    )
+    stateless_b = client.post(
+        "/v1/chat/completions",
+        json={"model": "toy-a", "messages": [{"role": "user", "content": "b"}], "max_tokens": 1},
+    )
+    assert stateless_a.status_code == 200
+    assert stateless_b.status_code == 200
+    assert stateless_a.json()["choices"][0]["message"]["content"] == "1"
+    assert stateless_b.json()["choices"][0]["message"]["content"] == "1"
+
+    session = client.post("/v1/langburst/sessions", json={"model": "toy-a"}).json()["id"]
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "toy-a",
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": 1,
+            "session_id": session,
+        },
+    )
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "toy-a",
+            "messages": [{"role": "user", "content": "b"}],
+            "max_tokens": 1,
+            "session_id": session,
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["session_id"] == session
+    assert second.json()["session_id"] == session
+    assert first.json()["choices"][0]["message"]["content"] == "1"
+    assert second.json()["choices"][0]["message"]["content"] == "3"
+    sessions = client.get("/v1/langburst/sessions").json()
+    assert sessions["active_sessions"] == 1
+    assert sessions["sessions"][0]["turns"] == 2
+    deleted = client.delete(f"/v1/langburst/sessions/{session}").json()
+    assert deleted["deleted"] == 1
 
 
 def test_server_stream_greedy_uses_batch_worker(tmp_path: Path):
@@ -122,6 +262,7 @@ def test_server_stream_greedy_uses_batch_worker(tmp_path: Path):
             "max_tokens": 2,
             "temperature": 0,
             "stream": True,
+            "stream_options": {"include_usage": True},
         },
     ) as response:
         body = response.read().decode("utf-8")
@@ -129,6 +270,8 @@ def test_server_stream_greedy_uses_batch_worker(tmp_path: Path):
     assert response.status_code == 200
     assert '"content": "2"' in body
     assert '"content": "3"' in body
+    assert '"usage"' in body
+    assert '"completion_tokens": 2' in body
     assert "data: [DONE]" in body
     assert manager.health()["batch_workers"]["workers"] == 1
     assert manager.health()["batch_scheduler"]["total_scheduled_batches"] >= 1
@@ -224,8 +367,10 @@ def test_engine_manager_summary_is_server_contract(tmp_path: Path):
     summary = manager.summary()
     assert summary["data"][0]["id"] == "toy-a"
     assert summary["policy"]["max_queued_requests"] == 2
-    assert summary["policy"]["max_state_pool_size"] == 0
-    assert summary["policy"]["max_prompt_tokens"] == 16384
+    from langburst.core.defaults import max_prompt_tokens_default, max_state_pool_size_default
+
+    assert summary["policy"]["max_state_pool_size"] == max_state_pool_size_default()
+    assert summary["policy"]["max_prompt_tokens"] == max_prompt_tokens_default()
     assert summary["policy"]["max_generation_tokens"] == 1024
     assert summary["policy"]["max_num_batched_tokens"] == 256
     assert summary["policy"]["prefill_chunk_size"] == 64

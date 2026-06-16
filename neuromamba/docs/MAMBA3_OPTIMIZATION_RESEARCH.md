@@ -90,7 +90,7 @@ Use by default:
 
 Current user-facing default:
 
-- `./neurova.sh` uses `neuromamba/scripts/mamba3_safe_chat.py`, a model-only full-forward deterministic path, because the latest speaking checkpoint gives better answers there than the recurrent/CUDA-graph path.
+- `./neurova.sh mamba3` uses `neuromamba/scripts/mamba3_safe_chat.py`, a model-only full-forward deterministic path, because the latest speaking checkpoint gives better answers there than the recurrent/CUDA-graph path.
 - This is slower than the theoretical Mamba-3 fast path, but it avoids presenting broken fast-cache outputs as model quality.
 - `neuromamba/scripts/mamba3_decode_tune.py` is the canonical quality/speed sweep for deciding when a checkpoint is ready to switch back to recurrent/CUDA-graph decode.
 

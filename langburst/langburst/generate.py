@@ -5,9 +5,9 @@ import time
 
 import torch
 
-from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, runtime_features_from_args
-from .core.adapter import adapter_registry
-from .core.runtime import GenerationConfig, RuntimeEngine
+from .cli_features import add_adapter_arg, add_model_path_args, add_runtime_feature_args, create_runtime_engine_from_args, runtime_features_from_args
+from .core.defaults import serving_recent_window_default
+from .core.runtime import GenerationConfig
 from .core.text_stream import StreamingTextDecoder
 
 
@@ -17,7 +17,7 @@ def main() -> None:
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--system", default=None)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--recent-window", type=int, default=16384)
+    ap.add_argument("--recent-window", type=int, default=serving_recent_window_default())
     ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-k", type=int, default=0)
@@ -31,28 +31,16 @@ def main() -> None:
     args = ap.parse_args()
     features = runtime_features_from_args(args)
 
-    engine = RuntimeEngine(
-        adapter=adapter_registry.get(args.adapter),
-        hf_model=args.hf_model,
-        qb_model=args.qb_model,
-        device=args.device,
-        recent_window=args.recent_window,
-        weight_device=args.weight_device,
-        cpu_embed=args.cpu_embed,
-        features=features,
-    )
+    engine = create_runtime_engine_from_args(args, features=features)
     prompt_ids = engine.encode_prompt(args.prompt, args.system)
     eos = []
     for name in ("eos_token_id", "pad_token_id"):
         val = getattr(engine.tokenizer, name, None)
         if isinstance(val, int):
             eos.append(val)
-    gen_cfg = GenerationConfig(
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_k=args.top_k,
-        eos_token_ids=tuple(set(eos)),
-    )
+    gen_cfg = GenerationConfig.greedy(max_new_tokens=args.max_new_tokens, eos_token_ids=tuple(set(eos)))
+    gen_cfg.temperature = float(args.temperature)
+    gen_cfg.top_k = int(args.top_k)
 
     t0 = time.perf_counter()
     if args.stream:

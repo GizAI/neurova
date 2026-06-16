@@ -16,7 +16,7 @@ Run all competitors with identical prompts, sampling, context, and token budget.
 - emitted tok/s
 - MTP proposed/accepted/emitted-per-target-step
 - VRAM peak
-- exact greedy parity against HF/vLLM for first 256 generated tokens
+- exact greedy parity against reference for first 256 generated tokens
 
 ## Pass condition
 

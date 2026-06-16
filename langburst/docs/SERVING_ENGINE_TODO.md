@@ -1,6 +1,6 @@
-# LangBurst vLLM-Class Serving TODO
+# LangBurst external serving engine-Class Serving TODO
 
-This is the single backlog for vLLM/TensorRT-class LangBurst serving. Do not
+This is the single backlog for production-class LangBurst serving. Do not
 scatter performance TODOs into separate notes. Promote only changes that keep
 output/state parity and show measured benefit.
 
@@ -9,7 +9,7 @@ output/state parity and show measured benefit.
 - Status: in progress
 - SSOT: `langburst.correctness`, CPU tests, dmc8 short real-model benches
 - Required:
-  - HF/vLLM/LangBurst first-token top-k parity where a BF16 reference is feasible
+  - reference/LangBurst first-token top-k parity where a BF16 reference is feasible
   - batch=1 vs batch=N output parity
   - one-shot prefill vs chunked/block prefill state parity
   - speculative on/off greedy identity
@@ -64,7 +64,7 @@ output/state parity and show measured benefit.
   - fix paged prefill parity before enabling query_len > 1 paged prefill
   - remove ring `torch.cat` materialization from long-context non-paged fallback
   - add page refcount/copy-on-write for prefix cache
-  - add KV page zeroing/admission behavior like vLLM
+  - add KV page zeroing/admission behavior like external serving engine
 
 ## P4: Multi-User Batched Model Forward
 
@@ -86,7 +86,7 @@ output/state parity and show measured benefit.
     paged-attention timestep prefill improved TTFT to 9.44s but changed
     deterministic continuation, so it is guarded off for paged plans.
   - make speculative verify-N use the same batch model path
-  - return hidden/logit tensors in vLLM-compatible flattened form
+  - return hidden/logit tensors in batch-runtime-compatible flattened form
   - investigate batch=6 regression: runs but drops to about 40 decode tok/s;
     batch=8 OOMs on 16GB with current arena + paged KV allocation
 
@@ -147,7 +147,7 @@ output/state parity and show measured benefit.
   - fused CUDA batch verifier single hot path. Current flow has the right
     contract but can still fall back through `forward_verify_batch`,
     `forward_verify_block`, `forward_block`, or sequential target verification.
-    It is not yet one vLLM-class fused verifier path for all common cases.
+    It is not yet one production-class fused verifier path for all common cases.
   - keep `bench-auto-nextn` as the only NEXTN auto-adopt gate
   - run long-context sweeps after prefill is optimized; context=65K did not complete under a 120s smoke timeout
   - wire true batch=2 NEXTN generation through the multi-request batch verifier before benchmarking it
@@ -211,7 +211,7 @@ output/state parity and show measured benefit.
     - MTP/NEXTN
     - long prompt prefill
     - multi-user throughput
-    - vLLM/EXL3 external baseline on the same prompt/context/output-token
+    - external engine external baseline on the same prompt/context/output-token
       matrix when the target model format is available
   - keep only measured speed-positive defaults
 
@@ -256,7 +256,7 @@ output/state parity and show measured benefit.
 
 - Status: planned
 - Goal: do not optimize in isolation. Keep LangBurst measurements comparable
-  to vLLM/EXL3-style engines on the same hardware, prompt shape, context length,
+  to external-engine engines on the same hardware, prompt shape, context length,
   output length, and cache mode.
 - Required:
   - single-user decode-only baseline
