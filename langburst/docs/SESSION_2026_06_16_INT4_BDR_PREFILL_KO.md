@@ -109,7 +109,7 @@ prefix cache 기능 자체는 유지.
 파일:
 
 ```text
-langburst/scripts/start_openwebui_langburst.sh
+langburst/scripts/start_langburst.sh
 ```
 
 변경:
@@ -420,7 +420,7 @@ KV_CACHE_DTYPE=int4_bdr \
 LANGBURST_PAGED_KV=1 \
 CPU_EMBED=0 \
 LANGBURST_CPU_EMBED=0 \
-./scripts/start_openwebui_langburst.sh
+./scripts/start_langburst.sh
 ```
 
 접속:
@@ -428,5 +428,4 @@ LANGBURST_CPU_EMBED=0 \
 ```text
 OpenWebUI: http://192.168.0.47:3000/
 Backend:   http://192.168.0.47:8008/v1
-Proxy:     http://192.168.0.47:5000/v1
 ```

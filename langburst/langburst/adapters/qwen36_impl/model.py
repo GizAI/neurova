@@ -662,12 +662,6 @@ def short_prefill_sdpa_staging(
     layer: int,
     end_pos: int,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    kv_spec = getattr(state, "kv_cache_spec", None)
-    if kv_spec is not None and getattr(kv_spec, "is_int4", False):
-        cache = getattr(state, "_prefill_fp16_kv", None)
-        if cache is not None:
-            cache.pop(layer, None)
-        return None
     max_tokens = short_prefill_sdpa_tokens()
     cache = getattr(state, "_prefill_fp16_kv", None)
     if max_tokens <= 0 or int(end_pos) > max_tokens:

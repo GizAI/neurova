@@ -84,17 +84,17 @@ def test_decode_state_arena_returns_slot_views_and_recycles():
 
     arena.release(slot)
 
-    assert arena.summary() == {
-        "num_slots": 2,
-        "active_slots": 0,
-        "free_slots": 2,
-        "max_seq_len": 4,
-        "kv_num_blocks": 0,
-        "kv_block_size": 0,
-        "kv_cache_dtype": "fp16",
-        "kv_storage_head_dim": 4,
-        "paged_kv_enabled": False,
-    }
+    summary = arena.summary()
+    assert summary["num_slots"] == 2
+    assert summary["active_slots"] == 0
+    assert summary["free_slots"] == 2
+    assert summary["max_seq_len"] == 4
+    assert summary["kv_num_blocks"] == 0
+    assert summary["kv_block_size"] == 0
+    assert summary["kv_cache_dtype"] == "fp16"
+    assert summary["kv_storage_head_dim"] == 4
+    assert summary["paged_kv_enabled"] is False
+    assert "memory" in summary
     assert torch.count_nonzero(arena.gdn_states[0][slot]).item() == 0
     assert torch.count_nonzero(arena.attn_k[1][slot]).item() == 0
 
@@ -123,32 +123,34 @@ def test_batch_state_store_uses_arena_for_qwen_like_engine():
     first = store.allocate(10)
     second = store.allocate(11)
 
-    assert store.arena_summary() == {
-        "num_slots": 2,
-        "active_slots": 2,
-        "free_slots": 0,
-        "max_seq_len": 4,
-        "kv_num_blocks": 0,
-        "kv_block_size": 0,
-        "kv_cache_dtype": "int4_bdr",
-        "kv_storage_head_dim": 2,
-        "paged_kv_enabled": False,
-    }
+    summary = store.arena_summary()
+    assert summary is not None
+    assert summary["num_slots"] == 2
+    assert summary["active_slots"] == 2
+    assert summary["free_slots"] == 0
+    assert summary["max_seq_len"] == 4
+    assert summary["kv_num_blocks"] == 0
+    assert summary["kv_block_size"] == 0
+    assert summary["kv_cache_dtype"] == "int4_bdr"
+    assert summary["kv_storage_head_dim"] == 2
+    assert summary["paged_kv_enabled"] is False
+    assert "memory" in summary
     first.gdn_states[0].fill_(7)
     assert torch.equal(store.get(10).gdn_states[0], first.gdn_states[0])
     assert not torch.equal(store.get(10).gdn_states[0], second.gdn_states[0])
     store.release(10)
-    assert store.arena_summary() == {
-        "num_slots": 2,
-        "active_slots": 1,
-        "free_slots": 1,
-        "max_seq_len": 4,
-        "kv_num_blocks": 0,
-        "kv_block_size": 0,
-        "kv_cache_dtype": "int4_bdr",
-        "kv_storage_head_dim": 2,
-        "paged_kv_enabled": False,
-    }
+    summary = store.arena_summary()
+    assert summary is not None
+    assert summary["num_slots"] == 2
+    assert summary["active_slots"] == 1
+    assert summary["free_slots"] == 1
+    assert summary["max_seq_len"] == 4
+    assert summary["kv_num_blocks"] == 0
+    assert summary["kv_block_size"] == 0
+    assert summary["kv_cache_dtype"] == "int4_bdr"
+    assert summary["kv_storage_head_dim"] == 2
+    assert summary["paged_kv_enabled"] is False
+    assert "memory" in summary
 
 
 def test_decode_state_arena_uses_canonical_mirror_without_shadow_pages_by_default(monkeypatch):
@@ -252,7 +254,7 @@ def test_decode_state_arena_can_allocate_int4_bdr_paged_kv_buffers():
     assert arena.summary()["paged_kv_enabled"] is True
 
 
-def test_int4_bdr_prefill_never_allocates_fp16_sdpa_staging(monkeypatch):
+def test_short_prefill_sdpa_staging_requires_cuda(monkeypatch):
     monkeypatch.setenv("LANGBURST_SHORT_PREFILL_SDPA_TOKENS", "8192")
     state = DecodeState.allocate(
         tiny_qwen_cfg(),

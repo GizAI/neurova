@@ -815,7 +815,47 @@ class DecodeStateArena:
         state.arena_slot = slot  # type: ignore[attr-defined]
         return state
 
-    def summary(self) -> dict[str, int]:
+    @staticmethod
+    def _tensor_bytes(tensors: dict[int, torch.Tensor] | None) -> int:
+        if tensors is None:
+            return 0
+        return sum(int(t.numel() * t.element_size()) for t in tensors.values())
+
+    @staticmethod
+    def _mib(num_bytes: int) -> float:
+        return round(float(num_bytes) / 1024.0 / 1024.0, 2)
+
+    def memory_summary(self) -> dict[str, object]:
+        gdn_bytes = self._tensor_bytes(self.gdn_states)
+        conv_bytes = self._tensor_bytes(self.gdn_conv_states)
+        mirror_kv_bytes = (
+            self._tensor_bytes(self.attn_k)
+            + self._tensor_bytes(self.attn_v)
+            + self._tensor_bytes(self.attn_k_scale)
+            + self._tensor_bytes(self.attn_v_scale)
+            + self._tensor_bytes(self.attn_k_zero)
+            + self._tensor_bytes(self.attn_v_zero)
+        )
+        paged_kv_bytes = (
+            self._tensor_bytes(self.paged_attn_k)
+            + self._tensor_bytes(self.paged_attn_v)
+            + self._tensor_bytes(self.paged_attn_k_scale)
+            + self._tensor_bytes(self.paged_attn_v_scale)
+            + self._tensor_bytes(self.paged_attn_k_zero)
+            + self._tensor_bytes(self.paged_attn_v_zero)
+        )
+        total = gdn_bytes + conv_bytes + mirror_kv_bytes + paged_kv_bytes
+        return {
+            "total_mib": self._mib(total),
+            "mib_by_group": {
+                "gdn_recurrent": self._mib(gdn_bytes),
+                "gdn_conv": self._mib(conv_bytes),
+                "dense_or_mirror_kv": self._mib(mirror_kv_bytes),
+                "paged_kv": self._mib(paged_kv_bytes),
+            },
+        }
+
+    def summary(self) -> dict[str, object]:
         out = {
             "num_slots": self.num_slots,
             "active_slots": self.active_slot_count,
@@ -826,6 +866,7 @@ class DecodeStateArena:
             "kv_cache_dtype": self.kv_cache_spec.dtype,
             "kv_storage_head_dim": self.kv_layout.storage_head_dim(self.kv_cache_spec),
             "paged_kv_enabled": self.paged_kv_enabled,
+            "memory": self.memory_summary(),
         }
         if self.paged_kv_enabled:
             out["paged_kv_mirror"] = bool(next(iter(self.attn_k.values())).size(-2) > 0) if self.attn_k else False

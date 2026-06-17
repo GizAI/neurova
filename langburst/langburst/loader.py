@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,7 +20,7 @@ MARLIN_DIRECT_MAX_BATCH = DEFAULT_MARLIN_DIRECT_MAX_BATCH
 
 
 def _marlin_out_cache_policy() -> str:
-    return os.environ.get("LANGBURST_MARLIN_OUT_CACHE_POLICY", "all").strip().lower()
+    return os.environ.get("LANGBURST_MARLIN_OUT_CACHE_POLICY", "off").strip().lower()
 
 
 @dataclass
@@ -239,6 +240,58 @@ class QuantizedStore:
             raise ValueError(f"unknown tensor kind: {meta['kind']}")
         self.cache[name] = obj
         return obj
+
+    def loaded_tensor_summary(self) -> dict[str, object]:
+        counts: Counter[str] = Counter()
+        bytes_by_kind: defaultdict[str, int] = defaultdict(int)
+        bytes_by_group: defaultdict[str, int] = defaultdict(int)
+
+        def group_for(name: str) -> str:
+            low = name.lower()
+            if low.startswith("mtp."):
+                return "native_mtp"
+            if low.startswith("model.visual") or ".visual." in low or "vision" in low:
+                return "vision"
+            if "embed_tokens" in low:
+                return "text_embedding"
+            if "lm_head" in low or "output.weight" in low:
+                return "lm_head"
+            if ".layers." in low or "language_model.layers" in low:
+                return "text_layers"
+            return "other"
+
+        def add(kind: str, group: str, tensor: torch.Tensor | None) -> None:
+            if tensor is None:
+                return
+            nbytes = int(tensor.numel() * tensor.element_size())
+            bytes_by_kind[kind] += nbytes
+            bytes_by_group[group] += nbytes
+
+        for name, obj in self.cache.items():
+            group = group_for(name)
+            if isinstance(obj, LowBitTensor):
+                kind = "lowbit_symmetric_groupwise"
+                counts[kind] += 1
+                add(kind, group, obj.qweight)
+                add(kind, group, obj.scales)
+            elif isinstance(obj, LowBitMarlinTensor):
+                kind = "lowbit_marlin_groupwise"
+                counts[kind] += 1
+                add(kind, group, obj.qweight)
+                add(kind, group, obj.scales)
+                add("marlin_workspace", group, obj._workspace)
+                for out in obj._out_cache.values():
+                    add("marlin_output_cache", group, out)
+            elif isinstance(obj, FP16Tensor):
+                kind = "fp16_raw"
+                counts[kind] += 1
+                add(kind, group, obj.value)
+        return {
+            "loaded_tensors": len(self.cache),
+            "counts_by_kind": dict(counts),
+            "mib_by_kind": {k: round(v / (1024 * 1024), 2) for k, v in sorted(bytes_by_kind.items())},
+            "mib_by_group": {k: round(v / (1024 * 1024), 2) for k, v in sorted(bytes_by_group.items())},
+        }
 
     def has(self, name: str) -> bool:
         return name in self.index.get("tensors", {})

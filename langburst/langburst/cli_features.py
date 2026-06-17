@@ -100,7 +100,11 @@ def runtime_feature_override_from_args(args: argparse.Namespace) -> RuntimeFeatu
 
 
 def runtime_features_from_args(args: argparse.Namespace) -> RuntimeFeatures:
-    return RuntimeFeatures.from_profile(args.runtime_profile).with_overrides(runtime_feature_override_from_args(args))
+    features = RuntimeFeatures.from_profile(args.runtime_profile).with_overrides(runtime_feature_override_from_args(args))
+    enable_mtp = getattr(args, "enable_mtp", None)
+    if enable_mtp is not None:
+        features = features.with_overrides(speculative_decoding=bool(enable_mtp))
+    return features
 
 
 def runtime_features_from_obj(obj: object, *, base: RuntimeFeatures | None = None) -> RuntimeFeatures:

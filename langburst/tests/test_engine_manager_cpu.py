@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import langburst.adapters  # noqa: F401
 import torch
 from langburst.core.adapter import adapter_registry
+from langburst.core.features import RuntimeFeatures
 from langburst.engines.native.manager import EngineManager, EngineResourcePolicy, ModelResourceSpec
 from langburst.engines.native.runtime import GenerationConfig
 from langburst.server import create_app
@@ -450,6 +451,48 @@ def test_engine_manager_reuses_batch_runner_per_model_and_feature_plan(tmp_path:
     assert manager.health()["batch_runners"]["state_stores"]["toy-a"]["allocated_states"] == 1
     assert first.finish_request(row.request_id) is row
     assert manager.health()["batch_runners"]["state_stores"]["toy-a"]["allocated_states"] == 0
+
+
+def test_engine_manager_does_not_duplicate_runner_for_request_level_feature_flags(tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2),
+    )
+    base = RuntimeFeatures.from_profile("stateful")
+
+    first = manager.create_batch_worker("toy-a", base.with_overrides(prefix_cache=False, speculative_decoding=False))
+    second = manager.create_batch_worker("toy-a", base.with_overrides(prefix_cache=True, speculative_decoding=True))
+
+    assert first is second
+    assert manager.health()["batch_runners"]["runners"] == 1
+    assert manager.health()["batch_workers"]["workers"] == 1
+
+
+def test_batch_worker_honors_request_prefix_cache_flag_without_new_runner(tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2, kv_block_size=2),
+    )
+    base = RuntimeFeatures.from_profile("stateful")
+    worker = manager.create_batch_worker("toy-a", base.with_overrides(prefix_cache=True))
+    first = worker.submit([1, 2, 3], max_new_tokens=1, prompt_cache_key="shared", prefix_cache_enabled=True, request_id="r1")
+    assert first.wait_ids(timeout=2.0)
+    second = worker.submit([1, 2, 4], max_new_tokens=1, prompt_cache_key="shared", prefix_cache_enabled=False, request_id="r2")
+    assert second.wait_ids(timeout=2.0)
+
+    assert first.cached_input_tokens == 0
+    assert second.cached_input_tokens == 0
+    assert manager.health()["batch_runners"]["runners"] == 1
 
 
 def test_engine_manager_creates_cached_batch_worker(tmp_path: Path):

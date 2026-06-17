@@ -103,7 +103,7 @@ class ToyAdapter:
     def allocate_state(self, cfg, *, recent_window: int, device: str, features):
         return ToyState(profile=features.profile)
 
-    def encode_messages(self, tokenizer, messages):
+    def encode_messages(self, tokenizer, messages, **_kwargs):
         return tokenizer.encode("\n".join(str(m["content"]) for m in messages))
 
     def encode_prompt(self, tokenizer, prompt: str, system: str | None = None):

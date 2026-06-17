@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass, field
 import gc
-import os
 import time
 from pathlib import Path
 import json
@@ -14,15 +13,6 @@ import torch
 
 from ...core.adapter import adapter_registry
 from ...core.defaults import (
-    DEFAULT_MAX_GENERATION_TOKENS,
-    DEFAULT_MAX_BATCHED_TOKENS,
-    DEFAULT_PREFILL_CHUNK_SIZE,
-    DEFAULT_RESERVE_FREE_VRAM_MIB,
-    kv_block_size_default,
-    kv_blocks_default,
-    max_active_requests_default,
-    max_prompt_tokens_default,
-    max_state_pool_size_default,
     serving_recent_window_default,
 )
 from ...core.features import RuntimeFeatures, RuntimePlan, resolve_runtime_plan
@@ -32,6 +22,7 @@ from .runtime import RuntimeEngine
 from .scheduler import AdmissionController, ContinuousBatchScheduler
 from .block_table import KVBlockTable
 from .cuda_graph import CudaGraphBucketPlanner
+from .resource_policy import EngineResourcePolicy
 from .session_store import SessionStateRecord, SessionStateStore
 
 
@@ -92,87 +83,6 @@ class ModelResourceSpec:
         )
 
 
-@dataclass(frozen=True)
-class EngineResourcePolicy:
-    """Host-level serving policy.
-
-    LangBurst currently targets one 16GB GPU, so the safe default is one loaded
-    model and one active decode.  Larger hosts can raise these numbers without
-    changing server/request code.
-    """
-
-    max_loaded_models: int = 1
-    max_active_requests: int = field(default_factory=max_active_requests_default)
-    max_queued_requests: int = 0
-    admission_timeout_s: float | None = None
-    reserve_free_vram_mib: int = DEFAULT_RESERVE_FREE_VRAM_MIB
-    max_state_pool_size: int = field(default_factory=max_state_pool_size_default)
-    max_prompt_tokens: int | None = field(default_factory=max_prompt_tokens_default)
-    max_generation_tokens: int | None = DEFAULT_MAX_GENERATION_TOKENS
-    max_num_batched_tokens: int = DEFAULT_MAX_BATCHED_TOKENS
-    prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE
-    kv_block_size: int = field(default_factory=kv_block_size_default)
-    kv_blocks: int = field(default_factory=kv_blocks_default)
-    runtime_overhead_mib: int = field(default_factory=lambda: int(os.environ.get("LANGBURST_RUNTIME_OVERHEAD_MIB", "384")))
-    max_sessions: int = field(default_factory=lambda: int(os.environ.get("LANGBURST_MAX_SESSIONS", "16")))
-    session_ttl_s: float | None = field(
-        default_factory=lambda: (
-            None
-            if os.environ.get("LANGBURST_SESSION_TTL_S", "3600").lower() in {"0", "none", "off", "false"}
-            else float(os.environ.get("LANGBURST_SESSION_TTL_S", "3600"))
-        )
-    )
-
-    def __post_init__(self) -> None:
-        if self.max_loaded_models < 1:
-            raise ValueError("max_loaded_models must be >= 1")
-        if self.max_active_requests < 1:
-            raise ValueError("max_active_requests must be >= 1")
-        if self.max_queued_requests < 0:
-            raise ValueError("max_queued_requests must be >= 0")
-        if self.admission_timeout_s is not None and self.admission_timeout_s < 0:
-            raise ValueError("admission_timeout_s must be >= 0")
-        if self.reserve_free_vram_mib < 0:
-            raise ValueError("reserve_free_vram_mib must be >= 0")
-        if self.max_state_pool_size < 0:
-            raise ValueError("max_state_pool_size must be >= 0")
-        if self.max_prompt_tokens is not None and self.max_prompt_tokens < 1:
-            raise ValueError("max_prompt_tokens must be >= 1")
-        if self.max_generation_tokens is not None and self.max_generation_tokens < 1:
-            raise ValueError("max_generation_tokens must be >= 1")
-        if self.max_num_batched_tokens < 1:
-            raise ValueError("max_num_batched_tokens must be >= 1")
-        if self.prefill_chunk_size < 1:
-            raise ValueError("prefill_chunk_size must be >= 1")
-        if self.kv_block_size < 1:
-            raise ValueError("kv_block_size must be >= 1")
-        if self.kv_blocks < 1:
-            raise ValueError("kv_blocks must be >= 1")
-        if self.max_sessions < 0:
-            raise ValueError("max_sessions must be >= 0")
-        if self.session_ttl_s is not None and self.session_ttl_s <= 0:
-            raise ValueError("session_ttl_s must be positive when set")
-
-    def summary(self) -> dict[str, object]:
-        return {
-            "max_loaded_models": self.max_loaded_models,
-            "max_active_requests": self.max_active_requests,
-            "max_queued_requests": self.max_queued_requests,
-            "admission_timeout_s": self.admission_timeout_s,
-            "reserve_free_vram_mib": self.reserve_free_vram_mib,
-            "max_state_pool_size": self.max_state_pool_size,
-            "max_prompt_tokens": self.max_prompt_tokens,
-            "max_generation_tokens": self.max_generation_tokens,
-            "max_num_batched_tokens": self.max_num_batched_tokens,
-            "prefill_chunk_size": self.prefill_chunk_size,
-            "kv_block_size": self.kv_block_size,
-            "kv_blocks": self.kv_blocks,
-            "runtime_overhead_mib": self.runtime_overhead_mib,
-            "max_sessions": self.max_sessions,
-            "session_ttl_s": self.session_ttl_s,
-        }
-
-
 @dataclass
 class ModelRuntimeStatus:
     model_name: str
@@ -212,7 +122,7 @@ class EngineManager:
             max_queued_requests=self.policy.max_queued_requests,
             admission_timeout_s=self.policy.admission_timeout_s,
         )
-        paged_kv_enabled = os.environ.get("LANGBURST_PAGED_KV", "1").strip().lower() not in {"0", "false", "off", "no"}
+        paged_kv_enabled = _env_enabled("LANGBURST_PAGED_KV", default=True)
         self.kv_block_table = (
             KVBlockTable(
                 num_blocks=self.policy.kv_blocks,
@@ -295,12 +205,22 @@ class EngineManager:
             "batch_workers": self.batch_worker_summary(),
             "sessions": self.sessions.summary(),
             "resource": self.resource_summary(),
+            "loaded_tensor_memory": self.loaded_tensor_memory_summary(),
             "kv_blocks": self.kv_block_table.summary() if self.kv_block_table is not None else None,
             "state_pools": {
                 name: engine.state_pool_summary()
                 for name, engine in self._engines.items()
             },
         }
+
+    def loaded_tensor_memory_summary(self) -> dict[str, object]:
+        out: dict[str, object] = {}
+        for name, engine in self._engines.items():
+            store = getattr(getattr(engine, "model", None), "store", None)
+            summary = getattr(store, "loaded_tensor_summary", None)
+            if callable(summary):
+                out[name] = summary()
+        return out
 
     def resource_summary(self) -> dict[str, Any]:
         loaded = list(self._engines)
@@ -431,8 +351,8 @@ class EngineManager:
 
     def create_batch_runner(self, model_name: str | None = None, features: RuntimeFeatures | None = None) -> BatchedModelRunner:
         engine = self.get(model_name)
-        resolved = engine.resolve_plan(features).effective
-        key = (engine.model_name, tuple(sorted(resolved.summary().items())))
+        resolved = engine.resolve_plan(engine.features).effective
+        key = (engine.model_name, self._batch_resource_key(resolved))
         with self._lock:
             runner = self._batch_runners.get(key)
             if runner is None:
@@ -447,8 +367,8 @@ class EngineManager:
 
     def create_batch_worker(self, model_name: str | None = None, features: RuntimeFeatures | None = None) -> BatchGenerationWorker:
         engine = self.get(model_name)
-        resolved = engine.resolve_plan(features).effective
-        key = (engine.model_name, tuple(sorted(resolved.summary().items())))
+        resolved = engine.resolve_plan(engine.features).effective
+        key = (engine.model_name, self._batch_resource_key(resolved))
         with self._lock:
             worker = self._batch_workers.get(key)
             if worker is None:
@@ -458,6 +378,21 @@ class EngineManager:
                 )
                 self._batch_workers[key] = worker
             return worker
+
+    def _batch_resource_key(self, features: RuntimeFeatures) -> tuple[tuple[str, object], ...]:
+        """Return the resource-shape key for a model runner.
+
+        Request-level flags such as prefix cache or speculative decoding must
+        not allocate another state arena on 16GB deployments. The runner owns a
+        model's physical state/KV resources; per-request behavior is carried by
+        request rows and generation config.
+        """
+
+        return (
+            ("kv_cache_dtype", features.kv_cache_dtype),
+            ("kv_window_policy", features.kv_window_policy),
+            ("state_pool", features.state_pool),
+        )
 
     def create_session(self) -> str:
         return self.sessions.new_session_id()
@@ -479,6 +414,7 @@ class EngineManager:
                     "arena": runner.state_store.arena_summary(),
                     "reuse_pool": runner.state_store.reuse_pool_summary(),
                     "prefix_cache": runner.prefix_cache_summary(),
+                    "memory_policy": runner.memory_policy_summary(),
                 }
                 for (model_name, _), runner in self._batch_runners.items()
             },
@@ -633,3 +569,12 @@ def load_model_specs(path: Path, default_features: RuntimeFeatures) -> list[Mode
             raise ValueError("each model spec must be an object")
         specs.append(ModelResourceSpec.from_mapping(item, default_features))
     return specs
+
+
+def _env_enabled(name: str, *, default: bool) -> bool:
+    import os
+
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    return raw.strip().lower() not in {"0", "false", "off", "no"}

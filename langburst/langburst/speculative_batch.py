@@ -348,6 +348,7 @@ class DecodeRequestState:
     draft_token_ids_tensor: torch.Tensor | None = None
     prefix_cache_hit_tokens: int = 0
     prompt_cache_key: str | None = None
+    prefix_cache_enabled: bool = True
     generation_config: Any | None = None
     sample_index: int = 0
 

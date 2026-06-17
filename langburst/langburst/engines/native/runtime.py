@@ -232,7 +232,7 @@ class RuntimeEngine:
         )
         create_proposer = getattr(adapter, "create_speculative_proposer", None)
         self.speculative_proposer: SpeculativeProposer | None = (
-            create_proposer(self.model) if callable(create_proposer) else None
+            create_proposer(self.model) if self.features.speculative_decoding and callable(create_proposer) else None
         )
 
     def resolve_plan(self, features: RuntimeFeatures | None = None) -> RuntimePlan:
@@ -348,22 +348,7 @@ class RuntimeEngine:
         return self.adapter.encode_prompt(self.tokenizer, prompt, system)
 
     def encode_messages(self, messages: Sequence[dict[str, Any]], **kwargs: Any) -> list[int]:
-        if not kwargs:
-            return self.adapter.encode_messages(self.tokenizer, messages)
-        encoder = self.adapter.encode_messages
-        try:
-            signature = inspect.signature(encoder)
-        except (TypeError, ValueError):  # pragma: no cover - builtins / C funcs
-            signature = None
-        if signature is None:
-            return encoder(self.tokenizer, messages, **kwargs)
-        parameters = signature.parameters
-        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
-            return encoder(self.tokenizer, messages, **kwargs)
-        supported = {key: value for key, value in kwargs.items() if key in parameters}
-        if supported:
-            return encoder(self.tokenizer, messages, **supported)
-        return encoder(self.tokenizer, messages)
+        return self.adapter.encode_messages(self.tokenizer, messages, **kwargs)
 
     def eos_token_ids(self) -> tuple[int, ...]:
         return self.adapter.eos_token_ids(self.tokenizer)

@@ -14,6 +14,7 @@ from ..base import (
     EngineUsage,
     resolve_engine_feature_plan,
 )
+from ...core.chat_template import resolve_chat_template_kwargs
 from .bridge import (
     VLLMConversationStore,
     build_vllm_bridge_config,
@@ -68,20 +69,12 @@ def _sampling_kwargs(params: EngineSamplingParams) -> dict[str, Any]:
 
 
 def _chat_template_kwargs(request: EngineChatRequest, spec: EngineModelSpec) -> dict[str, Any]:
-    out: dict[str, Any] = {"enable_thinking": True}
     configured = spec.extra.get("chat_template_kwargs")
-    if isinstance(configured, dict):
-        out.update(configured)
     raw = request.raw_request
-    request_kwargs = getattr(raw, "chat_template_kwargs", None) if raw is not None else None
-    if isinstance(request_kwargs, dict):
-        out.update(request_kwargs)
-    reasoning_effort = getattr(raw, "reasoning_effort", None) if raw is not None else None
-    if reasoning_effort == "none":
-        out["enable_thinking"] = False
-    elif reasoning_effort is not None:
-        out["enable_thinking"] = True
-    return out
+    return resolve_chat_template_kwargs(
+        raw,
+        base=configured if isinstance(configured, dict) else None,
+    )
 
 
 class VLLMBackend:

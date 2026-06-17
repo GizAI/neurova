@@ -7,9 +7,10 @@ native remains a first-class runtime, not a compatibility shim.
 
 from .batch_worker import BatchGenerationHandle, BatchGenerationWorker
 from .block_table import KVBlockTable
-from .manager import EngineManager, EngineResourcePolicy, ModelResourceSpec, load_model_specs
+from .manager import EngineManager, ModelResourceSpec, load_model_specs
 from .model_runner import BatchedModelRunner
 from .provider import NativeBackend, NativeProvider
+from .resource_policy import EngineResourcePolicy
 from .runtime import GenerationConfig, RuntimeEngine, sample_next, sample_next_tensor
 from .scheduler import AdmissionController, ContinuousBatchScheduler
 

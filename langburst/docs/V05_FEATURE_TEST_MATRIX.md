@@ -75,15 +75,15 @@ Current result:
 OpenWebUI container `neurova-open-webui` is configured with:
 
 ```text
-OPENAI_API_BASE_URL=http://host.docker.internal:5000/v1
+OPENAI_API_BASE_URL=http://host.docker.internal:8008/v1
 OPENAI_API_KEY=...
 ```
 
-LangBurst runs on host port `8008`, and a lightweight `socat` bridge exposes it
-on host port `5000` for OpenWebUI:
+LangBurst runs on host port `8008` and exposes the OpenAI-compatible API
+directly:
 
 ```bash
-./scripts/start_openwebui_langburst.sh
+./scripts/start_langburst.sh
 ```
 
 Expected model:

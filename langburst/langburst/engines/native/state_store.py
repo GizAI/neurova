@@ -129,7 +129,7 @@ class BatchStateStore:
             active_state_indices=tuple(sorted(self._states)),
         )
 
-    def arena_summary(self) -> dict[str, int] | None:
+    def arena_summary(self) -> dict[str, object] | None:
         return self._arena.summary() if self._arena is not None else None
 
     def reuse_pool_summary(self) -> dict[str, int]:

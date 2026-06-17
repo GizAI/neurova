@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import statistics
-import os
 import queue
 import threading
 import time
 import uuid
 from typing import Any, Sequence
 
+from .cuda_memory import CudaMemoryPolicy
 from .model_runner import BatchedModelRunner
 from .runtime import GenerationConfig
 
@@ -50,6 +50,7 @@ class BatchGenerationHandle:
     generation_config: GenerationConfig = field(default_factory=GenerationConfig)
     prompt_tokens: int = 0
     prompt_cache_key: str | None = None
+    prefix_cache_enabled: bool = True
     session_record: Any | None = None
     stop_sequences: tuple[tuple[int, ...], ...] = ()
     include_stop_str_in_output: bool = False
@@ -240,6 +241,7 @@ class BatchGenerationWorker:
         self._pending: queue.Queue[tuple[BatchGenerationHandle, list[int]]] = queue.Queue()
         self._active: dict[str, BatchGenerationHandle] = {}
         self._completed: list[dict[str, float | int | str | None]] = []
+        self._cuda_memory_policy = CudaMemoryPolicy.from_env()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="langburst-batch-worker", daemon=True)
         self._thread.start()
@@ -252,6 +254,7 @@ class BatchGenerationWorker:
         eos_token_ids: tuple[int, ...] = (),
         generation_config: GenerationConfig | None = None,
         prompt_cache_key: str | None = None,
+        prefix_cache_enabled: bool = True,
         session_record: Any | None = None,
         stop_sequences: tuple[tuple[int, ...], ...] = (),
         include_stop_str_in_output: bool = False,
@@ -268,6 +271,7 @@ class BatchGenerationWorker:
             generation_config=generation_config or GenerationConfig(),
             prompt_tokens=len(prompt_ids),
             prompt_cache_key=prompt_cache_key,
+            prefix_cache_enabled=bool(prefix_cache_enabled),
             session_record=session_record,
             stop_sequences=tuple(tuple(int(t) for t in seq) for seq in stop_sequences),
             include_stop_str_in_output=bool(include_stop_str_in_output),
@@ -411,6 +415,7 @@ class BatchGenerationWorker:
                 prompt_ids,
                 generation_config=handle.generation_config,
                 prompt_cache_key=handle.prompt_cache_key,
+                prefix_cache_enabled=handle.prefix_cache_enabled,
                 external_state=external_state,
                 release_callback=release_callback,
             )
@@ -468,19 +473,8 @@ class BatchGenerationWorker:
                 self._cancel_active(req_id, handle)
 
     def _release_idle_cuda_cache(self) -> None:
-        if self._active:
-            return
-        if os.environ.get("LANGBURST_EMPTY_CACHE_AFTER_REQUEST", "1").strip().lower() in {"0", "false", "off", "no"}:
-            return
         try:
-            import gc
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+            self._cuda_memory_policy.release_idle_cache(active_requests=len(self._active))
         except Exception:
             pass
 

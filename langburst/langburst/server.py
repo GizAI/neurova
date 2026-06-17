@@ -22,16 +22,9 @@ from .cli_features import (
     runtime_features_from_obj,
 )
 from .core.defaults import (
-    DEFAULT_MAX_BATCHED_TOKENS,
-    DEFAULT_MAX_GENERATION_TOKENS,
-    DEFAULT_MAX_STATE_POOL_SIZE,
-    DEFAULT_PREFILL_CHUNK_SIZE,
-    DEFAULT_RESERVE_FREE_VRAM_MIB,
-    kv_block_size_default,
-    kv_blocks_default,
-    max_prompt_tokens_default,
     serving_recent_window_default,
 )
+from .core.chat_template import resolve_chat_template_kwargs
 from .core.features import RuntimeFeatures
 from .core.platform import PLATFORM_NAME
 from .core.text_stream import StreamingTextDecoder
@@ -162,16 +155,7 @@ def _request_messages(req: ChatCompletionRequest) -> list[dict[str, Any]]:
 
 
 def _chat_template_kwargs(req: ChatCompletionRequest) -> dict[str, Any]:
-    out: dict[str, Any] = {"enable_thinking": True}
-    if isinstance(req.chat_template_kwargs, dict):
-        out.update(req.chat_template_kwargs)
-    if req.enable_thinking is not None:
-        out["enable_thinking"] = bool(req.enable_thinking)
-    if req.reasoning_effort == "none":
-        out["enable_thinking"] = False
-    elif req.reasoning_effort is not None:
-        out["enable_thinking"] = True
-    return out
+    return resolve_chat_template_kwargs(req)
 
 
 def _model_uses_visible_thinking(model_name: str | None) -> bool:
@@ -179,7 +163,7 @@ def _model_uses_visible_thinking(model_name: str | None) -> bool:
 
 
 def _thinking_visible_prefix(req: ChatCompletionRequest, model_name: str | None = None) -> str:
-    if _model_uses_visible_thinking(model_name or req.model) and bool(_chat_template_kwargs(req).get("enable_thinking", True)):
+    if _model_uses_visible_thinking(model_name or req.model) and _chat_template_kwargs(req)["enable_thinking"]:
         return "<think>\n"
     return ""
 
@@ -263,7 +247,7 @@ def _request_feature_overrides(req: ChatCompletionRequest, base: RuntimeFeatures
 def _native_generation_config(engine, req: ChatCompletionRequest) -> GenerationConfig:
     request_suppress = tuple(int(t) for t in (req.suppress_tokens or []) + (req.begin_suppress_tokens or []))
     template_kwargs = _chat_template_kwargs(req)
-    default_suppress = () if bool(template_kwargs.get("enable_thinking", True)) else _default_suppress_tokens(engine)
+    default_suppress = () if template_kwargs["enable_thinking"] else _default_suppress_tokens(engine)
     return GenerationConfig(
         max_new_tokens=_requested_generation_tokens(req),
         min_new_tokens=_requested_min_generation_tokens(req),
@@ -386,6 +370,7 @@ def create_app(manager: EngineManager):
                         eos_token_ids=gen_cfg.eos_token_ids,
                         generation_config=gen_cfg,
                         prompt_cache_key=req.prompt_cache_key,
+                        prefix_cache_enabled=features.prefix_cache,
                         session_record=session_record,
                         stop_sequences=stop_sequences,
                         include_stop_str_in_output=req.include_stop_str_in_output,
@@ -481,6 +466,7 @@ def create_app(manager: EngineManager):
                     eos_token_ids=gen_cfg.eos_token_ids,
                     generation_config=gen_cfg,
                     prompt_cache_key=req.prompt_cache_key,
+                    prefix_cache_enabled=features.prefix_cache,
                     session_record=session_record,
                     stop_sequences=stop_sequences,
                     include_stop_str_in_output=req.include_stop_str_in_output,
@@ -714,20 +700,22 @@ def main() -> None:
     ap.add_argument("--weight-device", choices=("auto", "cpu", "cuda"), default="auto")
     ap.add_argument("--cpu-embed", action="store_true")
     add_adapter_arg(ap)
-    ap.add_argument("--max-loaded-models", type=int, default=1)
-    ap.add_argument("--max-active-requests", type=int, default=1)
-    ap.add_argument("--max-queued-requests", type=int, default=0)
-    ap.add_argument("--admission-timeout-s", type=float, default=None)
-    ap.add_argument("--reserve-free-vram-mib", type=int, default=DEFAULT_RESERVE_FREE_VRAM_MIB)
-    ap.add_argument("--max-state-pool-size", type=int, default=DEFAULT_MAX_STATE_POOL_SIZE)
-    ap.add_argument("--max-prompt-tokens", type=int, default=max_prompt_tokens_default())
-    ap.add_argument("--max-generation-tokens", type=int, default=DEFAULT_MAX_GENERATION_TOKENS)
-    ap.add_argument("--max-num-batched-tokens", type=int, default=DEFAULT_MAX_BATCHED_TOKENS)
-    ap.add_argument("--batch-prefill-chunk-size", type=int, default=DEFAULT_PREFILL_CHUNK_SIZE)
-    ap.add_argument("--kv-block-size", type=int, default=kv_block_size_default())
-    ap.add_argument("--kv-blocks", type=int, default=kv_blocks_default())
-    ap.add_argument("--max-sessions", type=int, default=int(os.environ.get("LANGBURST_MAX_SESSIONS", "16")))
-    ap.add_argument("--session-ttl-s", type=float, default=float(os.environ.get("LANGBURST_SESSION_TTL_S", "3600")))
+    resource_defaults = EngineResourcePolicy.from_env()
+    ap.add_argument("--max-loaded-models", type=int, default=resource_defaults.max_loaded_models)
+    ap.add_argument("--max-active-requests", type=int, default=resource_defaults.max_active_requests)
+    ap.add_argument("--max-queued-requests", type=int, default=resource_defaults.max_queued_requests)
+    ap.add_argument("--admission-timeout-s", type=float, default=resource_defaults.admission_timeout_s)
+    ap.add_argument("--reserve-free-vram-mib", type=int, default=resource_defaults.reserve_free_vram_mib)
+    ap.add_argument("--max-state-pool-size", type=int, default=resource_defaults.max_state_pool_size)
+    ap.add_argument("--max-prompt-tokens", type=int, default=resource_defaults.max_prompt_tokens)
+    ap.add_argument("--max-generation-tokens", type=int, default=resource_defaults.max_generation_tokens)
+    ap.add_argument("--max-num-batched-tokens", type=int, default=resource_defaults.max_num_batched_tokens)
+    ap.add_argument("--batch-prefill-chunk-size", type=int, default=resource_defaults.prefill_chunk_size)
+    ap.add_argument("--kv-block-size", type=int, default=resource_defaults.kv_block_size)
+    ap.add_argument("--kv-blocks", type=int, default=resource_defaults.kv_blocks)
+    ap.add_argument("--runtime-overhead-mib", type=int, default=resource_defaults.runtime_overhead_mib)
+    ap.add_argument("--max-sessions", type=int, default=resource_defaults.max_sessions)
+    ap.add_argument("--session-ttl-s", type=float, default=0.0 if resource_defaults.session_ttl_s is None else resource_defaults.session_ttl_s)
     ap.add_argument("--models-json", type=Path, default=None)
     add_runtime_feature_args(ap)
     args = ap.parse_args()
@@ -758,6 +746,7 @@ def main() -> None:
                     prefill_chunk_size=args.batch_prefill_chunk_size,
                     kv_block_size=args.kv_block_size,
                     kv_blocks=args.kv_blocks,
+                    runtime_overhead_mib=args.runtime_overhead_mib,
                     max_sessions=args.max_sessions,
                     session_ttl_s=None if args.session_ttl_s <= 0 else args.session_ttl_s,
                 ),

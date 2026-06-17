@@ -7,9 +7,10 @@ from typing import Any, Sequence
 import torch
 
 from .qwen36_impl.config import Qwen36_27B_TextConfig
-from ..core.kv_cache import KVCacheLayout, KVCacheSpec
 from ..core.adapter import AdapterDescriptor, adapter_registry
+from ..core.chat_template import resolve_chat_template_kwargs
 from ..core.features import RuntimeCapabilities, RuntimeFeatures
+from ..core.kv_cache import KVCacheLayout, KVCacheSpec
 from ..core.platform import resolve_index_file
 from ..loader import QuantizedStore
 from .qwen36_impl.model import Qwen36Model
@@ -197,8 +198,9 @@ class Qwen36Adapter:
     def encode_messages(self, tokenizer, messages: Sequence[dict[str, Any]], **kwargs: Any) -> list[int]:
         payload = [{"role": m.get("role", "user"), "content": _content_to_text(m.get("content", ""))} for m in messages]
         if hasattr(tokenizer, "apply_chat_template"):
-            chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
-            chat_template_kwargs.setdefault("enable_thinking", True)
+            chat_template_kwargs = resolve_chat_template_kwargs(
+                base=kwargs.get("chat_template_kwargs") or None
+            )
             try:
                 encoded = tokenizer.apply_chat_template(
                     payload,

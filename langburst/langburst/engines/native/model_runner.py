@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import gc
-import os
 from typing import Any, Sequence
 
 import torch
@@ -10,6 +8,8 @@ import torch
 from .runtime import GenerationConfig, RuntimeEngine, sample_next
 from .scheduler import ContinuousBatchScheduler
 from ...core.features import RuntimeFeatures
+from .cuda_memory import CudaMemoryPolicy
+from .kv_policy import KVCachePolicy
 from .prefix_cache import RadixPrefixCache
 from .state_store import BatchStateStore
 from ...speculation import DraftRequest
@@ -64,11 +64,12 @@ class BatchedModelRunner:
             kv_block_size=kv_block_size,
         )
         block_table = self.scheduler.block_table
-        self.prefix_cache = RadixPrefixCache(
+        self.kv_cache_policy = KVCachePolicy.from_env(
             enabled=bool(self.features.prefix_cache),
-            min_prefix_tokens=max(1, int(block_table.block_size if block_table is not None else 16)),
-            release_blocks=block_table.release_pinned_blocks if block_table is not None else None,
+            block_table=block_table,
         )
+        self.prefix_cache = RadixPrefixCache(**self.kv_cache_policy.prefix_cache_kwargs(block_table=block_table))
+        self.cuda_memory_policy = CudaMemoryPolicy.from_env()
         self.speculative_policy = engine.resolve_policy(self.features).speculative
 
     def add_request(
@@ -78,12 +79,14 @@ class BatchedModelRunner:
         *,
         generation_config: GenerationConfig | None = None,
         prompt_cache_key: str | None = None,
+        prefix_cache_enabled: bool = True,
         external_state: object | None = None,
         release_callback: object | None = None,
     ) -> DecodeRequestState:
         row = self.scheduler.add_request(request_id, token_ids)
         row.generation_config = generation_config or GenerationConfig()
         row.prompt_cache_key = prompt_cache_key
+        row.prefix_cache_enabled = bool(prefix_cache_enabled)
         try:
             if external_state is None:
                 state = self.state_store.allocate(row.state_index)
@@ -281,26 +284,8 @@ class BatchedModelRunner:
             rejected_counts[row_idx] = decision.rejected_count
 
     def _trim_cuda_cache_after_request(self) -> None:
-        raw = os.environ.get(
-            "LANGBURST_TRIM_CACHE_AFTER_REQUEST",
-            os.environ.get("LANGBURST_TRIM_CACHE_DURING_PREFILL", "1"),
-        ).strip().lower()
-        if raw in {"0", "false", "off", "no"}:
-            return
-        if not torch.cuda.is_available():
-            return
-        threshold_raw = os.environ.get("LANGBURST_TRIM_CACHE_FREE_BELOW_MIB", "768").strip()
-        try:
-            free_below_mib = int(threshold_raw)
-        except ValueError as exc:
-            raise ValueError("LANGBURST_TRIM_CACHE_FREE_BELOW_MIB must be an integer MiB value") from exc
-        if free_below_mib > 0:
-            free_bytes, _total_bytes = torch.cuda.mem_get_info()
-            if free_bytes >= free_below_mib * 1024 * 1024:
-                return
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        active_requests = self.scheduler.stats().active_requests
+        self.cuda_memory_policy.release_idle_cache(active_requests=active_requests)
 
     def _row(self, request_id: str) -> DecodeRequestState:
         row = self.scheduler.get_request(request_id)
@@ -313,8 +298,16 @@ class BatchedModelRunner:
         self.state_store.clear()
         self.prefix_cache.clear()
 
-    def prefix_cache_summary(self) -> dict[str, int]:
-        return self.prefix_cache.stats().summary()
+    def prefix_cache_summary(self) -> dict[str, object]:
+        summary: dict[str, object] = self.prefix_cache.stats().summary()
+        summary["policy"] = self.kv_cache_policy.summary()
+        return summary
+
+    def memory_policy_summary(self) -> dict[str, object]:
+        return {
+            "kv_cache": self.kv_cache_policy.summary(),
+            "cuda_cache": self.cuda_memory_policy.summary(),
+        }
 
     def _max_reusable_prefix_len(self, token_count: int) -> int:
         if token_count <= 1:
@@ -326,6 +319,8 @@ class BatchedModelRunner:
         return max(0, int(max_len))
 
     def _apply_prefix_cache(self, row: DecodeRequestState, state: object) -> None:
+        if not bool(getattr(row, "prefix_cache_enabled", True)):
+            return
         max_prefix_len = self._max_reusable_prefix_len(len(row.token_ids))
         if max_prefix_len <= 0:
             return
@@ -357,6 +352,8 @@ class BatchedModelRunner:
         for row, state, did_prefill in zip(rows, states, was_prefilling):
             if not did_prefill or row.computed_tokens <= 0:
                 continue
+            if not bool(getattr(row, "prefix_cache_enabled", True)):
+                continue
             prefix_len = int(row.computed_tokens)
             if int(row.prefix_cache_hit_tokens) >= prefix_len:
                 continue
@@ -364,6 +361,13 @@ class BatchedModelRunner:
                 continue
             fork = getattr(state, "fork", None)
             if not callable(fork):
+                continue
+            decision = self.kv_cache_policy.admit_prefix_store(
+                prefix_len=prefix_len,
+                block_table=block_table,
+            )
+            if not decision.allowed:
+                self.prefix_cache.clear()
                 continue
             block_ids: tuple[int, ...] = ()
             if block_table is not None:
