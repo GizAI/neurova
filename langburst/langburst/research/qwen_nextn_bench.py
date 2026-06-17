@@ -21,8 +21,9 @@ from ..speculation import (
     SpeculativeDecodeResult,
     SpeculativeDecodeStats,
     SpeculativeProbeResult,
+    TargetVerification,
 )
-from ..speculative_verifier import NativeNextNVerifier, VerifierMode
+from .speculative_verifier import NativeNextNVerifier, VerifierMode
 
 QWEN_NEXTN_ADAPTER_ID = "qwen36"
 
@@ -103,6 +104,35 @@ def _target_decode_from_prefill(
 
 
 @torch.no_grad()
+def _research_verify_nextn_tokens(
+    engine: RuntimeEngine,
+    token_ids: Iterable[int],
+    state: object,
+    num_candidates: int,
+) -> TargetVerification:
+    token_list = [int(t) for t in token_ids]
+    if not token_list:
+        raise ValueError("verify batch requires at least one token")
+    if num_candidates < 0 or num_candidates >= len(token_list):
+        raise ValueError("num_candidates must be in [0, len(token_ids) - 1]")
+    forward_block = getattr(engine.model, "forward_block")
+    result = forward_block(
+        token_list,
+        state,
+        return_logits=True,
+        logits_mode="all",
+        commit=True,
+    )
+    if not result.logits or len(result.logits) <= num_candidates:
+        raise RuntimeError("research verifier did not return enough logits")
+    check_logits = torch.stack([result.logits[i].contiguous() for i in range(num_candidates)], dim=0)
+    target_ids = torch.argmax(check_logits, dim=-1).to(device=check_logits.device, dtype=torch.long)
+    raw_hiddens = getattr(result, "final_hiddens", None) or getattr(result, "raw_hiddens", None)
+    raw_hidden = raw_hiddens[-1] if raw_hiddens else result.logits[-1]
+    return TargetVerification(target_ids=target_ids, logits=result.logits[-1], raw_hidden=raw_hidden)
+
+
+@torch.no_grad()
 def _generate_native_nextn_from_prefill(
     engine: RuntimeEngine,
     *,
@@ -135,7 +165,12 @@ def _generate_native_nextn_from_prefill(
         sample_next=lambda current_logits: sample_next_tensor(current_logits, cfg),
         max_draft=policy.max_draft,
         mode=policy.verifier_mode,  # type: ignore[arg-type]
-        verify_tokens=engine.verify_nextn_tokens,
+        verify_tokens=lambda token_ids, verify_state, num_candidates: _research_verify_nextn_tokens(
+            engine,
+            token_ids,
+            verify_state,
+            num_candidates,
+        ),
     )
     _sync_if_cuda()
     t0 = time.perf_counter()
@@ -422,24 +457,21 @@ def generate_native_nextn_timed(
 ) -> tuple[SpeculativeDecodeResult, float]:
     if not isinstance(engine.model, Qwen36Model):
         raise TypeError("native_mtp1 currently supports Qwen36Model only")
-    _sync_if_cuda()
-    t0 = time.perf_counter()
-    policy = RuntimePolicyResolver().speculative_policy(
+    if adaptive:
+        raise ValueError("research verifier timing does not implement adaptive fallback; use serving batch metrics")
+    features = engine.features.with_overrides(speculative_decoding=True)
+    state = engine.new_state(features)
+    logits, raw_hidden = engine._prefill_with_raw_hidden([int(t) for t in prompt_ids], state, features)
+    return _run_nextn_from_prefill(
+        engine,
+        base_state=state,
+        logits=logits,
+        raw_hidden=raw_hidden,
+        max_new_tokens=max_new_tokens,
         max_draft=max_draft,
         verifier_mode=verifier_mode,
-        adaptive=adaptive,
-        min_verified=min_verified,
-        accept_threshold=accept_threshold,
-        max_rejections=max_rejections,
-        min_speedup=min_speedup,
+        min_speedup=min_speedup or RuntimePolicyResolver().speculative_policy().min_speedup,
     )
-    result = engine.generate_native_nextn_result(
-        prompt_ids,
-        GenerationConfig(max_new_tokens=max_new_tokens),
-        policy=policy,
-    )
-    _sync_if_cuda()
-    return result, time.perf_counter() - t0
 
 
 def benchmark_result_from_run(

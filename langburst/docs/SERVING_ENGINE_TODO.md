@@ -97,11 +97,19 @@ output/state parity and show measured benefit.
 - Done:
   - GDN recurrent kernel reads/writes `[slot, layer, ...]` by `state_indices`
   - GDN conv update reads/writes arena conv buffers by `state_indices`
+  - speculative commit-aware CUDA kernels are implemented and registered:
+    `gdn_recurrent_ab_spec`, `depthwise_conv_update_spec`
   - attention decode reads paged/block KV by `block_tables/slot_mapping`
+  - speculative INT4/BDR paged KV append is implemented and registered:
+    `attention_append_paged_int4_spec`
   - no Python loop over requests in hot decode
   - fixed real Qwen shape GDN batch output drift at `kv_heads=16`, `v_heads=48`
   - dmc8 deterministic batch=2 runner: batch-state ON token-identical to eager path
   - dmc8 speed: 17.46 tok/s -> 20.35 tok/s on the short batch=2 parity prompt
+  - 2026-06-17 dmc8 CUDA extension build and kernel tests:
+    `tests/test_v05_cuda_kernels.py tests/test_sampling_cuda.py
+    tests/test_speculative_batch_cpu.py tests/test_model_runner_cpu.py
+    tests/test_adapter_runtime_cpu.py tests/test_speculative_cpu.py`: 77 passed
 - Remaining:
   - broaden parity prompts and longer generation lengths
   - keep monitoring paged KV + batch-state together under long-context tests
@@ -129,11 +137,22 @@ output/state parity and show measured benefit.
   - graph capture for decode1 first
   - graph capture for verify-N after speculative verifier is batch-safe
   - eager vs graph token/state parity
+- Current blockers:
+  - `CudaGraphBucketPlanner` only selects static buckets; there is no
+    `torch.cuda.CUDAGraph` capture/replay hot path yet.
+  - verifier and decode still update Python-visible `DecodeState.pos/kv_len`.
+  - hot paths still allocate dynamic tensors and perform scalar CPU handoff for
+    output/state metadata.
 
 ## P8: Native MTP / NEXTN Speculative Decode
 
-- Status: auto-gated adaptive path with model-side batch verifier
-- SSOT: `RuntimeEngine.generate_decode_result`, `RuntimeEngine.verify_nextn_tokens`, `langburst.adapters.qwen36_mtp`, `langburst.research.qwen_nextn_bench_verifier`, `Qwen36Model.forward_verify_batch`
+- Status: partially implemented, not speed-positive on current native Q3
+  serving path
+- SSOT: production serving should be
+  `NativeSpecDecodeMetadata -> resolve_speculative_gpu -> Qwen36Model.forward_verify_batch`.
+  Legacy `NativeNextNVerifier` and the object/reference reducers are now under
+  `langburst.research` and are not called by the production runtime or batch
+  runner path.
 - Current measurement:
   - dmc8 short suite: identity true, average speedup about 1.09x for MTP1
   - dmc8 decode-only smoke, context=256, draft=4/6/8/10:
@@ -143,12 +162,51 @@ output/state parity and show measured benefit.
     - draft=8: 11.6 tok/s, 0.29x, identity true
     - draft=10: 10.3 tok/s, 0.25x, identity true
     - decision: do not promote larger draft counts
+  - 2026-06-17, dmc8, Qwen3.6-27B Q3, context=32K, max_new=256,
+    `ENABLE_MTP=1`, `num_speculative_tokens=1`:
+    - MTP actually verified after fixing the suppress-token gate.
+    - accepted draft tokens: 15 / 32, accept rate 46.9%
+    - decode: about 23.3 tok/s
+    - speculative path EMA: about 63.9 ms/output token vs baseline about
+      39.2 ms/token
+    - decision: current native Q3 MTP remains auto-disabled by speed gate
+      after warmup; it is correct to keep measuring but not to claim 100 tok/s.
+- Implemented and build-validated on ml-dmc8:
+  - `_forward_verify_batch_uniform_hot` now runs a single target verifier pass
+    and records per-token GDN/conv state trajectory plus attention candidate
+    K/V.  After `resolve_speculative_gpu` returns `commit_tokens[B]`, the
+    selected prefix state is copied into the live arena and committed K/V is
+    appended once.  The second target layer pass was removed.
+  - GDN/conv trajectory CUDA entry points are present in csrc and pybind, with
+    preallocated out-buffer variants for the production verifier:
+    `gdn_recurrent_ab_spec_trajectory_out` and
+    `depthwise_conv_update_spec_trajectory_out`.
+  - `pos/kv_len` serving progress is represented by arena device tensors and
+    verifier state progress uses `arena.advance_slots(...)`, not per-row
+    Python `finish_token()` calls.
+  - CUDA Graph capture/replay scaffolding now has an executable cache keyed by
+    static shape and buffer signatures.  The verifier graph path is wired for
+    explicit `LANGBURST_CUDA_GRAPH=1`, with stateful warmup disabled to avoid
+    double-advancing counters.
+  - 2026-06-17 ml-dmc8 validation:
+    - `pip install -v --no-build-isolation -e .` with CUDA 13 / SM89 succeeded.
+    - CUDA kernel tests: `tests/test_v05_cuda_kernels.py`,
+      `tests/test_sampling_cuda.py`, `tests/test_gdn_parity_cuda.py` passed
+      23/23.
+    - CPU contract tests passed 66/67 with one CUDA-graph CPU skip:
+      `test_model_runner_cpu.py`, `test_speculative_batch_cpu.py`,
+      `test_adapter_runtime_cpu.py`, `test_cuda_graph_cpu.py`,
+      `test_state_arena_cpu.py`, `test_block_table_cpu.py`.
 - Remaining:
-  - fused CUDA batch verifier single hot path. Current flow has the right
-    contract but can still fall back through `forward_verify_batch`,
-    `forward_verify_block`, `forward_block`, or sequential target verification.
-    It is not yet one production-class fused verifier path for all common cases.
-  - keep `bench-auto-nextn` as the only NEXTN auto-adopt gate
+  - finish page refcount/COW transaction semantics for prefix-cache sharing.
+    The verifier now truncates speculative tail blocks to committed length, but
+    shared prefix pages still need copy-on-write at mutation boundaries.
+  - keep `bench-auto-nextn` as the external NEXTN auto-adopt gate and require
+    speed-positive measurements before enabling larger K in deployment.
+  - extend K-candidate champion selection from per-K acceptance/latency EMA to
+    prompt-class aware profiles.  The runtime now tracks per-K
+    `speculative_ms_per_output_token_ema` and picks only speed-positive
+    candidates relative to baseline EMA.
   - run long-context sweeps after prefill is optimized; context=65K did not complete under a 120s smoke timeout
   - wire true batch=2 NEXTN generation through the multi-request batch verifier before benchmarking it
   - full probabilistic rejection sampling for temperature/top-p
@@ -164,10 +222,24 @@ output/state parity and show measured benefit.
     dmc8 worker benchmark; remaining gap vs direct target-only decode is in the
     serving/state/paged forward path and full-logits materialization
 - Required:
+  - fixed decode-critical-path profile for batch=1/2/4 before every decode
+    optimization pass:
+    - `mlp_gate_up`, `mlp_down`, `gdn_qkvz`, `gdn_out`, `gdn_ba`,
+      `lm_head`, `sampling`, `CPU sync`, `cache_update`
+    - kernel/path tags: Marlin direct, Marlin row-loop fallback,
+      temporary dequant/allocation, output-cache hit/miss
+    - basis labels: target-only, MTP K=1, MTP K=2 candidate, serving worker
+      vs direct adapter microprofile
   - fused greedy argmax/top-k for 248K vocab
   - avoid materializing full logits when only argmax is needed
   - candidate-limited projection for verifier where mathematically valid
   - GPU-only EOS/sampling postprocess
+- Current decode target:
+  - near-term: batch=1, K=1, 40-45 tok/s; stretch 50 tok/s
+  - serving target: batch=4 aggregate 100-120 tok/s while preserving
+    fresh-prefill throughput near the 1000 tok/s class
+  - single-request 70-100 tok/s requires deeper fused GDN/MLP/lm_head work and
+    must not be claimed without direct measurement
 
 ## P10: Prefix / State Cache
 
@@ -203,6 +275,8 @@ output/state parity and show measured benefit.
 
 - Status: in progress
 - Required:
+  - `qwen36_tools.profile` must support decode batch sizes 1/2/4 and report
+    per-module timing plus Marlin direct/fallback/cache counters
   - Nsight Systems: launch gaps, CPU sync, stream idle
   - Nsight Compute: Marlin occupancy, tensor core utilization, bandwidth, GDN occupancy
   - standard dmc8 benchmark suite:
@@ -284,13 +358,22 @@ output/state parity and show measured benefit.
 
 Highest ROI order:
 
-1. P4 batch prefill/query_len > 1 through one model forward. This attacks TTFT,
-   currently the largest end-to-end serving bottleneck.
-2. P10 prefix/state cache for repeated system/chat prefixes. This can skip
-   prefill work outright and is likely the fastest TTFT win for OpenWebUI-style
-   repeated prompts.
-3. P9 avoid full logits materialization for greedy decode where possible.
-4. P15 adapter conformance and policy resolver cleanup, so Gemma/Llama-style
+1. P9/P13 decode-critical-path profile for batch=1/2/4. Treat CUDA Graph as a
+   5-20% jitter/launch optimization, not the primary decode fix. First prove
+   whether `mlp_gate_up/down`, `qkvz/gdn_out/gdn_ba`, `lm_head/sampling`,
+   CPU sync, or cache/update allocation dominate each batch size.
+2. P6/P9 immediate hot-path fixes from that profile: keep Marlin output cache
+   `decode_only`, remove per-step allocation where measured, keep sampling on
+   GPU, and avoid full logits materialization when mathematically safe.
+3. P8 MTP policy stays K=1 by default. K=2 is enabled only when free VRAM is
+   sufficient and recent accepted draft length is about 1.7+ with
+   speed-positive EMA; K>2 remains benchmark-only on 16GB until proven.
+4. P1 scheduler tuning: keep decode-ready rows batched at 2-4 where possible,
+   separate fresh prefill and extend/chunked prefill, and keep long prefill off
+   decode graph shapes.
+5. P4/P10 prefill and prefix cache after the decode profile is stable:
+   preserve the fast fresh-prefill path (BF16/FP16 scratch SDPA then INT4_BDR
+   persistent KV append), and leave long-past INT4_BDR tiled fused prefill as
+   the next CUDA-kernel project.
+6. P15 adapter conformance and policy resolver cleanup, so Gemma/Llama-style
    adapters can be added without touching every CLI/bench path.
-5. P8 true multi-request NEXTN only after P4 verifier batches are fast enough
-   to make speculation speed-positive.

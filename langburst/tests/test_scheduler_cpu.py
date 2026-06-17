@@ -73,6 +73,34 @@ def test_continuous_batch_scheduler_prioritizes_decode_rows():
     assert next_batch.input_ids.tolist() == [10, 11, 12, 13]
 
 
+def test_continuous_batch_scheduler_does_not_mix_speculative_and_plain_decode_rows():
+    scheduler = ContinuousBatchScheduler(max_num_requests=3, max_num_batched_tokens=6, prefill_chunk_size=4)
+    speculative = scheduler.add_request("spec", [1, 2])
+    speculative.computed_tokens = 2
+    speculative.last_sampled_token = 3
+    speculative.draft_token_ids = [4, 5]
+    plain = scheduler.add_request("plain", [10, 11])
+    plain.computed_tokens = 2
+    plain.last_sampled_token = 12
+
+    first = scheduler.schedule()
+
+    assert first is not None
+    assert first.request_ids == ["spec"]
+    assert first.input_ids.tolist() == [3, 4, 5]
+    assert first.num_draft_tokens_per_request == [2]
+
+    speculative.computed_tokens += 3
+    speculative.last_sampled_token = 6
+    scheduler.finish_request("spec")
+    second = scheduler.schedule()
+
+    assert second is not None
+    assert second.request_ids == ["plain"]
+    assert second.input_ids.tolist() == [12]
+    assert second.num_draft_tokens_per_request == [0]
+
+
 def test_continuous_batch_scheduler_interleaves_prefill_with_long_decode():
     scheduler = ContinuousBatchScheduler(
         max_num_requests=2,

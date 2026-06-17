@@ -16,7 +16,7 @@ from langburst.engines.native.runtime import GenerationConfig, RuntimeEngine
 from langburst.engines.native.scheduler import ContinuousBatchScheduler
 from langburst.adapters.hf_causal import HFCausalState
 from langburst.adapters.qwen36_impl.model import Qwen36Model
-from langburst.speculative_batch import DecodeRequestState, build_decode_batch_plan
+from langburst.speculative_batch import DecodeRequestState, build_decode_batch_plan, resolve_speculative_gpu
 
 
 @dataclass
@@ -152,6 +152,14 @@ class NativeVerifyBatchToyModel(ToyModel):
         assert plan.num_requests == 1
         assert plan.input_ids.tolist() == [5, 6, 7]
         assert plan.num_draft_tokens_per_request == [2]
+        metadata = plan.spec_decode_metadata
+        assert metadata is not None
+        decision = resolve_speculative_gpu(
+            metadata,
+            target_token_ids=torch.tensor([6, 7], dtype=torch.long),
+            bonus_token_ids=torch.tensor([3], dtype=torch.long),
+            scheduled_token_counts=torch.tensor([3], dtype=torch.int32),
+        )
         states[0].pos += plan.num_tokens
         states[0].last_raw_hidden = torch.ones((4,))
         logits = torch.full((8,), -1000.0)
@@ -162,6 +170,8 @@ class NativeVerifyBatchToyModel(ToyModel):
                 logits=logits,
                 hidden=torch.ones((4,)),
                 state=states[0],
+                state_already_committed=True,
+                speculative_decision=decision,
             )
         ]
 
@@ -495,26 +505,6 @@ def test_batched_runner_reuses_prefix_cache_blocks_and_state(tmp_path: Path):
     assert second.computed_tokens == 3
     assert int(runner.state_store.get(second.state_index).pos) == 3
     assert runner.prefix_cache_summary()["hits"] == 1
-
-
-def test_runtime_engine_verify_nextn_prefers_native_batch_verifier(tmp_path: Path):
-    engine = RuntimeEngine(
-        adapter=NativeVerifyBatchToyAdapter(),
-        hf_model=tmp_path,
-        qb_model=tmp_path,
-        device="cpu",
-        recent_window=16,
-        weight_device="cpu",
-    )
-    state = engine.new_state()
-
-    result = engine.verify_nextn_tokens([5, 6, 7], state, num_candidates=2)
-
-    assert engine.model.verify_batch_calls == 1
-    assert engine.model.verify_block_calls == 0
-    assert result.target_ids.tolist() == [6, 7]
-    assert int(torch.argmax(result.logits).item()) == 3
-    assert state.pos == 3
 
 
 def test_runtime_engine_forward_batch_logits_returns_all_draft_rows(tmp_path: Path):

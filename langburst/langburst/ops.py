@@ -201,6 +201,111 @@ class CPUFallbackOps:
         return torch.stack(outs, dim=0).contiguous()
 
     @staticmethod
+    def gdn_recurrent_ab_spec(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_arena: torch.Tensor,
+        state_indices: torch.Tensor,
+        commit_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        outs = []
+        for row in range(q.size(0)):
+            slot = int(state_indices[row].item())
+            commit_n = max(0, min(int(commit_tokens[row].item()), int(q.size(1))))
+            scratch = state_arena[slot].clone()
+            row_out = []
+            committed = None
+            for step in range(q.size(1)):
+                row_out.append(
+                    CPUFallbackOps.gdn_recurrent_ab(
+                        q[row, step],
+                        k[row, step],
+                        v[row, step],
+                        a[row, step],
+                        b[row, step],
+                        A_log,
+                        dt_bias,
+                        scratch,
+                    )
+                )
+                if step + 1 == commit_n:
+                    committed = scratch.clone()
+            if committed is not None:
+                state_arena[slot].copy_(committed)
+            outs.append(torch.stack(row_out, dim=0).contiguous())
+        return torch.stack(outs, dim=0).contiguous()
+
+    @staticmethod
+    def gdn_recurrent_ab_spec_trajectory(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_arena: torch.Tensor,
+        state_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        outs = []
+        trajectories = []
+        for row in range(q.size(0)):
+            slot = int(state_indices[row].item())
+            scratch = state_arena[slot].clone()
+            row_out = []
+            row_traj = []
+            for step in range(q.size(1)):
+                row_out.append(
+                    CPUFallbackOps.gdn_recurrent_ab(
+                        q[row, step],
+                        k[row, step],
+                        v[row, step],
+                        a[row, step],
+                        b[row, step],
+                        A_log,
+                        dt_bias,
+                        scratch,
+                    )
+                )
+                row_traj.append(scratch.clone())
+            outs.append(torch.stack(row_out, dim=0).contiguous())
+            trajectories.append(torch.stack(row_traj, dim=0).contiguous())
+        return torch.stack(outs, dim=0).contiguous(), torch.stack(trajectories, dim=0).contiguous()
+
+    @staticmethod
+    def gdn_recurrent_ab_spec_trajectory_out(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_arena: torch.Tensor,
+        state_indices: torch.Tensor,
+        out: torch.Tensor,
+        trajectory: torch.Tensor,
+    ) -> None:
+        out_ref, traj_ref = CPUFallbackOps.gdn_recurrent_ab_spec_trajectory(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state_arena,
+            state_indices,
+        )
+        out.copy_(out_ref)
+        trajectory.copy_(traj_ref)
+
+    @staticmethod
     def depthwise_conv_update(state: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         if weight.ndim == 3:
             w = weight[:, 0, :]
@@ -235,6 +340,73 @@ class CPUFallbackOps:
             slot = int(state_indices[row].item())
             outs.append(CPUFallbackOps.depthwise_conv_update(state_arena[slot], x[row].contiguous(), weight, bias))
         return torch.stack(outs, dim=0).contiguous()
+
+    @staticmethod
+    def depthwise_conv_update_spec(
+        state_arena: torch.Tensor,
+        state_indices: torch.Tensor,
+        commit_tokens: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        outs = []
+        for row in range(x.size(0)):
+            slot = int(state_indices[row].item())
+            commit_n = max(0, min(int(commit_tokens[row].item()), int(x.size(1))))
+            scratch = state_arena[slot].clone()
+            row_out = []
+            committed = None
+            for step in range(x.size(1)):
+                row_out.append(CPUFallbackOps.depthwise_conv_update(scratch, x[row, step].contiguous(), weight, bias))
+                if step + 1 == commit_n:
+                    committed = scratch.clone()
+            if committed is not None:
+                state_arena[slot].copy_(committed)
+            outs.append(torch.stack(row_out, dim=0).contiguous())
+        return torch.stack(outs, dim=0).contiguous()
+
+    @staticmethod
+    def depthwise_conv_update_spec_trajectory(
+        state_arena: torch.Tensor,
+        state_indices: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        outs = []
+        trajectories = []
+        for row in range(x.size(0)):
+            slot = int(state_indices[row].item())
+            scratch = state_arena[slot].clone()
+            row_out = []
+            row_traj = []
+            for step in range(x.size(1)):
+                row_out.append(CPUFallbackOps.depthwise_conv_update(scratch, x[row, step].contiguous(), weight, bias))
+                row_traj.append(scratch.clone())
+            outs.append(torch.stack(row_out, dim=0).contiguous())
+            trajectories.append(torch.stack(row_traj, dim=0).contiguous())
+        return torch.stack(outs, dim=0).contiguous(), torch.stack(trajectories, dim=0).contiguous()
+
+    @staticmethod
+    def depthwise_conv_update_spec_trajectory_out(
+        state_arena: torch.Tensor,
+        state_indices: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        out: torch.Tensor,
+        trajectory: torch.Tensor,
+    ) -> None:
+        out_ref, traj_ref = CPUFallbackOps.depthwise_conv_update_spec_trajectory(
+            state_arena,
+            state_indices,
+            x,
+            weight,
+            bias,
+        )
+        out.copy_(out_ref)
+        trajectory.copy_(traj_ref)
 
     @staticmethod
     def attention_decode_fp16(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, length: int, scale: float) -> torch.Tensor:
@@ -382,6 +554,69 @@ class CPUFallbackOps:
             v_zeros[block, :, offset].copy_(v_zero)
 
     @staticmethod
+    def attention_append_paged_int4_spec(
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        k_scales: torch.Tensor,
+        v_scales: torch.Tensor,
+        k_zeros: torch.Tensor,
+        v_zeros: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        commit_tokens: torch.Tensor,
+        block_size: int,
+        hadamard_order: int,
+        bdr_k: bool,
+        rotate_v: bool,
+        tiled_layout: bool = False,
+    ) -> None:
+        from .core.kv_cache import hadamard_transform, pack_int4_rows
+
+        for row in range(k_new.size(0)):
+            commit_n = max(0, min(int(commit_tokens[row].item()), int(k_new.size(1))))
+            for step in range(commit_n):
+                slot = int(slot_mapping[row, step].item())
+                block = slot // int(block_size)
+                offset = slot % int(block_size)
+                k_store = hadamard_transform(k_new[row, step], hadamard_order) if bdr_k else k_new[row, step]
+                v_store = hadamard_transform(v_new[row, step], hadamard_order) if bdr_k and rotate_v else v_new[row, step]
+                k_packed, k_scale, k_zero = pack_int4_rows(k_store)
+                v_packed, v_scale, v_zero = pack_int4_rows(v_store)
+                if tiled_layout:
+                    k_pages[block, :, :, offset].copy_(k_packed)
+                    v_pages[block, :, :, offset].copy_(v_packed)
+                else:
+                    k_pages[block, :, offset, :].copy_(k_packed)
+                    v_pages[block, :, offset, :].copy_(v_packed)
+                k_scales[block, :, offset].copy_(k_scale)
+                v_scales[block, :, offset].copy_(v_scale)
+                k_zeros[block, :, offset].copy_(k_zero)
+                v_zeros[block, :, offset].copy_(v_zero)
+
+    @staticmethod
+    def attention_spec_decode_paged_int4(
+        q: torch.Tensor,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        k_scales: torch.Tensor,
+        v_scales: torch.Tensor,
+        k_zeros: torch.Tensor,
+        v_zeros: torch.Tensor,
+        block_tables: torch.Tensor,
+        base_seq_lens: torch.Tensor,
+        block_size: int,
+        scale: float,
+        hadamard_order: int,
+        bdr_k: bool,
+        rotate_v: bool,
+        tiled_layout: bool = False,
+    ) -> torch.Tensor:
+        raise RuntimeError("INT4 speculative paged attention requires the CUDA extension")
+
+    @staticmethod
     def argmax(logits: torch.Tensor) -> torch.Tensor:
         return torch.argmax(logits).to(torch.long)
 
@@ -402,6 +637,50 @@ class CPUFallbackOps:
                 break
             k += 1
         return torch.tensor([k], device=a.device, dtype=torch.long)
+
+    @staticmethod
+    def resolve_greedy_speculative(
+        draft_token_ids: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        cu_num_draft_tokens: torch.Tensor,
+        scheduled_token_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = draft_token_ids.device
+        counts = cu_num_draft_tokens.to(device="cpu", dtype=torch.int32).tolist()
+        scheduled = scheduled_token_counts.to(device="cpu", dtype=torch.int32).tolist()
+        batch = len(counts)
+        prev = 0
+        max_draft = 0
+        for cur in counts:
+            max_draft = max(max_draft, int(cur) - prev)
+            prev = int(cur)
+        token_matrix = torch.full((batch, max_draft + 1), -1, device=device, dtype=torch.long)
+        sampled_counts = torch.empty((batch,), device=device, dtype=torch.int32)
+        rejected_counts = torch.empty((batch,), device=device, dtype=torch.int32)
+        accepted_counts = torch.empty((batch,), device=device, dtype=torch.int32)
+        prev = 0
+        for row, cur_raw in enumerate(counts):
+            cur = int(cur_raw)
+            draft = draft_token_ids[prev:cur].to(dtype=torch.long)
+            target = target_token_ids[prev:cur].to(device=device, dtype=torch.long)
+            accepted = 0
+            for i in range(int(draft.numel())):
+                if int(draft[i].item()) != int(target[i].item()):
+                    break
+                accepted += 1
+            if accepted:
+                token_matrix[row, :accepted] = draft[:accepted]
+            if accepted < int(draft.numel()):
+                token_matrix[row, accepted] = target[accepted]
+            else:
+                token_matrix[row, accepted] = bonus_token_ids[row].to(device=device, dtype=torch.long)
+            sampled = accepted + 1
+            sampled_counts[row] = sampled
+            rejected_counts[row] = max(0, int(scheduled[row]) - sampled)
+            accepted_counts[row] = accepted
+            prev = cur
+        return token_matrix, sampled_counts, rejected_counts, accepted_counts
 
 
 @lru_cache(maxsize=1)

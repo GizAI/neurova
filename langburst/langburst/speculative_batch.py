@@ -9,52 +9,6 @@ from .ops import cuda_ops
 
 
 @dataclass(frozen=True)
-class SpeculativeBatchPlan:
-    """Single-request spec-decode execution plan.
-
-    This is the langburst equivalent of the external serving engine spec-decode input contract:
-    target verification receives the newly sampled token followed by draft
-    tokens, then sampler output is reduced to sampled/rejected counts for state
-    post-processing.
-    """
-
-    first_token: torch.Tensor
-    draft_tokens: torch.Tensor
-    emit_first: bool = True
-
-    @property
-    def num_draft_tokens(self) -> int:
-        return int(self.draft_tokens.numel())
-
-    @property
-    def num_target_tokens(self) -> int:
-        return 1 + self.num_draft_tokens
-
-    def target_token_ids(self) -> list[int]:
-        tokens: list[torch.Tensor] = [self.first_token.reshape(())]
-        tokens.extend(token.reshape(()) for token in self.draft_tokens.reshape(-1))
-        return [int(token.detach().cpu().item()) for token in tokens]
-
-
-@dataclass(frozen=True)
-class SpeculativeBatchResult:
-    accepted_draft_tokens: int
-    verified_draft_tokens: int
-    rejected_tokens: int
-    commit_tokens: list[torch.Tensor]
-    emitted_tokens: list[torch.Tensor]
-    all_draft_accepted: bool
-
-    @property
-    def num_sampled(self) -> int:
-        return len(self.commit_tokens)
-
-    @property
-    def state_delta_tokens(self) -> int:
-        return self.num_sampled
-
-
-@dataclass(frozen=True)
 class NativeSpecDecodeMetadata:
     """vLLM-shaped speculative decode metadata for native serving.
 
@@ -186,148 +140,131 @@ class NativeSpecDecodeMetadata:
 
 
 @dataclass(frozen=True)
-class SpeculativeBatchDecision:
-    """Per-request result of resolving target verifier logits.
+class SpeculativeGPUDecision:
+    """Production speculative reducer output.
 
-    The token list follows the continuous serving contract: it contains the
-    accepted draft prefix, plus either the target correction token or the bonus
-    token when every draft was accepted. The already-scheduled first sampled
-    token is part of the target input/state update, not this emitted list.
+    This is the single tensor-shaped boundary consumed by serving code.  The
+    names separate model-state progress from emitted token payload:
+    `accepted_draft_tokens` counts accepted draft positions, while
+    `commit_tokens` is the number of target input tokens whose state must be
+    committed for each row.
     """
 
-    token_ids: list[int]
-    sampled_count: int
-    rejected_count: int
-    accepted_draft_tokens: int
-    verified_draft_tokens: int
+    accepted_draft_tokens: torch.Tensor
+    commit_tokens: torch.Tensor
+    output_tokens_padded: torch.Tensor
+    output_lengths: torch.Tensor
+    next_input_ids: torch.Tensor
+    rejected_tokens: torch.Tensor
 
-    @property
-    def all_drafts_accepted(self) -> bool:
-        return self.accepted_draft_tokens == self.verified_draft_tokens
+    def output_rows(self) -> list[list[int]]:
+        tokens = self.output_tokens_padded.detach().cpu()
+        lengths = self.output_lengths.detach().cpu().tolist()
+        return [
+            [int(t) for t in tokens[row, : int(length)].tolist()]
+            for row, length in enumerate(lengths)
+        ]
 
+    def output_length_list(self) -> list[int]:
+        return [int(v) for v in self.output_lengths.detach().cpu().tolist()]
 
-def make_speculative_batch_plan(first_token: torch.Tensor, draft_tokens: torch.Tensor, *, emit_first: bool = True) -> SpeculativeBatchPlan:
-    draft = draft_tokens.reshape(-1).to(device=first_token.device, dtype=torch.long)
-    return SpeculativeBatchPlan(first_token=first_token.reshape(()).to(dtype=torch.long), draft_tokens=draft, emit_first=emit_first)
+    def rejected_count_list(self) -> list[int]:
+        return [int(v) for v in self.rejected_tokens.detach().cpu().tolist()]
 
-
-def count_accepted_prefix(draft_tokens: torch.Tensor, target_token_ids: torch.Tensor) -> int:
-    draft = draft_tokens.reshape(-1).to(dtype=torch.long)
-    target = target_token_ids.reshape(-1).to(device=draft.device, dtype=torch.long)
-    if draft.numel() != target.numel():
-        raise ValueError("draft and target token tensors must have the same length")
-    if draft.numel() == 0:
-        return 0
-    if draft.device.type == "cuda":
-        return int(cuda_ops().count_prefix_matches(draft.contiguous(), target.contiguous())[0].detach().cpu().item())
-    matches = target.eq(draft)
-    mismatch = torch.nonzero(~matches, as_tuple=False)
-    return int(draft.numel()) if mismatch.numel() == 0 else int(mismatch[0].item())
+    def accepted_draft_count_list(self) -> list[int]:
+        return [int(v) for v in self.accepted_draft_tokens.detach().cpu().tolist()]
 
 
-def resolve_greedy_speculative_metadata(
+def resolve_speculative_gpu(
     metadata: NativeSpecDecodeMetadata,
     *,
     target_token_ids: torch.Tensor,
     bonus_token_ids: torch.Tensor,
-    scheduled_token_counts: Sequence[int] | None = None,
-) -> list[SpeculativeBatchDecision]:
-    """Resolve vLLM-shaped speculative metadata into per-row decisions.
+    scheduled_token_counts: Sequence[int] | torch.Tensor,
+) -> SpeculativeGPUDecision:
+    """Resolve greedy native NEXTN decisions in the production tensor contract."""
 
-    `target_token_ids` is flattened in `metadata.target_logits_indices` order
-    and validates draft tokens. `bonus_token_ids` is one token per row in
-    `metadata.bonus_logits_indices` order. This is the single reducer used by
-    both the generic batched verifier path and the transaction verifier path.
-    """
-
-    target_ids = target_token_ids.reshape(-1).to(dtype=torch.long)
-    bonus_ids = bonus_token_ids.reshape(-1).to(dtype=torch.long)
+    device = metadata.draft_token_ids.device
+    target_ids = target_token_ids.reshape(-1).to(device=device, dtype=torch.long).contiguous()
+    bonus_ids = bonus_token_ids.reshape(-1).to(device=device, dtype=torch.long).contiguous()
+    if torch.is_tensor(scheduled_token_counts):
+        scheduled = scheduled_token_counts.to(device=device, dtype=torch.int32).reshape(-1).contiguous()
+    else:
+        scheduled = torch.tensor([int(v) for v in scheduled_token_counts], device=device, dtype=torch.int32)
     if int(bonus_ids.numel()) != metadata.batch_size:
         raise ValueError("bonus_token_ids must contain one token per speculative row")
-    if scheduled_token_counts is not None and len(scheduled_token_counts) != metadata.batch_size:
+    if int(scheduled.numel()) != metadata.batch_size:
         raise ValueError("scheduled_token_counts must match speculative metadata batch size")
-    decisions: list[SpeculativeBatchDecision] = []
-    draft_offset = 0
-    target_offset = 0
-    for row_idx, draft_n_raw in enumerate(metadata.num_draft_tokens):
-        draft_n = int(draft_n_raw)
-        drafts = metadata.draft_token_ids[draft_offset : draft_offset + draft_n].to(dtype=torch.long)
-        targets = target_ids[target_offset : target_offset + draft_n].to(device=drafts.device, dtype=torch.long)
-        if int(targets.numel()) < draft_n:
-            raise RuntimeError("target_token_ids did not include enough verifier tokens")
-        draft_offset += draft_n
-        target_offset += draft_n
-        accepted = count_accepted_prefix(drafts, targets)
-        if accepted < draft_n:
-            tokens_tensor = torch.cat([drafts[:accepted], targets[accepted : accepted + 1]], dim=0)
-        else:
-            tokens_tensor = torch.cat(
-                [drafts, bonus_ids[row_idx : row_idx + 1].to(device=drafts.device, dtype=torch.long)],
-                dim=0,
-            )
-        tokens = [int(t) for t in tokens_tensor.detach().cpu().tolist()]
-        sampled_count = len(tokens)
-        scheduled_count = int(scheduled_token_counts[row_idx]) if scheduled_token_counts is not None else draft_n + 1
-        rejected_count = scheduled_count - sampled_count
-        if rejected_count < 0:
-            raise RuntimeError(f"sampled more tokens than scheduled: {sampled_count} > {scheduled_count}")
-        decisions.append(
-            SpeculativeBatchDecision(
-                token_ids=tokens,
-                sampled_count=sampled_count,
-                rejected_count=rejected_count,
-                accepted_draft_tokens=accepted,
-                verified_draft_tokens=draft_n,
-            )
+    draft_ids = metadata.draft_token_ids.to(device=device, dtype=torch.long).reshape(-1).contiguous()
+    cu_drafts = metadata.cu_num_draft_tokens.to(device=device, dtype=torch.int32).reshape(-1).contiguous()
+    if device.type == "cuda":
+        token_matrix, sampled_counts, rejected_counts, accepted_counts = cuda_ops().resolve_greedy_speculative(
+            draft_ids,
+            target_ids,
+            bonus_ids,
+            cu_drafts,
+            scheduled,
         )
-    return decisions
-
-
-def resolve_speculative_batch(
-    plan: SpeculativeBatchPlan,
-    *,
-    target_token_ids: torch.Tensor,
-) -> SpeculativeBatchResult:
-    """Resolve accepted/rejected counts and exact commit/emission tokens.
-
-    `target_token_ids[i]` is the target model token that validates
-    `plan.draft_tokens[i]`.  On reject, external serving engine samples the correcting target token
-    and treats the remaining candidate logits as rejected; langburst mirrors that
-    contract for the single-request path.
-    """
-
-    verified = plan.num_draft_tokens
-    accepted = count_accepted_prefix(plan.draft_tokens, target_token_ids)
-    first = plan.first_token.reshape(())
-    accepted_drafts = [token.reshape(()) for token in plan.draft_tokens[:accepted]]
-
-    if accepted == verified:
-        commit_tokens = [first, *accepted_drafts]
-        emitted = ([first] if plan.emit_first else []) + accepted_drafts
-        return SpeculativeBatchResult(
-            accepted_draft_tokens=accepted,
-            verified_draft_tokens=verified,
-            rejected_tokens=0,
-            commit_tokens=commit_tokens,
-            emitted_tokens=emitted,
-            all_draft_accepted=True,
+    else:
+        token_matrix, sampled_counts, rejected_counts, accepted_counts = _resolve_greedy_speculative_torch(
+            draft_ids=draft_ids,
+            target_ids=target_ids,
+            bonus_ids=bonus_ids,
+            cu_drafts=cu_drafts,
+            scheduled_counts=scheduled,
         )
-
-    correct = target_token_ids[accepted].reshape(())
-    commit_tokens = [first, *accepted_drafts, correct]
-    emitted = ([first] if plan.emit_first else []) + accepted_drafts + [correct]
-    return SpeculativeBatchResult(
-        accepted_draft_tokens=accepted,
-        verified_draft_tokens=verified,
-        rejected_tokens=verified - accepted,
+    output_lengths = sampled_counts
+    commit_tokens = output_lengths
+    next_input_ids = token_matrix.gather(
+        1,
+        torch.clamp(output_lengths.to(dtype=torch.long) - 1, min=0).reshape(-1, 1),
+    ).reshape(-1)
+    return SpeculativeGPUDecision(
+        accepted_draft_tokens=accepted_counts,
         commit_tokens=commit_tokens,
-        emitted_tokens=emitted,
-        all_draft_accepted=False,
+        output_tokens_padded=token_matrix,
+        output_lengths=output_lengths,
+        next_input_ids=next_input_ids,
+        rejected_tokens=rejected_counts,
     )
 
 
-def tensor_token_ids(tokens: Sequence[torch.Tensor]) -> list[int]:
-    return [int(token.detach().cpu().item()) for token in tokens]
+def _resolve_greedy_speculative_torch(
+    *,
+    draft_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    bonus_ids: torch.Tensor,
+    cu_drafts: torch.Tensor,
+    scheduled_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch = int(cu_drafts.numel())
+    max_sampled = max(1, int(draft_ids.numel()) + 1)
+    token_matrix = torch.full((batch, max_sampled), -1, dtype=torch.long, device=draft_ids.device)
+    sampled_counts = torch.empty((batch,), dtype=torch.int32, device=draft_ids.device)
+    rejected_counts = torch.empty((batch,), dtype=torch.int32, device=draft_ids.device)
+    accepted_counts = torch.empty((batch,), dtype=torch.int32, device=draft_ids.device)
+    draft_start = 0
+    for row in range(batch):
+        draft_end = int(cu_drafts[row].item())
+        draft_n = draft_end - draft_start
+        accepted = 0
+        for offset in range(draft_n):
+            if int(draft_ids[draft_start + offset].item()) != int(target_ids[draft_start + offset].item()):
+                break
+            accepted += 1
+        sampled = accepted + 1
+        if accepted < draft_n:
+            token_matrix[row, accepted] = target_ids[draft_start + accepted]
+        else:
+            token_matrix[row, accepted] = bonus_ids[row]
+        for offset in range(accepted):
+            token_matrix[row, offset] = draft_ids[draft_start + offset]
+        rejected = int(scheduled_counts[row].item()) - sampled
+        sampled_counts[row] = sampled
+        rejected_counts[row] = max(0, rejected)
+        accepted_counts[row] = accepted
+        draft_start = draft_end
+    return token_matrix, sampled_counts, rejected_counts, accepted_counts
 
 
 @dataclass

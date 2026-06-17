@@ -10,8 +10,10 @@ from typing import Sequence
 import torch
 
 from .cli_features import add_adapter_arg, add_model_path_args, create_runtime_engine_from_args
+from .core.features import RUNTIME_PROFILES
 from .core.defaults import kv_block_size_default, kv_blocks_default, serving_recent_window_default
 from .core.features import RuntimeFeatures
+from .engines.native.resource_policy import EngineResourcePolicy
 from .engines.native import (
     BatchGenerationHandle,
     BatchGenerationWorker,
@@ -30,6 +32,7 @@ class ServingBenchCase:
     max_new_tokens: int
     max_num_batched_tokens: int
     prefill_chunk_size: int
+    max_prefill_rows_per_batch: int
     max_wait_ms: float
     paged_kv: bool = True
 
@@ -83,6 +86,7 @@ def run_serving_case(
         max_num_requests=case.requests,
         max_num_batched_tokens=case.max_num_batched_tokens,
         prefill_chunk_size=case.prefill_chunk_size,
+        max_prefill_rows_per_batch=case.max_prefill_rows_per_batch,
         block_table=block_table,
     )
     runner = BatchedModelRunner(engine=engine, scheduler=scheduler)
@@ -137,6 +141,7 @@ def run_serving_case(
         "max_new_tokens": case.max_new_tokens,
         "max_num_batched_tokens": case.max_num_batched_tokens,
         "prefill_chunk_size": case.prefill_chunk_size,
+        "max_prefill_rows_per_batch": case.max_prefill_rows_per_batch,
         "max_wait_ms": case.max_wait_ms,
         "paged_kv": case.paged_kv,
         "recent_window": recent_window,
@@ -211,12 +216,17 @@ def main() -> None:
     add_adapter_arg(parser)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--weight-device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--runtime-profile", choices=RUNTIME_PROFILES, default="stateful")
+    mtp_group = parser.add_mutually_exclusive_group()
+    mtp_group.add_argument("--enable-mtp", dest="enable_mtp", action="store_true", default=None)
+    mtp_group.add_argument("--disable-mtp", dest="enable_mtp", action="store_false")
     parser.add_argument("--recent-window", type=int, default=serving_recent_window_default())
     parser.add_argument("--prompt-tokens", type=int, default=256)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--requests", default="1,2,4")
     parser.add_argument("--max-num-batched-tokens", type=int, default=256)
     parser.add_argument("--prefill-chunk-size", type=int, default=64)
+    parser.add_argument("--max-prefill-rows-per-batch", type=int, default=EngineResourcePolicy.from_env().max_prefill_rows_per_batch)
     parser.add_argument("--kv-block-size", type=int, default=kv_block_size_default())
     parser.add_argument("--kv-blocks", type=int, default=kv_blocks_default())
     parser.add_argument("--max-wait-ms", type=float, default=2.0)
@@ -226,11 +236,10 @@ def main() -> None:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    engine = create_runtime_engine_from_args(
-        args,
-        features=RuntimeFeatures.from_profile("stateful"),
-        max_state_pool_size=0,
-    )
+    features = RuntimeFeatures.from_profile(args.runtime_profile)
+    if args.enable_mtp is not None:
+        features = features.with_overrides(speculative_decoding=bool(args.enable_mtp))
+    engine = create_runtime_engine_from_args(args, features=features, max_state_pool_size=0)
     results: list[dict[str, object]] = []
     if args.include_single:
         results.append(
@@ -243,12 +252,21 @@ def main() -> None:
             )
         )
     for requests in _parse_int_list(args.requests):
+        policy = EngineResourcePolicy(
+            max_active_requests=requests,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            prefill_chunk_size=args.prefill_chunk_size,
+            max_prefill_rows_per_batch=args.max_prefill_rows_per_batch,
+            kv_block_size=args.kv_block_size,
+            kv_blocks=args.kv_blocks,
+        )
         case = ServingBenchCase(
             requests=requests,
             prompt_tokens=args.prompt_tokens,
             max_new_tokens=args.max_new_tokens,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            prefill_chunk_size=args.prefill_chunk_size,
+            max_num_batched_tokens=policy.max_num_batched_tokens,
+            prefill_chunk_size=policy.prefill_chunk_size,
+            max_prefill_rows_per_batch=policy.max_prefill_rows_per_batch,
             max_wait_ms=args.max_wait_ms,
             paged_kv=not args.no_paged_kv,
         )

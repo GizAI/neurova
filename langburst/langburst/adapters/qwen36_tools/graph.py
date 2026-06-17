@@ -110,13 +110,13 @@ def inspect_decode1_graph_safety(
     else:
         notes.append("BLOCKER: warm all Marlin tensors so gemm_out reuses fixed output/workspace buffers.")
 
-    pos = getattr(state, "pos", None)
-    kv_len = getattr(state, "kv_len", None)
+    pos = getattr(state, "pos_tensor", None)
+    kv_len = getattr(state, "kv_len_tensor", None)
     device_position_counters = torch.is_tensor(pos) and torch.is_tensor(kv_len) and pos.device.type == "cuda" and kv_len.device.type == "cuda"
     if device_position_counters:
-        notes.append("OK: pos/kv_len are CUDA tensors.")
+        notes.append("OK: pos_tensor/kv_len_tensor are CUDA tensors.")
     else:
-        notes.append("BLOCKER: DecodeState.pos and kv_len are Python counters; graph capture needs fixed CUDA counter tensors.")
+        notes.append("BLOCKER: DecodeState requires fixed CUDA pos_tensor/kv_len_tensor counters.")
 
     ring_kv_device_indexing = False
     if isinstance(state, DecodeState):

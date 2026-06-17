@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import threading
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -49,8 +48,9 @@ class NativeBackend:
     def __init__(self, spec: EngineModelSpec) -> None:
         self.spec = spec
         self.feature_plan = resolve_engine_feature_plan(self.descriptor.capabilities, spec.features, prefer_bridge=False)
-        self._engine = None
-        self._request_lock = threading.Lock()
+        self._engine: RuntimeEngine | None = None
+        self._worker: BatchGenerationWorker | None = None
+        self._resource_policy = EngineResourcePolicy.from_env()
 
     def start(self) -> None:
         if self._engine is not None:
@@ -68,7 +68,7 @@ class NativeBackend:
         qb_model = self.spec.extra.get("qb_model")
         if not qb_model:
             raise RuntimeError("native engine requires qb_model in EngineModelSpec.extra")
-        self._engine = RuntimeEngine(
+        engine = RuntimeEngine(
             adapter=adapter_registry.get(adapter_id),
             hf_model=Path(self.spec.model),
             qb_model=Path(str(qb_model)),
@@ -84,8 +84,31 @@ class NativeBackend:
                 ttt_sidecar=True if self.spec.features.ttt_sidecar else None,
             ),
         )
+        block_table = KVBlockTable(
+            num_blocks=self._resource_policy.kv_blocks,
+            block_size=self._resource_policy.kv_block_size,
+        )
+        scheduler = ContinuousBatchScheduler(
+            max_num_requests=self._resource_policy.max_active_requests,
+            max_num_batched_tokens=self._resource_policy.max_num_batched_tokens,
+            prefill_chunk_size=self._resource_policy.prefill_chunk_size,
+            max_prefill_rows_per_batch=self._resource_policy.max_prefill_rows_per_batch,
+            decode_prefill_interleave_steps=self._resource_policy.decode_prefill_interleave_steps,
+            block_table=block_table,
+        )
+        runner = BatchedModelRunner(
+            engine=engine,
+            scheduler=scheduler,
+            features=engine.resolve_plan(engine.features).effective,
+            max_state_pool_size=self._resource_policy.max_state_pool_size,
+        )
+        self._engine = engine
+        self._worker = BatchGenerationWorker(runner=runner, device=engine.device)
 
     def shutdown(self) -> None:
+        if self._worker is not None:
+            self._worker.shutdown()
+            self._worker = None
         self._engine = None
 
     def list_models(self) -> list[dict[str, object]]:
@@ -97,23 +120,29 @@ class NativeBackend:
             "engine": self.descriptor.summary(),
             "model": self.spec.public_name,
             "feature_plan": self.feature_plan.summary(),
+            "resource_policy": self._resource_policy.summary(),
+            "batch_worker": self._worker.stats() if self._worker is not None else None,
         }
 
     def generate_chat(self, request: EngineChatRequest) -> EngineChatResult:
         self.start()
         assert self._engine is not None
+        assert self._worker is not None
         t0 = time.perf_counter()
         prompt_ids = self._engine.encode_messages(request.messages)
         encode_s = time.perf_counter() - t0
         cfg = _native_generation_config(self._engine, request)
-        lock_start = time.perf_counter()
-        self._request_lock.acquire()
-        lock_wait_s = time.perf_counter() - lock_start
         gen_start = time.perf_counter()
-        try:
-            ids = self._engine.generate_ids_greedy_gpu(prompt_ids, cfg)
-        finally:
-            self._request_lock.release()
+        handle = self._worker.submit(
+            prompt_ids,
+            max_new_tokens=cfg.max_new_tokens,
+            eos_token_ids=tuple(cfg.eos_token_ids),
+            generation_config=cfg,
+            stop_sequences=tuple(_encode_stop_strings(self._engine, request)),
+            include_stop_str_in_output=bool(request.sampling.extra.get("include_stop_str_in_output", False)),
+            request_id=request.request_id,
+        )
+        ids = handle.wait_ids()
         gen_s = time.perf_counter() - gen_start
         e2e_s = time.perf_counter() - t0
         text = self._engine.tokenizer.decode(ids, skip_special_tokens=True)
@@ -126,7 +155,7 @@ class NativeBackend:
             "message_chars": _message_chars(request.messages),
             "completion_tokens": len(ids),
             "encode_s": encode_s,
-            "lock_wait_s": lock_wait_s,
+            "queue_wait_s": handle.metrics().get("queue_wait_s"),
             "generate_s": gen_s,
             "e2e_s": e2e_s,
             "tok_s": len(ids) / max(gen_s, 1e-9),
@@ -138,6 +167,7 @@ class NativeBackend:
     def stream_chat(self, request: EngineChatRequest) -> Iterable[EngineChatChunk]:
         self.start()
         assert self._engine is not None
+        assert self._worker is not None
         t0 = time.perf_counter()
         prompt_ids = self._engine.encode_messages(request.messages)
         encode_s = time.perf_counter() - t0
@@ -145,24 +175,33 @@ class NativeBackend:
         completion_tokens = 0
         first_token_s: float | None = None
         first_text_s: float | None = None
-        lock_start = time.perf_counter()
-        self._request_lock.acquire()
-        lock_wait_s = time.perf_counter() - lock_start
         gen_start = time.perf_counter()
+        handle = self._worker.submit(
+            prompt_ids,
+            max_new_tokens=cfg.max_new_tokens,
+            eos_token_ids=tuple(cfg.eos_token_ids),
+            generation_config=cfg,
+            stop_sequences=tuple(_encode_stop_strings(self._engine, request)),
+            include_stop_str_in_output=bool(request.sampling.extra.get("include_stop_str_in_output", False)),
+            request_id=request.request_id,
+        )
+        emitted_ids: list[int] = []
         try:
-            for token_id, text in self._engine.completion_tokens_from_ids(prompt_ids, cfg):
+            for token_id in handle.iter_token_ids():
                 if int(token_id) >= 0:
                     completion_tokens += 1
+                    emitted_ids.append(int(token_id))
                     if first_token_s is None:
                         first_token_s = time.perf_counter() - t0
+                text = self._engine.tokenizer.decode([int(token_id)], skip_special_tokens=True)
                 if text:
                     if first_text_s is None:
                         first_text_s = time.perf_counter() - t0
                     yield EngineChatChunk(text=text, model=self.spec.public_name)
         finally:
-            self._request_lock.release()
             gen_s = time.perf_counter() - gen_start
             e2e_s = time.perf_counter() - t0
+            handle_metrics = handle.metrics()
             metrics = {
                 "stream": True,
                 "request_id": request.request_id,
@@ -171,7 +210,7 @@ class NativeBackend:
                 "message_chars": _message_chars(request.messages),
                 "completion_tokens": completion_tokens,
                 "encode_s": encode_s,
-                "lock_wait_s": lock_wait_s,
+                "queue_wait_s": handle_metrics.get("queue_wait_s"),
                 "first_token_s": first_token_s,
                 "first_text_s": first_text_s,
                 "generate_s": gen_s,
@@ -202,6 +241,15 @@ def _native_generation_config(engine, request: EngineChatRequest):
         stop_token_ids=request.sampling.stop_token_ids,
         ignore_eos=request.sampling.ignore_eos,
     )
+
+
+def _encode_stop_strings(engine, request: EngineChatRequest) -> tuple[tuple[int, ...], ...]:
+    out: list[tuple[int, ...]] = []
+    for stop in request.sampling.stop:
+        ids = engine.tokenizer.encode(str(stop), add_special_tokens=False)
+        if ids:
+            out.append(tuple(int(t) for t in ids))
+    return tuple(out)
 
 
 def _profile_enabled() -> bool:

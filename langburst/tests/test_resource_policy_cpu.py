@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from langburst.engines.native.resource_policy import EngineResourcePolicy
+from langburst.tuning import marlin_direct_max_batch
 
 
 def test_resource_policy_from_env_derives_kv_blocks_from_context_and_concurrency():
@@ -44,3 +45,11 @@ def test_resource_policy_from_env_accepts_explicit_deployment_budget():
     assert policy.reserve_free_vram_mib == 256
     assert policy.runtime_overhead_mib == 128
     assert policy.max_state_pool_size == 1
+
+
+def test_resource_policy_caps_prefill_chunk_to_marlin_direct_batch(monkeypatch):
+    monkeypatch.setenv("LANGBURST_MARLIN_DIRECT_MAX_BATCH", "32")
+
+    policy = EngineResourcePolicy(prefill_chunk_size=256)
+
+    assert policy.prefill_chunk_size == marlin_direct_max_batch()

@@ -68,6 +68,9 @@ class RuntimePolicyResolver:
             "accept_threshold",
             "max_rejections",
             "min_speedup",
+            "latency_ema_alpha",
+            "latency_min_verified",
+            "min_free_vram_mib",
         ):
             if key in policy:
                 values[key] = policy[key]
@@ -100,17 +103,20 @@ class RuntimePolicyResolver:
         accept_threshold: float | None = None,
         max_rejections: int | None | object = _UNSET,
         min_speedup: float | None = None,
+        latency_ema_alpha: float | None = None,
+        latency_min_verified: int | None = None,
+        min_free_vram_mib: int | None = None,
     ) -> SpeculativeDecodePolicy:
         tuned = self._autotune_policy_values()
         chosen_max_draft = self._choose_value(max_draft, "LANGBURST_MTP_MAX_DRAFT", tuned, "max_draft", 1)
         chosen_adaptive = self._choose_value(adaptive, "LANGBURST_MTP_ADAPTIVE", tuned, "adaptive", True)
-        chosen_min_verified = self._choose_value(min_verified, "LANGBURST_MTP_MIN_VERIFIED", tuned, "min_verified", 1)
+        chosen_min_verified = self._choose_value(min_verified, "LANGBURST_MTP_MIN_VERIFIED", tuned, "min_verified", 32)
         chosen_accept_threshold = self._choose_value(
             accept_threshold,
             "LANGBURST_MTP_ACCEPT_THRESHOLD",
             tuned,
             "accept_threshold",
-            1.0,
+            0.30,
         )
         chosen_max_rejections = self._choose_value(
             max_rejections,
@@ -120,6 +126,34 @@ class RuntimePolicyResolver:
             None,
         )
         chosen_min_speedup = self._choose_value(min_speedup, "LANGBURST_MTP_MIN_SPEEDUP", tuned, "min_speedup", 1.03)
+        chosen_latency_ema_alpha = self._choose_value(
+            latency_ema_alpha,
+            "LANGBURST_MTP_LATENCY_EMA_ALPHA",
+            tuned,
+            "latency_ema_alpha",
+            0.20,
+        )
+        chosen_latency_min_verified = self._choose_value(
+            latency_min_verified,
+            "LANGBURST_MTP_LATENCY_MIN_VERIFIED",
+            tuned,
+            "latency_min_verified",
+            8,
+        )
+        chosen_min_free_vram_mib = self._choose_value(
+            min_free_vram_mib,
+            "LANGBURST_MTP_MIN_FREE_VRAM_MIB",
+            tuned,
+            "min_free_vram_mib",
+            256,
+        )
+        raw_candidates = self._choose_value(
+            None,
+            "LANGBURST_MTP_DRAFT_CANDIDATES",
+            tuned,
+            "draft_candidates",
+            "1,2,4,8",
+        )
         chosen_verifier_mode = (
             str(verifier_mode)
             if verifier_mode is not None
@@ -152,6 +186,10 @@ class RuntimePolicyResolver:
                 else int(chosen_max_rejections)
             ),
             min_speedup=float(chosen_min_speedup),
+            latency_ema_alpha=float(chosen_latency_ema_alpha),
+            latency_min_verified=int(chosen_latency_min_verified),
+            draft_candidates=_parse_int_tuple(raw_candidates),
+            min_free_vram_mib=int(chosen_min_free_vram_mib),
         )
 
     def execution_policy(
@@ -195,5 +233,18 @@ class ExecutionPolicy:
                 "accept_threshold": self.speculative.accept_threshold,
                 "max_rejections": self.speculative.max_rejections,
                 "min_speedup": self.speculative.min_speedup,
+                "latency_ema_alpha": self.speculative.latency_ema_alpha,
+                "latency_min_verified": self.speculative.latency_min_verified,
+                "draft_candidates": self.speculative.draft_candidates,
+                "min_free_vram_mib": self.speculative.min_free_vram_mib,
             },
         }
+
+
+def _parse_int_tuple(value: object) -> tuple[int, ...]:
+    if isinstance(value, (tuple, list)):
+        return tuple(int(v) for v in value)
+    text = str(value).strip()
+    if not text:
+        return (1,)
+    return tuple(int(part.strip()) for part in text.split(",") if part.strip())

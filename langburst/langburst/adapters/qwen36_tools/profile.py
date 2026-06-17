@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -20,6 +21,8 @@ from ...cli_features import (
 from ...engines.native.runtime import GenerationConfig, sample_next_tensor
 from ...loader import LowBitMarlinTensor, LowBitTensor
 from ...ops import cuda_ops
+from ...speculative_batch import DecodeBatchPlan
+from ...tuning import marlin_direct_max_batch
 from langburst.adapters.qwen36_impl import model as model_mod
 
 
@@ -70,6 +73,7 @@ class DecodeProfiler:
     def __init__(self) -> None:
         self.calls: list[TimedCall] = []
         self.cpu_counts: defaultdict[str, int] = defaultdict(int)
+        self.path_counts: defaultdict[str, int] = defaultdict(int)
 
     def record_cuda(self, category: str, fn: Callable, *args, **kwargs):
         if not torch.cuda.is_available():
@@ -103,6 +107,13 @@ class DecodeProfiler:
         rows.sort(key=lambda row: row[2], reverse=True)
         return rows
 
+    def count_path(self, category: str, path: str, *, batch: int, bits: int | None = None) -> None:
+        bit_label = "na" if bits is None else str(int(bits))
+        self.path_counts[f"{category},batch={int(batch)},bits={bit_label},{path}"] += 1
+
+    def path_table(self) -> list[tuple[str, int]]:
+        return sorted(self.path_counts.items(), key=lambda item: (-item[1], item[0]))
+
 
 @contextmanager
 def profile_decode() -> Iterator[DecodeProfiler]:
@@ -120,12 +131,31 @@ def profile_decode() -> Iterator[DecodeProfiler]:
     orig_sdpa = F.scaled_dot_product_attention
 
     def marlin_gemm(self: LowBitMarlinTensor, x: torch.Tensor):
+        batch = int(x.size(0)) if x.ndim >= 2 else 1
+        category = projection_category(self.name)
+        max_direct = marlin_direct_max_batch()
+        if batch > max_direct:
+            profiler.count_path(category, "marlin_row_loop_parent", batch=batch, bits=getattr(self, "exec_bits", None))
+        else:
+            cache_policy = os.environ.get("LANGBURST_MARLIN_OUT_CACHE_POLICY", "off").strip().lower()
+            cache_out = cache_policy not in {"0", "false", "off", "none", "no_cache"} and (
+                cache_policy != "decode_only" or batch == 1
+            )
+            if cache_out and batch in getattr(self, "_out_cache", {}):
+                profiler.count_path(category, "marlin_direct_cache_hit", batch=batch, bits=getattr(self, "exec_bits", None))
+            elif cache_out:
+                profiler.count_path(category, "marlin_direct_cache_miss", batch=batch, bits=getattr(self, "exec_bits", None))
+            else:
+                profiler.count_path(category, "marlin_direct_no_cache", batch=batch, bits=getattr(self, "exec_bits", None))
         return profiler.record_cuda(projection_category(self.name), orig_marlin_gemm, self, x)
 
     def lowbit_gemv(self: LowBitTensor, x: torch.Tensor):
+        profiler.count_path(projection_category(self.name), "lowbit_gemv", batch=1, bits=getattr(self, "bits", None))
         return profiler.record_cuda(projection_category(self.name), orig_lowbit_gemv, self, x)
 
     def lowbit_gemm(self: LowBitTensor, x: torch.Tensor):
+        batch = int(x.size(0)) if x.ndim >= 2 else 1
+        profiler.count_path(projection_category(self.name), "lowbit_gemm", batch=batch, bits=getattr(self, "bits", None))
         return profiler.record_cuda(projection_category(self.name), orig_lowbit_gemm, self, x)
 
     def row_dequant(self: LowBitTensor, row):
@@ -179,6 +209,134 @@ def profile_decode() -> Iterator[DecodeProfiler]:
         F.scaled_dot_product_attention = orig_sdpa
 
 
+def _make_single_token_batch_plan(
+    *,
+    input_ids: torch.Tensor,
+    states: list[object],
+    device: torch.device,
+) -> DecodeBatchPlan:
+    batch = int(input_ids.numel())
+    positions = torch.tensor([int(getattr(state, "pos")) for state in states], dtype=torch.long, device=device)
+    query_start = torch.arange(0, batch + 1, dtype=torch.int32, device=device)
+    seq_lens = (positions + 1).to(dtype=torch.int32)
+    logits_indices = torch.arange(0, batch, dtype=torch.long, device=device)
+    cu_num_logits = torch.arange(0, batch + 1, dtype=torch.int32, device=device)
+    return DecodeBatchPlan(
+        request_ids=[f"profile-{row}" for row in range(batch)],
+        state_indices=torch.arange(0, batch, dtype=torch.int32, device=device),
+        input_ids=input_ids.to(device=device, dtype=torch.long).reshape(-1).contiguous(),
+        positions=positions,
+        query_start_loc=query_start,
+        seq_lens=seq_lens,
+        logits_indices=logits_indices,
+        cu_num_logits=cu_num_logits,
+        row_spans=tuple((row, row + 1) for row in range(batch)),
+        num_scheduled_tokens=[1] * batch,
+        num_draft_tokens_per_request=[0] * batch,
+        is_prefill=[False] * batch,
+    )
+
+
+def _print_profile_result(
+    *,
+    label: str,
+    prompt_tokens: int,
+    generated: int,
+    elapsed: float,
+    profiler: DecodeProfiler,
+) -> None:
+    print(
+        f"profile={label} prompt_tokens={prompt_tokens} generated={generated} "
+        f"elapsed_s={elapsed:.3f} tok_s={generated/max(elapsed, 1e-9):.2f}"
+    )
+    print("category,calls,total_ms,avg_us,max_us,pct_measured")
+    rows = profiler.table()
+    total = sum(row[2] for row in rows) or 1.0
+    for cat, count, total_ms, avg_ms, max_ms in rows:
+        print(f"{cat},{count},{total_ms:.3f},{avg_ms*1000:.2f},{max_ms*1000:.2f},{total_ms/total*100:.2f}")
+    if profiler.path_counts:
+        print("path,count")
+        for path, count in profiler.path_table():
+            print(f"{path},{count}")
+
+
+def _parse_batch_sizes(raw: str) -> list[int]:
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        value = int(part)
+        if value < 1:
+            raise ValueError("batch sizes must be >= 1")
+        out.append(value)
+    return out or [1]
+
+
+def _profile_direct_single(engine, prompt_ids: list[int], cfg: GenerationConfig, features, args) -> None:
+    state = engine.new_state()
+    prefill_logits = engine.prefill(prompt_ids, state, features)
+    prefill_next = sample_next_tensor(prefill_logits, cfg)
+    if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+        torch.cuda.synchronize()
+    with profile_decode() as profiler:
+        t0 = time.perf_counter()
+        next_token = prefill_next
+        generated = 0
+        for i in range(args.max_new_tokens):
+            generated += 1
+            if i == args.max_new_tokens - 1:
+                break
+            logits = engine.forward_one(next_token, state, return_logits=True)
+            next_token = profiler.record_cuda("sampling", sample_next_tensor, logits, cfg)
+        if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+    _print_profile_result(
+        label="direct_single",
+        prompt_tokens=len(prompt_ids),
+        generated=generated,
+        elapsed=elapsed,
+        profiler=profiler,
+    )
+
+
+def _profile_decode_batch(engine, prompt_ids: list[int], cfg: GenerationConfig, features, args, *, batch_size: int) -> None:
+    device = torch.device(args.device)
+    states = []
+    next_tokens: list[torch.Tensor] = []
+    for _ in range(batch_size):
+        state = engine.new_state()
+        logits = engine.prefill(prompt_ids, state, features)
+        token = sample_next_tensor(logits, cfg)
+        states.append(state)
+        next_tokens.append(token.reshape(()))
+    next_input = torch.stack(next_tokens, dim=0).to(device=device, dtype=torch.long).contiguous()
+    if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+        torch.cuda.synchronize()
+    with profile_decode() as profiler:
+        t0 = time.perf_counter()
+        generated = 0
+        for i in range(args.max_new_tokens):
+            generated += batch_size
+            if i == args.max_new_tokens - 1:
+                break
+            plan = _make_single_token_batch_plan(input_ids=next_input, states=states, device=device)
+            logits_rows = engine.forward_batch(plan, states, return_logits=True)
+            logits = torch.stack([row.contiguous() for row in logits_rows if row is not None], dim=0).contiguous()
+            next_input = profiler.record_cuda("sampling", cuda_ops().argmax_many, logits).to(device=device, dtype=torch.long)
+        if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+    _print_profile_result(
+        label=f"decode_batch_B{batch_size}",
+        prompt_tokens=len(prompt_ids),
+        generated=generated,
+        elapsed=elapsed,
+        profiler=profiler,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Profile Qwen3.6 adapter target-only decode bottlenecks")
     add_model_path_args(parser)
@@ -189,6 +347,16 @@ def main() -> None:
     parser.add_argument("--prompt", default="Write a concise technical note about quantized LLM inference.")
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--include-prefill", action="store_true", help="profile prompt prefill as well as decode")
+    parser.add_argument(
+        "--batch-sizes",
+        default="1",
+        help="comma-separated single-token decode batch sizes to profile through RuntimeEngine.forward_batch",
+    )
+    parser.add_argument(
+        "--skip-direct-single",
+        action="store_true",
+        help="skip the direct engine.forward_one single-request profile",
+    )
     add_runtime_feature_args(parser)
     args = parser.parse_args()
     if args.adapter not in {"qwen36", "qwen36-a3b"}:
@@ -198,41 +366,26 @@ def main() -> None:
     engine = create_runtime_engine_from_args(args, features=features)
     prompt_ids = engine.encode_prompt(args.prompt)
     cfg = GenerationConfig.greedy(max_new_tokens=args.max_new_tokens)
-    state = engine.new_state()
-    prefill_logits: torch.Tensor | None = None
-    prefill_next: torch.Tensor | None = None
-    if not args.include_prefill:
-        prefill_logits = engine.prefill(prompt_ids, state, features)
-        prefill_next = sample_next_tensor(prefill_logits, cfg)
-        if torch.cuda.is_available() and str(args.device).startswith("cuda"):
-            torch.cuda.synchronize()
-    with profile_decode() as profiler:
-        t0 = time.perf_counter()
-        if args.include_prefill:
+    if args.include_prefill:
+        with profile_decode() as profiler:
+            t0 = time.perf_counter()
             out = engine.generate_ids_greedy_gpu(prompt_ids, cfg)
-        else:
-            assert prefill_next is not None
-            next_token = prefill_next
-            out = []
-            for i in range(args.max_new_tokens):
-                out.append(next_token)
-                if i == args.max_new_tokens - 1:
-                    break
-                logits = engine.forward_one(next_token, state, return_logits=True)
-                next_token = sample_next_tensor(logits, cfg)
-        if torch.cuda.is_available() and str(args.device).startswith("cuda"):
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - t0
-    print(
-        f"prompt_tokens={len(prompt_ids)} generated={len(out)} "
-        f"max_new_tokens={args.max_new_tokens} include_prefill={args.include_prefill} "
-        f"elapsed_s={elapsed:.3f} tok_s={len(out)/max(elapsed, 1e-9):.2f}"
-    )
-    print("category,calls,total_ms,avg_us,max_us,pct_measured")
-    rows = profiler.table()
-    total = sum(row[2] for row in rows) or 1.0
-    for cat, count, total_ms, avg_ms, max_ms in rows:
-        print(f"{cat},{count},{total_ms:.3f},{avg_ms*1000:.2f},{max_ms*1000:.2f},{total_ms/total*100:.2f}")
+            if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
+        _print_profile_result(
+            label="direct_generate_include_prefill",
+            prompt_tokens=len(prompt_ids),
+            generated=len(out),
+            elapsed=elapsed,
+            profiler=profiler,
+        )
+        return
+
+    if not args.skip_direct_single:
+        _profile_direct_single(engine, prompt_ids, cfg, features, args)
+    for batch_size in _parse_batch_sizes(args.batch_sizes):
+        _profile_decode_batch(engine, prompt_ids, cfg, features, args, batch_size=batch_size)
 
 
 if __name__ == "__main__":

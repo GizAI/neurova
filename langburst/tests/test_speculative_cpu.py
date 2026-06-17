@@ -6,11 +6,12 @@ import torch
 
 from langburst.speculation import (
     DraftRequest,
+    SpeculativeAcceptanceTracker,
     SpeculativeBenchmarkResult,
     SpeculativeDecodePolicy,
     SpeculativeProbeResult,
 )
-from langburst.speculative_verifier import NativeNextNVerifier, TargetVerification
+from langburst.research.speculative_verifier import NativeNextNVerifier, TargetVerification
 from langburst.engines.native.policy import RuntimePolicyResolver
 from langburst.tuning import verify_nextn_mode
 
@@ -81,15 +82,13 @@ def test_runtime_policy_resolver_reads_env(monkeypatch):
     monkeypatch.setenv("LANGBURST_MTP_MAX_REJECTIONS", "2")
     policy = RuntimePolicyResolver().speculative_policy()
 
-    assert policy == SpeculativeDecodePolicy(
-        max_draft=10,
-        verifier_mode="transaction_block",
-        adaptive=True,
-        min_verified=3,
-        accept_threshold=0.75,
-        max_rejections=2,
-        min_speedup=1.03,
-    )
+    assert policy.max_draft == 10
+    assert policy.verifier_mode == "transaction_block"
+    assert policy.adaptive is True
+    assert policy.min_verified == 3
+    assert policy.accept_threshold == 0.75
+    assert policy.max_rejections == 2
+    assert policy.min_speedup == 1.03
 
 
 def test_runtime_policy_resolver_reads_speed_positive_autotune_json(monkeypatch, tmp_path):
@@ -119,15 +118,13 @@ def test_runtime_policy_resolver_reads_speed_positive_autotune_json(monkeypatch,
 
     policy = RuntimePolicyResolver().speculative_policy()
 
-    assert policy == SpeculativeDecodePolicy(
-        max_draft=6,
-        verifier_mode="transaction_block",
-        adaptive=True,
-        min_verified=2,
-        accept_threshold=0.8,
-        max_rejections=1,
-        min_speedup=1.05,
-    )
+    assert policy.max_draft == 6
+    assert policy.verifier_mode == "transaction_block"
+    assert policy.adaptive is True
+    assert policy.min_verified == 2
+    assert policy.accept_threshold == 0.8
+    assert policy.max_rejections == 1
+    assert policy.min_speedup == 1.05
 
 
 def test_runtime_policy_resolver_ignores_non_kept_autotune_json(monkeypatch, tmp_path):
@@ -137,6 +134,51 @@ def test_runtime_policy_resolver_ignores_non_kept_autotune_json(monkeypatch, tmp
     monkeypatch.delenv("LANGBURST_MTP_MAX_DRAFT", raising=False)
 
     assert RuntimePolicyResolver().speculative_policy().max_draft == 1
+
+
+def test_runtime_policy_resolver_reads_mtp_free_vram_watermark(monkeypatch):
+    monkeypatch.setenv("LANGBURST_MTP_MIN_FREE_VRAM_MIB", "384")
+
+    policy = RuntimePolicyResolver().speculative_policy()
+
+    assert policy.min_free_vram_mib == 384
+
+
+def test_speculative_acceptance_tracker_uses_accepted_tokens_per_pass():
+    policy = SpeculativeDecodePolicy(max_draft=2, min_verified=3, accept_threshold=0.75)
+    tracker = SpeculativeAcceptanceTracker(policy)
+
+    assert tracker.should_propose()
+
+    tracker.record(accepted_counts=[1], verified_counts=[2])
+    assert tracker.should_propose()
+
+    tracker.record(accepted_counts=[1], verified_counts=[2])
+    assert not tracker.should_propose()
+    assert tracker.accept_rate == 0.5
+    assert tracker.mean_accepted_per_pass == 1.0
+
+
+def test_speculative_acceptance_tracker_picks_speed_positive_k_champion():
+    policy = SpeculativeDecodePolicy(
+        max_draft=4,
+        min_verified=1,
+        accept_threshold=0.0,
+        latency_min_verified=1,
+        draft_candidates=(1, 2, 4),
+        min_speedup=1.05,
+    )
+    tracker = SpeculativeAcceptanceTracker(policy)
+    tracker.record_baseline(elapsed_ms=100.0, output_tokens=10)
+
+    tracker.record(accepted_counts=[1], verified_counts=[1], elapsed_ms=8.0, output_tokens=1)
+    tracker.record(accepted_counts=[2], verified_counts=[2], elapsed_ms=7.0, output_tokens=1)
+    tracker.record(accepted_counts=[4], verified_counts=[4], elapsed_ms=12.0, output_tokens=1)
+
+    assert tracker.current_max_draft() == 2
+    summary = tracker.summary()
+    assert summary["champion_draft"] == 2
+    assert summary["draft_totals"][2]["speculative_ms_per_output_token_ema"] == 7.0
 
 
 def test_native_nextn_verifier_uses_batch_verify_callback():

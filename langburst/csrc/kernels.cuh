@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <vector>
 
 #define QB_CUDA_CHECK(err) do {                                      \
   cudaError_t err__ = (err);                                         \
@@ -47,20 +48,34 @@ torch::Tensor gdn_recurrent_ab(torch::Tensor q, torch::Tensor k, torch::Tensor v
 torch::Tensor gdn_recurrent_scan(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g, torch::Tensor beta, torch::Tensor state);
 torch::Tensor gdn_recurrent_ab_scan(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor a, torch::Tensor b, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state);
 torch::Tensor gdn_recurrent_ab_batch(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor a, torch::Tensor b, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state_arena, torch::Tensor state_indices);
+torch::Tensor gdn_recurrent_ab_spec(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor a, torch::Tensor b, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state_arena, torch::Tensor state_indices, torch::Tensor commit_tokens);
+std::vector<torch::Tensor> gdn_recurrent_ab_spec_trajectory(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor a, torch::Tensor b, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state_arena, torch::Tensor state_indices);
+void gdn_recurrent_ab_spec_trajectory_out(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor a, torch::Tensor b, torch::Tensor A_log, torch::Tensor dt_bias, torch::Tensor state_arena, torch::Tensor state_indices, torch::Tensor out, torch::Tensor trajectory);
 torch::Tensor depthwise_conv_update(torch::Tensor state, torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
 torch::Tensor depthwise_conv_update_scan(torch::Tensor state, torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
 torch::Tensor depthwise_conv_update_batch(torch::Tensor state_arena, torch::Tensor state_indices, torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+torch::Tensor depthwise_conv_update_spec(torch::Tensor state_arena, torch::Tensor state_indices, torch::Tensor commit_tokens, torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+std::vector<torch::Tensor> depthwise_conv_update_spec_trajectory(torch::Tensor state_arena, torch::Tensor state_indices, torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+void depthwise_conv_update_spec_trajectory_out(torch::Tensor state_arena, torch::Tensor state_indices, torch::Tensor x, torch::Tensor weight, torch::Tensor bias, torch::Tensor out, torch::Tensor trajectory);
 torch::Tensor attention_decode_fp16(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, int64_t seq_len, double softmax_scale);
 torch::Tensor attention_decode_batch_fp16(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_arena, torch::Tensor v_arena, torch::Tensor state_indices, torch::Tensor write_indices, torch::Tensor live_lengths, torch::Tensor positions, bool use_ring, double softmax_scale);
 torch::Tensor attention_decode_paged_fp16(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor slot_mapping, torch::Tensor block_tables, torch::Tensor seq_lens, int64_t block_size, double softmax_scale);
 torch::Tensor attention_decode_paged_fp8_e4m3(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor slot_mapping, torch::Tensor block_tables, torch::Tensor seq_lens, int64_t block_size, double softmax_scale, double k_scale, double v_scale);
 void attention_append_paged_int4(torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor k_scales, torch::Tensor v_scales, torch::Tensor k_zeros, torch::Tensor v_zeros, torch::Tensor slot_mapping, int64_t block_size, int64_t hadamard_order, bool bdr_k, bool rotate_v, bool tiled_layout);
+void attention_append_paged_int4_spec(torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor k_scales, torch::Tensor v_scales, torch::Tensor k_zeros, torch::Tensor v_zeros, torch::Tensor slot_mapping, torch::Tensor commit_tokens, int64_t block_size, int64_t hadamard_order, bool bdr_k, bool rotate_v, bool tiled_layout);
+torch::Tensor attention_spec_decode_paged_int4(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor k_scales, torch::Tensor v_scales, torch::Tensor k_zeros, torch::Tensor v_zeros, torch::Tensor block_tables, torch::Tensor base_seq_lens, int64_t block_size, double softmax_scale, int64_t hadamard_order, bool bdr_k, bool rotate_v, bool tiled_layout);
 torch::Tensor attention_decode_paged_int4(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor k_scales, torch::Tensor v_scales, torch::Tensor k_zeros, torch::Tensor v_zeros, torch::Tensor slot_mapping, torch::Tensor block_tables, torch::Tensor seq_lens, int64_t block_size, double softmax_scale, int64_t hadamard_order, bool bdr_k, bool rotate_v, bool tiled_layout);
 torch::Tensor attention_paged_int4_flash(torch::Tensor q, torch::Tensor k_new, torch::Tensor v_new, torch::Tensor k_pages, torch::Tensor v_pages, torch::Tensor k_scales, torch::Tensor v_scales, torch::Tensor k_zeros, torch::Tensor v_zeros, torch::Tensor slot_mapping, torch::Tensor block_tables, torch::Tensor seq_lens, int64_t block_size, double softmax_scale, int64_t hadamard_order, bool bdr_k, bool rotate_v, bool tiled_layout);
 torch::Tensor argmax(torch::Tensor logits);
 torch::Tensor argmax_many(torch::Tensor logits);
 void argmax_many_out(torch::Tensor logits, torch::Tensor out);
 torch::Tensor count_prefix_matches(torch::Tensor proposed, torch::Tensor verified);
+std::vector<torch::Tensor> resolve_greedy_speculative(
+    torch::Tensor draft_token_ids,
+    torch::Tensor target_token_ids,
+    torch::Tensor bonus_token_ids,
+    torch::Tensor cu_num_draft_tokens,
+    torch::Tensor scheduled_token_counts);
 
 // Utility: fast sigmoid/silu in fp32.
 __device__ __forceinline__ float qb_sigmoid(float x) {

@@ -124,7 +124,7 @@ def test_batched_model_runner_rolls_back_scheduler_when_state_allocate_fails(tmp
     assert scheduler.stats().waiting_requests == 0
 
 
-def test_batched_model_runner_accepts_draft_and_emits_bonus(tmp_path: Path):
+def test_batched_model_runner_rejects_speculative_rows_without_hot_verifier(tmp_path: Path):
     engine = RuntimeEngine(
         adapter=ToyAdapter(),
         hf_model=tmp_path,
@@ -141,13 +141,12 @@ def test_batched_model_runner_accepts_draft_and_emits_bonus(tmp_path: Path):
     runner.execute_step(device="cpu")
     row.draft_token_ids = [3]
 
-    step = runner.execute_step(device="cpu")
-
-    assert step is not None
-    assert step.tokens_by_request() == {"a": [3, 4]}
-    assert step.sampled_counts == [2]
-    assert step.rejected_counts == [0]
-    assert row.token_ids[-2:] == [3, 4]
+    try:
+        runner.execute_step(device="cpu")
+    except RuntimeError as exc:
+        assert "forward_verify_batch hot path" in str(exc)
+    else:
+        raise AssertionError("speculative row without hot verifier was accepted")
 
 
 def test_batched_model_runner_routes_native_mtp_to_verify_batch(tmp_path: Path):
@@ -218,7 +217,84 @@ def test_batched_model_runner_prepares_next_draft_after_bonus_accept(tmp_path: P
     assert row.draft_token_ids_tensor.tolist() == [4]
 
 
-def test_batched_model_runner_commits_rejected_prefix_without_replay(tmp_path: Path):
+def test_batched_model_runner_acceptance_gate_blocks_next_draft_after_loss(tmp_path: Path):
+    engine = RuntimeEngine(
+        adapter=ToyAdapter(),
+        hf_model=tmp_path,
+        qb_model=tmp_path,
+        device="cpu",
+        recent_window=16,
+        weight_device="cpu",
+    )
+
+    class Proposer:
+        def __init__(self):
+            self.calls = 0
+
+        def propose_tensors_batch(self, requests):
+            self.calls += 1
+            return torch.tensor([[4]], dtype=torch.long)
+
+    proposer = Proposer()
+    engine.speculative_proposer = proposer
+    runner = BatchedModelRunner(
+        engine=engine,
+        scheduler=ContinuousBatchScheduler(max_num_requests=1, max_num_batched_tokens=4, prefill_chunk_size=2),
+    )
+    runner.features = runner.features.with_overrides(speculative_decoding=True)
+    row = runner.add_request("a", [1], generation_config=GenerationConfig(ignore_eos=True))
+    state = runner.state_store.get(row.state_index)
+    state.last_raw_hidden = torch.ones((4,))
+    row.last_sampled_token = 1
+
+    for _ in range(runner.speculative_policy.min_verified):
+        runner.speculative_tracker.record(accepted_counts=[0], verified_counts=[1])
+    runner._prepare_native_nextn_drafts([row], [state], [1], [0])
+
+    assert proposer.calls == 0
+    assert row.draft_token_ids is None
+    assert row.draft_token_ids_tensor is None
+
+
+def test_batched_model_runner_memory_gate_blocks_next_draft(tmp_path: Path):
+    engine = RuntimeEngine(
+        adapter=ToyAdapter(),
+        hf_model=tmp_path,
+        qb_model=tmp_path,
+        device="cpu",
+        recent_window=16,
+        weight_device="cpu",
+    )
+
+    class Proposer:
+        def __init__(self):
+            self.calls = 0
+
+        def propose_tensors_batch(self, requests):
+            self.calls += 1
+            return torch.tensor([[4]], dtype=torch.long)
+
+    proposer = Proposer()
+    engine.speculative_proposer = proposer
+    runner = BatchedModelRunner(
+        engine=engine,
+        scheduler=ContinuousBatchScheduler(max_num_requests=1, max_num_batched_tokens=4, prefill_chunk_size=2),
+    )
+    runner.features = runner.features.with_overrides(speculative_decoding=True)
+    runner._has_speculative_vram_headroom = lambda: False  # type: ignore[method-assign]
+    row = runner.add_request("a", [1], generation_config=GenerationConfig(ignore_eos=True))
+    state = runner.state_store.get(row.state_index)
+    state.last_raw_hidden = torch.ones((4,))
+    row.last_sampled_token = 1
+
+    runner._prepare_native_nextn_drafts([row], [state], [1], [0])
+
+    assert proposer.calls == 0
+    assert row.draft_token_ids is None
+    assert row.draft_token_ids_tensor is None
+
+
+def test_batched_model_runner_requires_committed_verify_batch(tmp_path: Path):
     class RejectVerifyModel(ToyModel):
         def __init__(self):
             super().__init__()
@@ -227,9 +303,6 @@ def test_batched_model_runner_commits_rejected_prefix_without_replay(tmp_path: P
         def forward_verify_batch(self, plan, states):
             self.verify_batch_calls += 1
             assert plan.input_ids.tolist() == [5, 99]
-            base_pos = states[0].pos
-            commit_state = ToyState(pos=base_pos + 1)
-            states[0].pos = base_pos + plan.num_tokens
             logits = torch.full((8,), -1000.0)
             logits[6] = 1000.0
             return [
@@ -238,7 +311,6 @@ def test_batched_model_runner_commits_rejected_prefix_without_replay(tmp_path: P
                     logits=logits,
                     hidden=torch.ones((4,)),
                     state=states[0],
-                    commit_states=[commit_state],
                 )
             ]
 
@@ -263,25 +335,15 @@ def test_batched_model_runner_commits_rejected_prefix_without_replay(tmp_path: P
     runner.execute_step(device="cpu")
     row.last_sampled_token = 5
     row.draft_token_ids = [99]
-    replayed_tokens: list[int] = []
-
-    def fail_forward_one(token, state, *args, **kwargs):
-        replayed_tokens.append(int(token))
-        raise AssertionError("reject prefix should use verifier commit_states, not replay")
-
-    engine.forward_one = fail_forward_one  # type: ignore[method-assign]
-
-    step = runner.execute_step(device="cpu")
-
-    assert step is not None
-    assert step.tokens_by_request() == {"a": [6]}
-    assert step.sampled_counts == [1]
-    assert step.rejected_counts == [1]
-    assert runner.state_store.get(row.state_index).pos == 2
-    assert replayed_tokens == []
+    try:
+        runner.execute_step(device="cpu")
+    except RuntimeError as exc:
+        assert "state_already_committed" in str(exc) or "commit" in str(exc)
+    else:
+        raise AssertionError("uncommitted verifier result was accepted")
 
 
-def test_batched_model_runner_rejects_bad_draft(tmp_path: Path):
+def test_batched_model_runner_has_no_replay_rollback_fallback(tmp_path: Path):
     engine = RuntimeEngine(
         adapter=ToyAdapter(),
         hf_model=tmp_path,
@@ -306,15 +368,13 @@ def test_batched_model_runner_rejects_bad_draft(tmp_path: Path):
 
     engine.forward_one = record_forward_one  # type: ignore[method-assign]
 
-    step = runner.execute_step(device="cpu")
-
-    assert step is not None
-    assert step.tokens_by_request() == {"a": [3]}
-    assert step.sampled_counts == [1]
-    assert step.rejected_counts == [1]
-    assert row.token_ids[-1] == 3
-    assert runner.state_store.get(row.state_index).pos == 3
-    assert replayed_tokens == [2]
+    try:
+        runner.execute_step(device="cpu")
+    except RuntimeError as exc:
+        assert "forward_verify_batch hot path" in str(exc)
+    else:
+        raise AssertionError("rollback-style speculative fallback was accepted")
+    assert replayed_tokens == []
 
 
 def test_batched_model_runner_uses_state_store_indices(tmp_path: Path):

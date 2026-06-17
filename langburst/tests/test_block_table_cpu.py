@@ -26,6 +26,20 @@ def test_kv_block_table_releases_blocks():
     assert table.release("r1") == 0
 
 
+def test_kv_block_table_truncates_speculative_tail_blocks():
+    table = KVBlockTable(num_blocks=4, block_size=4)
+    req = table.ensure_tokens("r1", 9)
+
+    assert req.block_ids == [0, 1, 2]
+    assert table.summary()["used_blocks"] == 3
+
+    truncated = table.truncate_tokens("r1", 5)
+
+    assert truncated.block_ids == [0, 1]
+    assert table.summary()["used_blocks"] == 2
+    assert table.summary()["free_blocks"] == 2
+
+
 def test_kv_block_table_builds_block_and_slot_tensors():
     table = KVBlockTable(num_blocks=4, block_size=4)
     table.ensure_tokens("a", 6)

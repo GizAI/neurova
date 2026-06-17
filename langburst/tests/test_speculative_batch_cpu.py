@@ -8,10 +8,13 @@ from langburst.speculative_batch import (
     NativeSpecDecodeMetadata,
     apply_decode_post_update,
     build_decode_batch_plan,
+    resolve_speculative_gpu,
+    sampled_and_rejected_counts,
+)
+from langburst.research.speculative_oracle import (
     make_speculative_batch_plan,
     resolve_greedy_speculative_metadata,
     resolve_speculative_batch,
-    sampled_and_rejected_counts,
     tensor_token_ids,
 )
 
@@ -132,6 +135,48 @@ def test_resolve_greedy_speculative_metadata_is_the_batch_decision_ssot():
     assert [decision.rejected_count for decision in decisions] == [2, 0, 0]
     assert [decision.accepted_draft_tokens for decision in decisions] == [1, 0, 2]
     assert [decision.all_drafts_accepted for decision in decisions] == [False, True, True]
+
+
+def test_resolve_speculative_gpu_contract_matches_reference():
+    meta = NativeSpecDecodeMetadata.from_draft_rows([[10, 11, 12], [], [20, 21]])
+    reference = resolve_greedy_speculative_metadata(
+        meta,
+        target_token_ids=torch.tensor([10, 99, 12, 20, 21]),
+        bonus_token_ids=torch.tensor([13, 30, 22]),
+        scheduled_token_counts=[4, 1, 3],
+    )
+
+    resolved = resolve_speculative_gpu(
+        meta,
+        target_token_ids=torch.tensor([10, 99, 12, 20, 21]),
+        bonus_token_ids=torch.tensor([13, 30, 22]),
+        scheduled_token_counts=[4, 1, 3],
+    )
+
+    assert resolved.output_rows() == [decision.token_ids for decision in reference]
+    assert resolved.output_length_list() == [decision.sampled_count for decision in reference]
+    assert resolved.rejected_count_list() == [decision.rejected_count for decision in reference]
+    assert resolved.accepted_draft_tokens.cpu().tolist() == [
+        decision.accepted_draft_tokens for decision in reference
+    ]
+
+
+def test_resolve_speculative_gpu_exposes_commit_and_output_contract():
+    meta = NativeSpecDecodeMetadata.from_draft_rows([[10, 11, 12], [], [20, 21]])
+
+    resolved = resolve_speculative_gpu(
+        meta,
+        target_token_ids=torch.tensor([10, 99, 12, 20, 21]),
+        bonus_token_ids=torch.tensor([13, 30, 22]),
+        scheduled_token_counts=[4, 1, 3],
+    )
+
+    assert resolved.output_rows() == [[10, 99], [30], [20, 21, 22]]
+    assert resolved.output_length_list() == [2, 1, 3]
+    assert resolved.rejected_count_list() == [2, 0, 0]
+    assert resolved.accepted_draft_count_list() == [1, 0, 2]
+    assert resolved.commit_tokens.tolist() == [2, 1, 3]
+    assert resolved.next_input_ids.tolist() == [99, 30, 22]
 
 
 def test_apply_decode_post_update_uses_query_len_minus_rejected_delta():

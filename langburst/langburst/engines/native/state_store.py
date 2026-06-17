@@ -88,6 +88,15 @@ class BatchStateStore:
     def get_many(self, state_indices: Iterable[int]) -> list[Any]:
         return [self.get(int(idx)) for idx in state_indices]
 
+    def physical_index(self, state_index: int) -> int:
+        idx = int(state_index)
+        if self._arena is None:
+            return idx
+        try:
+            return int(self._state_to_slot[idx])
+        except KeyError as exc:
+            raise KeyError(f"state_index is not allocated in arena: {idx}") from exc
+
     def clear(self) -> None:
         if self._arena is not None:
             for slot in list(self._state_to_slot.values()):
@@ -124,11 +133,19 @@ class BatchStateStore:
         arena_mode = os.environ.get("LANGBURST_BATCH_STATE_ARENA", "auto").strip().lower()
         if arena_mode in {"0", "false", "off", "no"}:
             return None
-        if arena_mode == "auto" and slots == 1:
+        if (
+            arena_mode == "auto"
+            and slots == 1
+            and not self.features.speculative_decoding
+        ):
             # Single-request serving gets batch worker queueing/streaming without
             # taking the paged-arena hot path. The canonical state path is the
             # quality champion and matches plain RuntimeEngine generation; paged
             # arena remains available for explicit multi-slot experiments.
+            #
+            # Speculative verification is different: even a single request must
+            # use the arena/paged contract so target verify can commit the
+            # reducer-selected prefix without replay or rollback.
             return None
         create_arena = getattr(self.engine, "create_state_arena", None)
         if not callable(create_arena):

@@ -135,6 +135,7 @@ class EngineManager:
             max_num_requests=self.policy.max_active_requests,
             max_num_batched_tokens=self.policy.max_num_batched_tokens,
             prefill_chunk_size=self.policy.prefill_chunk_size,
+            max_prefill_rows_per_batch=self.policy.max_prefill_rows_per_batch,
             decode_prefill_interleave_steps=self.policy.decode_prefill_interleave_steps,
             block_table=self.kv_block_table,
             cuda_graph_planner=self.cuda_graph_planner,
@@ -403,6 +404,7 @@ class EngineManager:
                     "reuse_pool": runner.state_store.reuse_pool_summary(),
                     "prefix_cache": runner.prefix_cache_summary(),
                     "memory_policy": runner.memory_policy_summary(),
+                    "speculative": runner.speculative_summary(),
                 }
                 for (model_name, _), runner in self._batch_runners.items()
             },

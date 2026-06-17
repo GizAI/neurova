@@ -776,6 +776,171 @@ __global__ void attention_decode_paged_int4_kernel(
   out[q_base + dim] = __float2half_rn(acc / fmaxf(l, 1e-20f));
 }
 
+template<int D>
+__global__ void attention_kv_append_paged_int4_spec_kernel(
+    const half* __restrict__ k_new,
+    const half* __restrict__ v_new,
+    uint8_t* __restrict__ k_pages,
+    uint8_t* __restrict__ v_pages,
+    half* __restrict__ k_scales,
+    half* __restrict__ v_scales,
+    half* __restrict__ k_zeros,
+    half* __restrict__ v_zeros,
+    const int64_t* __restrict__ slot_mapping,
+    const int32_t* __restrict__ commit_tokens,
+    int batch,
+    int tokens,
+    int num_blocks,
+    int kv_heads,
+    int block_size,
+    int hadamard_order,
+    bool bdr_k,
+    bool tiled_layout) {
+  int row_step = blockIdx.x;
+  int kvh = blockIdx.y;
+  int d = threadIdx.x;
+  int row = row_step / tokens;
+  int step = row_step - row * tokens;
+  if (row >= batch || step >= tokens || kvh >= kv_heads || d >= D) return;
+  int commit_n = commit_tokens[row];
+  if (commit_n <= 0 || step >= commit_n) return;
+
+  int64_t slot = slot_mapping[row_step];
+  int64_t block = slot / block_size;
+  int offset = static_cast<int>(slot % block_size);
+  if (block < 0 || block >= num_blocks || offset < 0 || offset >= block_size) return;
+
+  __shared__ float k_vals[QB_ATT_BLOCK];
+  __shared__ float v_vals[QB_ATT_BLOCK];
+  __shared__ float k_minmax[QB_ATT_BLOCK];
+  __shared__ float k_maxval[QB_ATT_BLOCK];
+  __shared__ float v_minmax[QB_ATT_BLOCK];
+  __shared__ float v_maxval[QB_ATT_BLOCK];
+
+  const int64_t src_base = ((static_cast<int64_t>(row) * tokens + step) * kv_heads + kvh) * D;
+  float kval = bdr_k ? qb_bdr_rotate_value<D>(k_new, src_base, d, hadamard_order) : __half2float(k_new[src_base + d]);
+  float vval = __half2float(v_new[src_base + d]);
+  k_vals[d] = kval;
+  v_vals[d] = vval;
+  k_minmax[d] = kval;
+  k_maxval[d] = kval;
+  v_minmax[d] = vval;
+  v_maxval[d] = vval;
+  __syncthreads();
+  for (int stride = D / 2; stride > 0; stride >>= 1) {
+    if (d < stride) {
+      k_minmax[d] = fminf(k_minmax[d], k_minmax[d + stride]);
+      k_maxval[d] = fmaxf(k_maxval[d], k_maxval[d + stride]);
+      v_minmax[d] = fminf(v_minmax[d], v_minmax[d + stride]);
+      v_maxval[d] = fmaxf(v_maxval[d], v_maxval[d + stride]);
+    }
+    __syncthreads();
+  }
+  float k_scale = fmaxf((k_maxval[0] - k_minmax[0]) / 15.0f, 1e-6f);
+  float v_scale = fmaxf((v_maxval[0] - v_minmax[0]) / 15.0f, 1e-6f);
+  float k_zero = -k_minmax[0] / k_scale;
+  float v_zero = -v_minmax[0] / v_scale;
+  const int64_t scale_idx = (static_cast<int64_t>(block) * kv_heads + kvh) * block_size + offset;
+  if (d == 0) {
+    k_scales[scale_idx] = __float2half_rn(k_scale);
+    v_scales[scale_idx] = __float2half_rn(v_scale);
+    k_zeros[scale_idx] = __float2half_rn(k_zero);
+    v_zeros[scale_idx] = __float2half_rn(v_zero);
+  }
+  if (d < D / 2) {
+    int q0k = static_cast<int>(nearbyintf(k_vals[d] / k_scale + k_zero));
+    int q1k = static_cast<int>(nearbyintf(k_vals[d + D / 2] / k_scale + k_zero));
+    int q0v = static_cast<int>(nearbyintf(v_vals[d] / v_scale + v_zero));
+    int q1v = static_cast<int>(nearbyintf(v_vals[d + D / 2] / v_scale + v_zero));
+    int64_t dst = qb_int4_paged_offset(
+        static_cast<int>(block), kvh, kv_heads, block_size, D / 2, offset, d, tiled_layout);
+    k_pages[dst] = qb_pack_uint4_pair(q0k, q1k);
+    v_pages[dst] = qb_pack_uint4_pair(q0v, q1v);
+  }
+}
+
+template<int D>
+__global__ void attention_spec_decode_paged_int4_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k_new,
+    const half* __restrict__ v_new,
+    const uint8_t* __restrict__ k_pages,
+    const uint8_t* __restrict__ v_pages,
+    const half* __restrict__ k_scales,
+    const half* __restrict__ v_scales,
+    const half* __restrict__ k_zeros,
+    const half* __restrict__ v_zeros,
+    const int32_t* __restrict__ block_tables,
+    const int32_t* __restrict__ base_seq_lens,
+    half* __restrict__ out,
+    int batch,
+    int tokens,
+    int q_heads,
+    int kv_heads,
+    int max_blocks_per_row,
+    int block_size,
+    float softmax_scale,
+    int hadamard_order,
+    bool bdr_k,
+    bool tiled_layout) {
+  int qh = blockIdx.x;
+  int row_step = blockIdx.y;
+  int dim = threadIdx.x;
+  int row = row_step / tokens;
+  int step = row_step - row * tokens;
+  if (row >= batch || step >= tokens || qh >= q_heads || dim >= D) return;
+  int base_len = base_seq_lens[row];
+  if (base_len < 0) base_len = 0;
+  int total_len = base_len + step + 1;
+  int ratio = q_heads / kv_heads;
+  int kvh = qh / ratio;
+  __shared__ float qk[QB_ATT_BLOCK];
+
+  const int64_t q_base = (((static_cast<int64_t>(row) * tokens + step) * q_heads + qh) * D);
+  float qval = bdr_k ? qb_bdr_rotate_value<D>(q, q_base, dim, hadamard_order) : __half2float(q[q_base + dim]);
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc = 0.0f;
+
+  for (int t = 0; t < total_len; ++t) {
+    float kval;
+    float vval;
+    if (t < base_len) {
+      int block_idx = t / block_size;
+      int offset = t - block_idx * block_size;
+      int block_id = block_tables[static_cast<int64_t>(row) * max_blocks_per_row + block_idx];
+      int64_t scale_idx = (static_cast<int64_t>(block_id) * kv_heads + kvh) * block_size + offset;
+      bool high_half = dim >= (D / 2);
+      int packed_dim = high_half ? dim - D / 2 : dim;
+      int64_t packed_idx = qb_int4_paged_offset(
+          block_id, kvh, kv_heads, block_size, D / 2, offset, packed_dim, tiled_layout);
+      uint8_t kpack = k_pages[packed_idx];
+      uint8_t vpack = v_pages[packed_idx];
+      kval = qb_unpack_uint4(kpack, high_half, __half2float(k_scales[scale_idx]), __half2float(k_zeros[scale_idx]));
+      vval = qb_unpack_uint4(vpack, high_half, __half2float(v_scales[scale_idx]), __half2float(v_zeros[scale_idx]));
+    } else {
+      int cand = t - base_len;
+      int64_t cand_base = (((static_cast<int64_t>(row) * tokens + cand) * kv_heads + kvh) * D);
+      kval = bdr_k ? qb_bdr_rotate_value<D>(k_new, cand_base, dim, hadamard_order) : __half2float(k_new[cand_base + dim]);
+      vval = __half2float(v_new[cand_base + dim]);
+    }
+    qk[dim] = qval * kval;
+    __syncthreads();
+    for (int stride = D / 2; stride > 0; stride >>= 1) {
+      if (dim < stride) qk[dim] += qk[dim + stride];
+      __syncthreads();
+    }
+    float s = qk[0] * softmax_scale;
+    float new_m = fmaxf(m, s);
+    float alpha = __expf(m - new_m);
+    float p = __expf(s - new_m);
+    acc = acc * alpha + p * vval;
+    l = l * alpha + p;
+    m = new_m;
+  }
+  out[q_base + dim] = __float2half_rn(acc / fmaxf(l, 1e-20f));
+}
+
 torch::Tensor attention_decode_paged_int4(
     torch::Tensor q,
     torch::Tensor k_new,
@@ -992,4 +1157,172 @@ void attention_append_paged_int4(
       slot_mapping.data_ptr<int64_t>(),
       batch, num_blocks, kv_heads, block_size, hadamard_order, bdr_k, tiled_layout);
   QB_CUDA_CHECK(cudaGetLastError());
+}
+
+void attention_append_paged_int4_spec(
+    torch::Tensor k_new,
+    torch::Tensor v_new,
+    torch::Tensor k_pages,
+    torch::Tensor v_pages,
+    torch::Tensor k_scales,
+    torch::Tensor v_scales,
+    torch::Tensor k_zeros,
+    torch::Tensor v_zeros,
+    torch::Tensor slot_mapping,
+    torch::Tensor commit_tokens,
+    int64_t block_size_i,
+    int64_t hadamard_order_i,
+    bool bdr_k,
+    bool rotate_v,
+    bool tiled_layout) {
+  QB_CHECK_CUDA(k_new); QB_CHECK_CUDA(v_new); QB_CHECK_CUDA(k_pages); QB_CHECK_CUDA(v_pages);
+  QB_CHECK_CUDA(k_scales); QB_CHECK_CUDA(v_scales); QB_CHECK_CUDA(k_zeros); QB_CHECK_CUDA(v_zeros);
+  QB_CHECK_CUDA(slot_mapping); QB_CHECK_CUDA(commit_tokens);
+  QB_CHECK_CONTIGUOUS(k_new); QB_CHECK_CONTIGUOUS(v_new); QB_CHECK_CONTIGUOUS(k_pages); QB_CHECK_CONTIGUOUS(v_pages);
+  QB_CHECK_CONTIGUOUS(k_scales); QB_CHECK_CONTIGUOUS(v_scales); QB_CHECK_CONTIGUOUS(k_zeros); QB_CHECK_CONTIGUOUS(v_zeros);
+  QB_CHECK_CONTIGUOUS(slot_mapping); QB_CHECK_CONTIGUOUS(commit_tokens);
+  QB_CHECK_HALF(k_new); QB_CHECK_HALF(v_new); QB_CHECK_UINT8(k_pages); QB_CHECK_UINT8(v_pages);
+  QB_CHECK_HALF(k_scales); QB_CHECK_HALF(v_scales); QB_CHECK_HALF(k_zeros); QB_CHECK_HALF(v_zeros); QB_CHECK_INT64(slot_mapping);
+  TORCH_CHECK(commit_tokens.scalar_type() == at::kInt, "commit_tokens must be int32");
+  TORCH_CHECK(!rotate_v, "INT4 BDR rotate_v is not implemented in LangBurst; use K-only BDR");
+  TORCH_CHECK(k_new.dim() == 4 && v_new.dim() == 4, "k_new/v_new must be [batch, tokens, kv_heads, head_dim]");
+  TORCH_CHECK(k_pages.dim() == 4 && v_pages.dim() == 4,
+              "paged cache must be [num_blocks, kv_heads, block_size, packed_head_dim] or [num_blocks, kv_heads, packed_head_dim, block_size]");
+  TORCH_CHECK(k_scales.dim() == 3 && v_scales.dim() == 3, "int4 scales must be [num_blocks, kv_heads, block_size]");
+  TORCH_CHECK(k_zeros.dim() == 3 && v_zeros.dim() == 3, "int4 zero points must be [num_blocks, kv_heads, block_size]");
+  int batch = static_cast<int>(k_new.size(0));
+  int tokens = static_cast<int>(k_new.size(1));
+  int kv_heads = static_cast<int>(k_new.size(2));
+  int head_dim = static_cast<int>(k_new.size(3));
+  int num_blocks = static_cast<int>(k_pages.size(0));
+  int block_size = static_cast<int>(block_size_i);
+  int hadamard_order = static_cast<int>(hadamard_order_i);
+  TORCH_CHECK(head_dim == 256, "paged spec append kernel currently specializes head_dim=256");
+  TORCH_CHECK((head_dim % 2) == 0, "INT4 KV requires even head_dim");
+  TORCH_CHECK(!bdr_k || (hadamard_order > 0 && (hadamard_order & (hadamard_order - 1)) == 0 && head_dim % hadamard_order == 0),
+              "BDR hadamard_order must be a power-of-two divisor of head_dim");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(v_new.size(0) == batch && v_new.size(1) == tokens && v_new.size(2) == kv_heads && v_new.size(3) == head_dim, "v_new shape mismatch");
+  TORCH_CHECK(k_pages.size(1) == kv_heads && v_pages.size(1) == kv_heads, "arena kv_heads mismatch");
+  if (tiled_layout) {
+    TORCH_CHECK(k_pages.size(2) == head_dim / 2 && v_pages.size(2) == head_dim / 2, "tiled int4 packed head_dim mismatch");
+    TORCH_CHECK(k_pages.size(3) == block_size && v_pages.size(3) == block_size, "tiled block_size mismatch");
+  } else {
+    TORCH_CHECK(k_pages.size(2) == block_size && v_pages.size(2) == block_size, "block_size mismatch");
+    TORCH_CHECK(k_pages.size(3) == head_dim / 2 && v_pages.size(3) == head_dim / 2, "int4 packed head_dim mismatch");
+  }
+  TORCH_CHECK(k_scales.size(0) == num_blocks && k_scales.size(1) == kv_heads && k_scales.size(2) == block_size, "k_scales shape mismatch");
+  TORCH_CHECK(v_scales.sizes() == k_scales.sizes(), "v_scales shape mismatch");
+  TORCH_CHECK(k_zeros.sizes() == k_scales.sizes(), "k_zeros shape mismatch");
+  TORCH_CHECK(v_zeros.sizes() == k_scales.sizes(), "v_zeros shape mismatch");
+  TORCH_CHECK((slot_mapping.dim() == 2 && slot_mapping.size(0) == batch && slot_mapping.size(1) == tokens) ||
+              (slot_mapping.dim() == 1 && slot_mapping.size(0) == batch * tokens),
+              "slot_mapping must be [batch,tokens] or flattened [batch*tokens]");
+  TORCH_CHECK(commit_tokens.dim() == 1 && commit_tokens.size(0) == batch, "commit_tokens must be [batch]");
+
+  auto slot_flat = slot_mapping.reshape({batch * tokens}).contiguous();
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 append_grid(batch * tokens, kv_heads);
+  attention_kv_append_paged_int4_spec_kernel<256><<<append_grid, QB_ATT_BLOCK, 0, stream>>>(
+      reinterpret_cast<const half*>(k_new.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v_new.data_ptr<at::Half>()),
+      reinterpret_cast<uint8_t*>(k_pages.data_ptr()),
+      reinterpret_cast<uint8_t*>(v_pages.data_ptr()),
+      reinterpret_cast<half*>(k_scales.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(v_scales.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(k_zeros.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(v_zeros.data_ptr<at::Half>()),
+      slot_flat.data_ptr<int64_t>(),
+      commit_tokens.data_ptr<int32_t>(),
+      batch, tokens, num_blocks, kv_heads, block_size, hadamard_order, bdr_k, tiled_layout);
+  QB_CUDA_CHECK(cudaGetLastError());
+}
+
+torch::Tensor attention_spec_decode_paged_int4(
+    torch::Tensor q,
+    torch::Tensor k_new,
+    torch::Tensor v_new,
+    torch::Tensor k_pages,
+    torch::Tensor v_pages,
+    torch::Tensor k_scales,
+    torch::Tensor v_scales,
+    torch::Tensor k_zeros,
+    torch::Tensor v_zeros,
+    torch::Tensor block_tables,
+    torch::Tensor base_seq_lens,
+    int64_t block_size_i,
+    double softmax_scale,
+    int64_t hadamard_order_i,
+    bool bdr_k,
+    bool rotate_v,
+    bool tiled_layout) {
+  QB_CHECK_CUDA(q); QB_CHECK_CUDA(k_new); QB_CHECK_CUDA(v_new); QB_CHECK_CUDA(k_pages); QB_CHECK_CUDA(v_pages);
+  QB_CHECK_CUDA(k_scales); QB_CHECK_CUDA(v_scales); QB_CHECK_CUDA(k_zeros); QB_CHECK_CUDA(v_zeros);
+  QB_CHECK_CUDA(block_tables); QB_CHECK_CUDA(base_seq_lens);
+  QB_CHECK_CONTIGUOUS(q); QB_CHECK_CONTIGUOUS(k_new); QB_CHECK_CONTIGUOUS(v_new); QB_CHECK_CONTIGUOUS(k_pages); QB_CHECK_CONTIGUOUS(v_pages);
+  QB_CHECK_CONTIGUOUS(k_scales); QB_CHECK_CONTIGUOUS(v_scales); QB_CHECK_CONTIGUOUS(k_zeros); QB_CHECK_CONTIGUOUS(v_zeros);
+  QB_CHECK_CONTIGUOUS(block_tables); QB_CHECK_CONTIGUOUS(base_seq_lens);
+  QB_CHECK_HALF(q); QB_CHECK_HALF(k_new); QB_CHECK_HALF(v_new); QB_CHECK_UINT8(k_pages); QB_CHECK_UINT8(v_pages);
+  QB_CHECK_HALF(k_scales); QB_CHECK_HALF(v_scales); QB_CHECK_HALF(k_zeros); QB_CHECK_HALF(v_zeros);
+  TORCH_CHECK(block_tables.scalar_type() == at::kInt, "block_tables must be int32");
+  TORCH_CHECK(base_seq_lens.scalar_type() == at::kInt, "base_seq_lens must be int32");
+  TORCH_CHECK(!rotate_v, "INT4 BDR rotate_v is not implemented in LangBurst; use K-only BDR");
+  TORCH_CHECK(q.dim() == 4, "q must be [batch,tokens,q_heads,head_dim]");
+  TORCH_CHECK(k_new.dim() == 4 && v_new.dim() == 4, "k_new/v_new must be [batch,tokens,kv_heads,head_dim]");
+  TORCH_CHECK(k_pages.dim() == 4 && v_pages.dim() == 4,
+              "paged cache must be [num_blocks, kv_heads, block_size, packed_head_dim] or [num_blocks, kv_heads, packed_head_dim, block_size]");
+  TORCH_CHECK(k_scales.dim() == 3 && v_scales.dim() == 3, "int4 scales must be [num_blocks, kv_heads, block_size]");
+  TORCH_CHECK(k_zeros.dim() == 3 && v_zeros.dim() == 3, "int4 zero points must be [num_blocks, kv_heads, block_size]");
+  int batch = static_cast<int>(q.size(0));
+  int tokens = static_cast<int>(q.size(1));
+  int q_heads = static_cast<int>(q.size(2));
+  int head_dim = static_cast<int>(q.size(3));
+  int kv_heads = static_cast<int>(k_new.size(2));
+  int num_blocks = static_cast<int>(k_pages.size(0));
+  int block_size = static_cast<int>(block_size_i);
+  int max_blocks_per_row = static_cast<int>(block_tables.size(1));
+  int hadamard_order = static_cast<int>(hadamard_order_i);
+  TORCH_CHECK(head_dim == 256, "paged speculative attention kernel currently specializes head_dim=256");
+  TORCH_CHECK((head_dim % 2) == 0, "INT4 KV requires even head_dim");
+  TORCH_CHECK(!bdr_k || (hadamard_order > 0 && (hadamard_order & (hadamard_order - 1)) == 0 && head_dim % hadamard_order == 0),
+              "BDR hadamard_order must be a power-of-two divisor of head_dim");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+  TORCH_CHECK(k_new.size(0) == batch && k_new.size(1) == tokens, "k_new batch/tokens mismatch");
+  TORCH_CHECK(v_new.size(0) == batch && v_new.size(1) == tokens && v_new.size(2) == kv_heads && v_new.size(3) == head_dim, "v_new shape mismatch");
+  TORCH_CHECK(k_new.size(3) == head_dim, "k_new head_dim mismatch");
+  TORCH_CHECK(k_pages.size(1) == kv_heads && v_pages.size(1) == kv_heads, "arena kv_heads mismatch");
+  if (tiled_layout) {
+    TORCH_CHECK(k_pages.size(2) == head_dim / 2 && v_pages.size(2) == head_dim / 2, "tiled int4 packed head_dim mismatch");
+    TORCH_CHECK(k_pages.size(3) == block_size && v_pages.size(3) == block_size, "tiled block_size mismatch");
+  } else {
+    TORCH_CHECK(k_pages.size(2) == block_size && v_pages.size(2) == block_size, "block_size mismatch");
+    TORCH_CHECK(k_pages.size(3) == head_dim / 2 && v_pages.size(3) == head_dim / 2, "int4 packed head_dim mismatch");
+  }
+  TORCH_CHECK(k_scales.size(0) == num_blocks && k_scales.size(1) == kv_heads && k_scales.size(2) == block_size, "k_scales shape mismatch");
+  TORCH_CHECK(v_scales.sizes() == k_scales.sizes(), "v_scales shape mismatch");
+  TORCH_CHECK(k_zeros.sizes() == k_scales.sizes(), "k_zeros shape mismatch");
+  TORCH_CHECK(v_zeros.sizes() == k_scales.sizes(), "v_zeros shape mismatch");
+  TORCH_CHECK(block_tables.size(0) == batch && base_seq_lens.size(0) == batch, "block_tables/base_seq_lens batch mismatch");
+  TORCH_CHECK(q_heads % kv_heads == 0, "q_heads must be divisible by kv_heads");
+
+  auto out = torch::empty_like(q);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 grid(q_heads, batch * tokens);
+  attention_spec_decode_paged_int4_kernel<256><<<grid, QB_ATT_BLOCK, 0, stream>>>(
+      reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(k_new.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v_new.data_ptr<at::Half>()),
+      reinterpret_cast<const uint8_t*>(k_pages.data_ptr()),
+      reinterpret_cast<const uint8_t*>(v_pages.data_ptr()),
+      reinterpret_cast<const half*>(k_scales.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v_scales.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(k_zeros.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v_zeros.data_ptr<at::Half>()),
+      block_tables.data_ptr<int32_t>(),
+      base_seq_lens.data_ptr<int32_t>(),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      batch, tokens, q_heads, kv_heads, max_blocks_per_row, block_size,
+      static_cast<float>(softmax_scale), hadamard_order, bdr_k, tiled_layout);
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
 }

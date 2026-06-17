@@ -128,6 +128,7 @@ class ContinuousBatchSchedulerStats:
     max_num_requests: int
     max_num_batched_tokens: int
     prefill_chunk_size: int
+    max_prefill_rows_per_batch: int
     decode_prefill_interleave_steps: int
     waiting_requests: int
     active_requests: int
@@ -141,6 +142,7 @@ class ContinuousBatchSchedulerStats:
             "max_num_requests": self.max_num_requests,
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "prefill_chunk_size": self.prefill_chunk_size,
+            "max_prefill_rows_per_batch": self.max_prefill_rows_per_batch,
             "decode_prefill_interleave_steps": self.decode_prefill_interleave_steps,
             "waiting_requests": self.waiting_requests,
             "active_requests": self.active_requests,
@@ -165,6 +167,7 @@ class ContinuousBatchScheduler:
         max_num_requests: int = 8,
         max_num_batched_tokens: int = 256,
         prefill_chunk_size: int = 64,
+        max_prefill_rows_per_batch: int = 0,
         decode_prefill_interleave_steps: int = 16,
         block_table: KVBlockTable | None = None,
         cuda_graph_planner: CudaGraphBucketPlanner | None = None,
@@ -175,11 +178,14 @@ class ContinuousBatchScheduler:
             raise ValueError("max_num_batched_tokens must be >= 1")
         if prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be >= 1")
+        if max_prefill_rows_per_batch < 0:
+            raise ValueError("max_prefill_rows_per_batch must be >= 0")
         if decode_prefill_interleave_steps < 1:
             raise ValueError("decode_prefill_interleave_steps must be >= 1")
         self.max_num_requests = int(max_num_requests)
         self.max_num_batched_tokens = int(max_num_batched_tokens)
         self.prefill_chunk_size = int(prefill_chunk_size)
+        self.max_prefill_rows_per_batch = int(max_prefill_rows_per_batch)
         self.decode_prefill_interleave_steps = int(decode_prefill_interleave_steps)
         self.block_table = block_table
         self.cuda_graph_planner = cuda_graph_planner
@@ -236,6 +242,12 @@ class ContinuousBatchScheduler:
         # prevents long prefill chunks from starving active decoders.
         active_rows = list(self._active.values())
         decode_rows = [r for r in active_rows if not r.is_prefilling]
+        if any(r.has_draft_tokens for r in decode_rows):
+            # Speculative verification has a different fixed-shape target
+            # contract from plain decode.  Keep one scheduled batch descriptor
+            # uniform instead of mixing rows that require forward_verify_batch
+            # with rows that should run ordinary forward_batch_logits.
+            decode_rows = [r for r in decode_rows if r.has_draft_tokens]
         prefill_rows = [r for r in active_rows if r.is_prefilling]
         prefill_due = bool(decode_rows and prefill_rows and self._decode_only_ticks >= self.decode_prefill_interleave_steps)
         for row in ([] if prefill_due else decode_rows):
@@ -254,13 +266,17 @@ class ContinuousBatchScheduler:
         # paged-KV arena states.
         if selected:
             token_budget = 0
+        prefill_rows_selected = 0
         for row in prefill_rows:
+            if self.max_prefill_rows_per_batch and prefill_rows_selected >= self.max_prefill_rows_per_batch:
+                break
             n = min(row.prefill_remaining, self.prefill_chunk_size, token_budget)
             if n <= 0:
                 continue
             selected.append(row)
             scheduled_tokens.append(n)
             token_budget -= n
+            prefill_rows_selected += 1
             if token_budget <= 0:
                 break
         if not selected:
@@ -324,6 +340,7 @@ class ContinuousBatchScheduler:
             max_num_requests=self.max_num_requests,
             max_num_batched_tokens=self.max_num_batched_tokens,
             prefill_chunk_size=self.prefill_chunk_size,
+            max_prefill_rows_per_batch=self.max_prefill_rows_per_batch,
             decode_prefill_interleave_steps=self.decode_prefill_interleave_steps,
             waiting_requests=len(self._waiting),
             active_requests=len(self._active),

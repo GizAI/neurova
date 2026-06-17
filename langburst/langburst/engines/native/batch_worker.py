@@ -453,6 +453,13 @@ class BatchGenerationWorker:
         self._active.pop(req_id, None)
         handle.finish()
         self._completed.append(handle.metrics())
+        if not self._active:
+            reset_spec = getattr(self.runner, "reset_speculative_tracker", None)
+            if callable(reset_spec):
+                reset_spec()
+            release_caches = getattr(self.runner, "release_idle_runtime_caches", None)
+            if callable(release_caches):
+                release_caches()
         self._release_idle_cuda_cache()
 
     def _cancel_active(self, req_id: str, handle: BatchGenerationHandle) -> None:
@@ -460,6 +467,13 @@ class BatchGenerationWorker:
         self._active.pop(req_id, None)
         handle.finish()
         self._completed.append(handle.metrics())
+        if not self._active:
+            reset_spec = getattr(self.runner, "reset_speculative_tracker", None)
+            if callable(reset_spec):
+                reset_spec()
+            release_caches = getattr(self.runner, "release_idle_runtime_caches", None)
+            if callable(release_caches):
+                release_caches()
         self._release_idle_cuda_cache()
 
     def _release_cancelled_active(self) -> None:

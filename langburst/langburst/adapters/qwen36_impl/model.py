@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import os
 from types import SimpleNamespace
 from typing import Any, Literal, Sequence
 
@@ -11,8 +12,9 @@ from .config import Qwen36_27B_TextConfig
 from ...loader import QuantizedStore, LowBitTensor, LowBitMarlinTensor, FP16Tensor
 from ...core.kv_cache import hadamard_transform, pack_int4_rows, unpack_int4_rows
 from ...ops import cuda_ops
+from ...engines.native.cuda_graph import CudaGraphKey, CudaGraphReplayCache
 from .state import DecodeState
-from ...speculative_batch import DecodeBatchPlan
+from ...speculative_batch import DecodeBatchPlan, resolve_speculative_gpu
 from ...tuning import (
     attention_recent_tokens,
     batch_conv_kernels_enabled,
@@ -23,9 +25,7 @@ from ...tuning import (
     paged_attention_backend,
     paged_attention_kernels_enabled,
     paged_prefill_block_enabled,
-    raw_prefill_block_tokens,
-    short_prefill_sdpa_min_free_mib,
-    short_prefill_sdpa_tokens,
+    prefill_attention_policy,
     verify_nextn_mode,
 )
 
@@ -77,7 +77,8 @@ class VerifyBlockResult:
     logits: torch.Tensor
     hidden: torch.Tensor
     state: DecodeState
-    commit_states: list[DecodeState] | None = None
+    state_already_committed: bool = False
+    speculative_decision: object | None = None
 
 
 class WeightResolver:
@@ -647,54 +648,70 @@ def append_paged_int4_block(
     )
 
 
+def append_paged_int4_spec_block(
+    arena: object,
+    layer: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    commit_tokens: torch.Tensor,
+) -> None:
+    k_pages = getattr(arena, "paged_attn_k", None)
+    v_pages = getattr(arena, "paged_attn_v", None)
+    k_scales = getattr(arena, "paged_attn_k_scale", None)
+    v_scales = getattr(arena, "paged_attn_v_scale", None)
+    k_zeros = getattr(arena, "paged_attn_k_zero", None)
+    v_zeros = getattr(arena, "paged_attn_v_zero", None)
+    if any(x is None for x in (k_pages, v_pages, k_scales, v_scales, k_zeros, v_zeros)):
+        raise RuntimeError("INT4 paged speculative append requires paged KV scale/zero tensors")
+    kv_spec = getattr(arena, "kv_cache_spec")
+    cuda_ops().attention_append_paged_int4_spec(
+        k.contiguous(),
+        v.contiguous(),
+        k_pages[layer],
+        v_pages[layer],
+        k_scales[layer],
+        v_scales[layer],
+        k_zeros[layer],
+        v_zeros[layer],
+        slot_mapping.to(device=k.device, dtype=torch.long).contiguous(),
+        commit_tokens.to(device=k.device, dtype=torch.int32).contiguous(),
+        int(getattr(arena, "kv_block_size")),
+        int(kv_spec.hadamard_order),
+        bool(kv_spec.uses_bdr),
+        bool(kv_spec.rotate_v),
+        _paged_int4_tiled_layout(arena),
+    )
+
+
 def _short_prefill_sdpa_has_free_vram(device: torch.device) -> bool:
     if device.type != "cuda":
         return False
-    min_free_mib = short_prefill_sdpa_min_free_mib()
+    min_free_mib = prefill_attention_policy().min_free_mib
     if min_free_mib <= 0:
         return True
     free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
     return free_bytes >= min_free_mib * 1024 * 1024
 
 
-def short_prefill_sdpa_staging(
-    state: DecodeState,
-    layer: int,
-    end_pos: int,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    max_tokens = short_prefill_sdpa_tokens()
-    cache = getattr(state, "_prefill_fp16_kv", None)
-    if max_tokens <= 0 or int(end_pos) > max_tokens:
-        if cache is not None:
-            cache.pop(layer, None)
-        return None
-    device = next(iter(state.gdn_states.values())).device
-    if not _short_prefill_sdpa_has_free_vram(device):
-        if cache is not None:
-            cache.pop(layer, None)
-        return None
-    if cache is None:
-        cache = {}
-        setattr(state, "_prefill_fp16_kv", cache)
-    current = cache.get(layer)
-    kv_heads = state.cfg.num_key_value_heads
-    head_dim = state.cfg.attention_head_dim
-    cap = max(64, min(max_tokens, max(int(end_pos), 1)))
-    if current is None:
-        k_buf = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
-        v_buf = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
-        cache[layer] = (k_buf, v_buf)
-        return k_buf, v_buf
-    k_buf, v_buf = current
-    if k_buf.size(1) >= int(end_pos):
-        return k_buf, v_buf
-    cap = min(max_tokens, max(int(end_pos), int(k_buf.size(1)) * 2))
-    k_new = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
-    v_new = torch.empty((kv_heads, cap, head_dim), device=device, dtype=torch.float16)
-    k_new[:, : k_buf.size(1), :].copy_(k_buf)
-    v_new[:, : v_buf.size(1), :].copy_(v_buf)
-    cache[layer] = (k_new, v_new)
-    return k_new, v_new
+def prefill_sdpa_window(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    live_len: int,
+    query_start: int,
+    query_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    recent = attention_recent_tokens()
+    start = max(0, int(query_start) - int(recent) + 1) if recent > 0 else 0
+    k_live = k_cache[:, start:int(live_len), :]
+    v_live = v_cache[:, start:int(live_len), :]
+    key_pos = torch.arange(start, int(live_len), device=k_cache.device, dtype=torch.long)
+    query_pos = torch.arange(int(query_start), int(query_start) + int(query_len), device=k_cache.device, dtype=torch.long)
+    causal = key_pos.unsqueeze(0) <= query_pos.unsqueeze(1)
+    if recent > 0:
+        causal = causal & (key_pos.unsqueeze(0) >= (query_pos.unsqueeze(1) - int(recent) + 1))
+    return k_live, v_live, causal
 
 
 def attention_decode_paged_reference(
@@ -991,6 +1008,16 @@ def _arena_batch(states: Sequence[DecodeState]) -> tuple[object, torch.Tensor] |
     return arena, torch.tensor(slots, device=device, dtype=torch.long)
 
 
+def _arena_positions(arena: object, state_indices: torch.Tensor, *, device: torch.device) -> torch.Tensor:
+    pos = getattr(arena, "pos", None)
+    if not torch.is_tensor(pos):
+        raise RuntimeError("arena-backed hot path requires device-side position counters")
+    return pos.index_select(0, state_indices.to(device=pos.device, dtype=torch.long).reshape(-1)).to(
+        device=device,
+        dtype=torch.long,
+    )
+
+
 def depthwise_conv_update_batch(
     arena: object,
     layer: int,
@@ -1017,6 +1044,64 @@ def depthwise_conv_update_batch(
         weight.to(device=state_arena.device, dtype=state_arena.dtype).contiguous(),
         (bias.to(device=state_arena.device, dtype=state_arena.dtype).contiguous() if bias is not None else empty_bias),
     )
+
+
+def depthwise_conv_update_spec(
+    arena: object,
+    layer: int,
+    state_indices: torch.Tensor,
+    commit_tokens: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    state_arena = getattr(arena, "gdn_conv_states")[layer]
+    empty_bias = torch.empty((0,), device=state_arena.device, dtype=state_arena.dtype)
+    return cuda_ops().depthwise_conv_update_spec(
+        state_arena,
+        state_indices.to(device=state_arena.device, dtype=torch.long).contiguous(),
+        commit_tokens.to(device=state_arena.device, dtype=torch.int32).contiguous(),
+        x.to(device=state_arena.device, dtype=state_arena.dtype).contiguous(),
+        weight.to(device=state_arena.device, dtype=state_arena.dtype).contiguous(),
+        (bias.to(device=state_arena.device, dtype=state_arena.dtype).contiguous() if bias is not None else empty_bias),
+    )
+
+
+def depthwise_conv_update_spec_trajectory(
+    arena: object,
+    layer: int,
+    state_indices: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    out: torch.Tensor | None = None,
+    trajectory: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    state_arena = getattr(arena, "gdn_conv_states")[layer]
+    empty_bias = torch.empty((0,), device=state_arena.device, dtype=state_arena.dtype)
+    x_in = x.to(device=state_arena.device, dtype=state_arena.dtype).contiguous()
+    weight_in = weight.to(device=state_arena.device, dtype=state_arena.dtype).contiguous()
+    bias_in = bias.to(device=state_arena.device, dtype=state_arena.dtype).contiguous() if bias is not None else empty_bias
+    if out is None or trajectory is None:
+        out, trajectory = cuda_ops().depthwise_conv_update_spec_trajectory(
+            state_arena,
+            state_indices.to(device=state_arena.device, dtype=torch.long).contiguous(),
+            x_in,
+            weight_in,
+            bias_in,
+        )
+    else:
+        cuda_ops().depthwise_conv_update_spec_trajectory_out(
+            state_arena,
+            state_indices.to(device=state_arena.device, dtype=torch.long).contiguous(),
+            x_in,
+            weight_in,
+            bias_in,
+            out,
+            trajectory,
+        )
+    return out, trajectory
 
 
 class Qwen36MLP:
@@ -1316,6 +1401,125 @@ class Qwen36GDNLayer:
         h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
         return residual + self.mlp.forward_block(h)
 
+    def forward_speculative_batch(
+        self,
+        x: torch.Tensor,
+        states: Sequence[DecodeState],
+        commit_tokens: torch.Tensor,
+        plan: Any | None = None,
+        trajectory: dict[str, object] | None = None,
+    ) -> torch.Tensor:
+        """Run this GDN layer over [B,T,D] with commit-token state semantics."""
+
+        if x.ndim != 3 or x.size(0) != len(states):
+            raise ValueError("speculative GDN input must be [batch,tokens,hidden] and match states")
+        arena_ctx = _arena_batch(states)
+        if arena_ctx is None:
+            raise RuntimeError("speculative GDN batch requires arena-backed states")
+        arena, state_indices = arena_ctx
+        batch, tokens, hidden = x.shape
+        flat = x.reshape(batch * tokens, hidden).contiguous()
+        residual = flat
+        h = qwen_rmsnorm(residual, self.input_norm, self.cfg.rms_norm_eps)
+        q, k, v, z, b, a = self.project_block(h)
+        key_dim = self.cfg.linear_key_head_dim * self.cfg.linear_num_key_heads
+        value_dim = self.cfg.linear_value_head_dim * self.cfg.linear_num_value_heads
+        conv_in = torch.cat(
+            [
+                q.reshape(batch * tokens, -1),
+                k.reshape(batch * tokens, -1),
+                v.reshape(batch * tokens, -1),
+            ],
+            dim=-1,
+        ).reshape(batch, tokens, -1).contiguous()
+        if trajectory is not None:
+            workspace = trajectory.get("workspace") if isinstance(trajectory, dict) else None
+            layer_ws = workspace.get(self.layer, {}) if isinstance(workspace, dict) else {}
+            conv_out_raw, conv_traj = depthwise_conv_update_spec_trajectory(
+                arena,
+                self.layer,
+                state_indices,
+                conv_in,
+                self.conv_weight,
+                self.conv_bias,
+                out=layer_ws.get("conv_out"),
+                trajectory=layer_ws.get("conv_traj"),
+            )
+            trajectory.setdefault("conv", []).append((self.layer, conv_traj))
+            conv_out = conv_out_raw.reshape(batch * tokens, -1)
+        else:
+            conv_out = depthwise_conv_update_spec(
+                arena,
+                self.layer,
+                state_indices,
+                commit_tokens,
+                conv_in,
+                self.conv_weight,
+                self.conv_bias,
+            ).reshape(batch * tokens, -1)
+        q2, k2, v2 = torch.split(conv_out, [key_dim, key_dim, value_dim], dim=-1)
+        q = q2.view(batch, tokens, self.cfg.linear_num_key_heads, self.cfg.linear_key_head_dim).contiguous()
+        k = k2.view_as(q).contiguous()
+        v = v2.view(batch, tokens, self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim).contiguous()
+        ops = cuda_ops()
+        a_spec = a.to(device=x.device, dtype=torch.float16).view(batch, tokens, self.cfg.linear_num_value_heads).contiguous()
+        b_spec = b.to(device=x.device, dtype=torch.float16).view(batch, tokens, self.cfg.linear_num_value_heads).contiguous()
+        if trajectory is not None:
+            workspace = trajectory.get("workspace") if isinstance(trajectory, dict) else None
+            layer_ws = workspace.get(self.layer, {}) if isinstance(workspace, dict) else {}
+            core = layer_ws.get("gdn_out")
+            gdn_traj = layer_ws.get("gdn_traj")
+            if core is None or gdn_traj is None:
+                core, gdn_traj = ops.gdn_recurrent_ab_spec_trajectory(
+                    q,
+                    k,
+                    v,
+                    a_spec,
+                    b_spec,
+                    self.A_log,
+                    self.dt_bias,
+                    getattr(arena, "gdn_states")[self.layer],
+                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                )
+            else:
+                ops.gdn_recurrent_ab_spec_trajectory_out(
+                    q,
+                    k,
+                    v,
+                    a_spec,
+                    b_spec,
+                    self.A_log,
+                    self.dt_bias,
+                    getattr(arena, "gdn_states")[self.layer],
+                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                    core,
+                    gdn_traj,
+                )
+            trajectory.setdefault("gdn", []).append((self.layer, gdn_traj))
+        else:
+            core = ops.gdn_recurrent_ab_spec(
+                q,
+                k,
+                v,
+                a_spec,
+                b_spec,
+                self.A_log,
+                self.dt_bias,
+                getattr(arena, "gdn_states")[self.layer],
+                state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                commit_tokens.to(device=x.device, dtype=torch.int32).contiguous(),
+            )
+        core_norm = gdn_norm_silu_gate_2d(
+            core.reshape(batch * tokens, -1),
+            self.gdn_norm_w,
+            z.reshape(batch * tokens, -1),
+            self.cfg.rms_norm_eps,
+        )
+        h = residual + linear_any(self.out_proj, core_norm)
+        residual = h
+        h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+        return (residual + self.mlp.forward_block(h)).reshape(batch, tokens, hidden).contiguous()
+
 
 class Qwen36AttentionLayer:
     def __init__(self, cfg: Qwen36_27B_TextConfig, weights: WeightResolver, layer: int):
@@ -1425,12 +1629,12 @@ class Qwen36AttentionLayer:
             state.attn_k[self.layer][:, base_pos : base_pos + x.size(0), :].copy_(k_rope.permute(1, 0, 2).contiguous())
             state.attn_v[self.layer][:, base_pos : base_pos + x.size(0), :].copy_(v.permute(1, 0, 2).contiguous())
             live_len = min(base_kv_len + x.size(0), state.max_seq_len)
-            k_live = state.attn_k[self.layer][:, :live_len, :].to(dtype=torch.float16).contiguous()
-            v_live = state.attn_v[self.layer][:, :live_len, :].to(dtype=torch.float16).contiguous()
-            prefix_len = max(0, live_len - x.size(0))
-            causal = torch.ones((x.size(0), live_len), device=x.device, dtype=torch.bool)
-            causal[:, prefix_len:] = torch.tril(
-                torch.ones((x.size(0), x.size(0)), device=x.device, dtype=torch.bool)
+            k_live, v_live, causal = prefill_sdpa_window(
+                state.attn_k[self.layer][:, :live_len, :].to(dtype=torch.float16).contiguous(),
+                state.attn_v[self.layer][:, :live_len, :].to(dtype=torch.float16).contiguous(),
+                live_len=int(live_len),
+                query_start=int(base_pos),
+                query_len=int(x.size(0)),
             )
             att = F.scaled_dot_product_attention(
                 q_rope.permute(1, 0, 2).unsqueeze(0).contiguous(),
@@ -1448,6 +1652,95 @@ class Qwen36AttentionLayer:
             residual = h
             h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
             return residual + self.mlp.forward_block(h)
+
+        can_staged_int4_sdpa_prefill = (
+            x.device.type == "cuda"
+            and state.kv_cache_spec.is_int4
+            and base_pos >= 0
+            and base_pos + x.size(0) <= state.max_seq_len
+            and base_kv_len < state.max_seq_len
+        )
+        if can_staged_int4_sdpa_prefill:
+            q_rope, k_rope = apply_rope_block(
+                q,
+                k,
+                start_pos=base_pos,
+                rope_dim=self.cfg.rope_dim,
+                rope_theta=self.cfg.rope_theta,
+            )
+            write_start = int(base_pos)
+            write_end = int(base_pos) + int(x.size(0))
+            live_len = min(base_kv_len + x.size(0), state.max_seq_len)
+            policy = prefill_attention_policy()
+            if (
+                int(base_kv_len) == 0
+                and policy.allows_fresh_sdpa(tokens=int(x.size(0)))
+                and _short_prefill_sdpa_has_free_vram(x.device)
+            ):
+                k_scratch = k_rope.permute(1, 0, 2).contiguous()
+                v_scratch = v.permute(1, 0, 2).contiguous()
+                causal = torch.tril(torch.ones((x.size(0), x.size(0)), device=x.device, dtype=torch.bool))
+                att = F.scaled_dot_product_attention(
+                    q_rope.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                    k_scratch.unsqueeze(0),
+                    v_scratch.unsqueeze(0),
+                    attn_mask=causal,
+                    dropout_p=0.0,
+                    scale=self.cfg.attention_head_dim ** -0.5,
+                    enable_gqa=(self.cfg.num_attention_heads != self.cfg.num_key_value_heads),
+                )
+                state.append_attention_kv_block_at(
+                    self.layer,
+                    k_rope.contiguous(),
+                    v.contiguous(),
+                    start_logical_pos=write_start,
+                )
+                att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
+                if gate_flat is not None:
+                    att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                h = residual + linear_any(self.o_proj, att_block)
+                residual = h
+                h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+                return residual + self.mlp.forward_block(h)
+            if (
+                int(base_kv_len) > 0
+                and policy.allows_extend_sdpa(live_tokens=int(live_len))
+                and _short_prefill_sdpa_has_free_vram(x.device)
+            ):
+                state.append_attention_kv_block_at(
+                    self.layer,
+                    k_rope.contiguous(),
+                    v.contiguous(),
+                    start_logical_pos=write_start,
+                )
+                k_cache, v_cache, live_len = state.attention_kv_view_at(
+                    self.layer,
+                    logical_pos=write_end - 1,
+                    live_len=int(live_len),
+                )
+                k_live, v_live, causal = prefill_sdpa_window(
+                    k_cache.to(dtype=torch.float16).contiguous(),
+                    v_cache.to(dtype=torch.float16).contiguous(),
+                    live_len=int(live_len),
+                    query_start=int(base_pos),
+                    query_len=int(x.size(0)),
+                )
+                att = F.scaled_dot_product_attention(
+                    q_rope.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                    k_live.unsqueeze(0),
+                    v_live.unsqueeze(0),
+                    attn_mask=causal,
+                    dropout_p=0.0,
+                    scale=self.cfg.attention_head_dim ** -0.5,
+                    enable_gqa=(self.cfg.num_attention_heads != self.cfg.num_key_value_heads),
+                )
+                att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
+                if gate_flat is not None:
+                    att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                h = residual + linear_any(self.o_proj, att_block)
+                residual = h
+                h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+                return residual + self.mlp.forward_block(h)
 
         att_rows = []
         for offset in range(x.size(0)):
@@ -1520,7 +1813,7 @@ class Qwen36AttentionLayer:
         arena_ctx = _arena_batch([state])
         if arena_ctx is None:
             raise RuntimeError("paged prefill block requires arena-backed state")
-        arena, _state_indices = arena_ctx
+        arena, state_indices = arena_ctx
         device = x.device
         block_tables = plan.block_tables
         slot_mapping = plan.slot_mapping
@@ -1541,20 +1834,52 @@ class Qwen36AttentionLayer:
         kv_spec = getattr(arena, "kv_cache_spec")
         block_slots = slot_mapping[int(start) : int(start) + x.size(0)].contiguous()
         if kv_spec.is_int4 and x.device.type == "cuda":
-            append_paged_int4_block(arena, self.layer, k_rope, v, block_slots)
             write_start = int(getattr(state, "pos", 0))
             write_end = write_start + x.size(0)
-            staging = short_prefill_sdpa_staging(state, self.layer, write_end)
-            if staging is not None:
-                k_stage, v_stage = staging
-                k_stage[:, write_start:write_end, :].copy_(k_rope.permute(1, 0, 2).contiguous())
-                v_stage[:, write_start:write_end, :].copy_(v.permute(1, 0, 2).contiguous())
-                k_live = k_stage[:, :write_end, :]
-                v_live = v_stage[:, :write_end, :]
-                prefix_len = max(0, write_end - x.size(0))
-                causal = torch.ones((x.size(0), write_end), device=x.device, dtype=torch.bool)
-                causal[:, prefix_len:] = torch.tril(
-                    torch.ones((x.size(0), x.size(0)), device=x.device, dtype=torch.bool)
+            policy = prefill_attention_policy()
+            if (
+                write_start == 0
+                and policy.allows_fresh_sdpa(tokens=int(x.size(0)))
+                and _short_prefill_sdpa_has_free_vram(x.device)
+            ):
+                k_scratch = k_rope.permute(1, 0, 2).contiguous()
+                v_scratch = v.permute(1, 0, 2).contiguous()
+                causal = torch.tril(torch.ones((x.size(0), x.size(0)), device=x.device, dtype=torch.bool))
+                att = F.scaled_dot_product_attention(
+                    q_rope.permute(1, 0, 2).unsqueeze(0).contiguous(),
+                    k_scratch.unsqueeze(0),
+                    v_scratch.unsqueeze(0),
+                    attn_mask=causal,
+                    dropout_p=0.0,
+                    scale=self.cfg.attention_head_dim ** -0.5,
+                    enable_gqa=(self.cfg.num_attention_heads != self.cfg.num_key_value_heads),
+                )
+                append_paged_int4_block(arena, self.layer, k_rope, v, block_slots)
+                att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
+                if gate_flat is not None:
+                    att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                h = residual + linear_any(self.o_proj, att_block)
+                residual = h
+                h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+                return residual + self.mlp.forward_block(h)
+            append_paged_int4_block(arena, self.layer, k_rope, v, block_slots)
+            if (
+                write_start > 0
+                and policy.allows_extend_sdpa(live_tokens=int(write_end))
+                and _short_prefill_sdpa_has_free_vram(x.device)
+                and arena_has_canonical_attention_mirror(arena, self.layer)
+            ):
+                slot = int(getattr(state, "arena_slot", 0))
+                k_cache = getattr(arena, "attn_k")[self.layer][slot]
+                v_cache = getattr(arena, "attn_v")[self.layer][slot]
+                k_cache[:, write_start:write_end, :].copy_(k_rope.permute(1, 0, 2).contiguous())
+                v_cache[:, write_start:write_end, :].copy_(v.permute(1, 0, 2).contiguous())
+                k_live, v_live, causal = prefill_sdpa_window(
+                    k_cache.to(dtype=torch.float16).contiguous(),
+                    v_cache.to(dtype=torch.float16).contiguous(),
+                    live_len=int(write_end),
+                    query_start=int(write_start),
+                    query_len=int(x.size(0)),
                 )
                 att = F.scaled_dot_product_attention(
                     q_rope.permute(1, 0, 2).unsqueeze(0).contiguous(),
@@ -1698,6 +2023,117 @@ class Qwen36AttentionLayer:
         h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
         return residual + self.mlp.forward_block(h)
 
+    def forward_speculative_batch(
+        self,
+        x: torch.Tensor,
+        states: Sequence[DecodeState],
+        commit_tokens: torch.Tensor,
+        plan: Any | None = None,
+        trajectory: dict[str, list] | None = None,
+    ) -> torch.Tensor:
+        """Run this attention layer over [B,T,D] without verifier live-KV pollution."""
+
+        if x.ndim != 3 or x.size(0) != len(states):
+            raise ValueError("speculative attention input must be [batch,tokens,hidden] and match states")
+        arena_ctx = _arena_batch(states)
+        if arena_ctx is None or plan is None:
+            raise RuntimeError("speculative attention batch requires arena-backed states and a decode plan")
+        arena, state_indices = arena_ctx
+        kv_spec = getattr(arena, "kv_cache_spec")
+        if not kv_spec.is_int4:
+            raise RuntimeError("speculative attention hot path currently requires INT4/BDR paged KV")
+        if getattr(plan, "block_tables", None) is None or getattr(plan, "slot_mapping", None) is None:
+            raise RuntimeError("speculative attention requires block_tables and slot_mapping")
+
+        batch, tokens, hidden = x.shape
+        flat = x.reshape(batch * tokens, hidden).contiguous()
+        residual = flat
+        h = qwen_rmsnorm(residual, self.input_norm, self.cfg.rms_norm_eps)
+        if self.qkv_proj is not None:
+            qkv_all = linear_any(self.qkv_proj, h)
+            kv_rows = self.cfg.num_key_value_heads * self.cfg.attention_head_dim
+            q_all, k_all, v_all = torch.split(qkv_all, [self.qkv_q_rows, kv_rows, kv_rows], dim=-1)
+        else:
+            q_all = linear_any(self.q_proj, h)  # type: ignore[arg-type]
+            k_all = linear_any(self.k_proj, h)  # type: ignore[arg-type]
+            v_all = linear_any(self.v_proj, h)  # type: ignore[arg-type]
+
+        q_dim = self.cfg.num_attention_heads * self.cfg.attention_head_dim
+        gate_flat: torch.Tensor | None
+        if q_all.size(-1) == q_dim * 2:
+            q_heads = q_all.view(batch * tokens, self.cfg.num_attention_heads, self.cfg.attention_head_dim * 2)
+            q, gate = torch.chunk(q_heads, 2, dim=-1)
+            q = q.contiguous()
+            gate_flat = gate.reshape(batch * tokens, -1).contiguous()
+        else:
+            q = q_all.view(batch * tokens, self.cfg.num_attention_heads, self.cfg.attention_head_dim).contiguous()
+            gate_flat = None
+        k = k_all.view(batch * tokens, self.cfg.num_key_value_heads, self.cfg.attention_head_dim).contiguous()
+        v = v_all.view(batch * tokens, self.cfg.num_key_value_heads, self.cfg.attention_head_dim).contiguous()
+        if self.q_norm is not None:
+            q = qwen_rmsnorm_lastdim(q, self.q_norm, self.cfg.rms_norm_eps)
+        if self.k_norm is not None:
+            k = qwen_rmsnorm_lastdim(k, self.k_norm, self.cfg.rms_norm_eps)
+
+        base_positions = _arena_positions(arena, state_indices, device=x.device)
+        positions = (base_positions.unsqueeze(1) + torch.arange(tokens, device=x.device, dtype=torch.long).unsqueeze(0)).reshape(batch * tokens).contiguous()
+        q_rope, k_rope = apply_rope_decode_batch(
+            q,
+            k,
+            positions=positions,
+            rope_dim=self.cfg.rope_dim,
+            rope_theta=self.cfg.rope_theta,
+        )
+        q_btd = q_rope.reshape(batch, tokens, self.cfg.num_attention_heads, self.cfg.attention_head_dim).contiguous()
+        k_btd = k_rope.reshape(batch, tokens, self.cfg.num_key_value_heads, self.cfg.attention_head_dim).contiguous()
+        v_btd = v.reshape(batch, tokens, self.cfg.num_key_value_heads, self.cfg.attention_head_dim).contiguous()
+        block_tables = plan.block_tables.to(device=x.device, dtype=torch.int32).contiguous()
+        base_seq_lens = base_positions.to(dtype=torch.int32).contiguous()
+        att = cuda_ops().attention_spec_decode_paged_int4(
+            q_btd,
+            k_btd,
+            v_btd,
+            getattr(arena, "paged_attn_k")[self.layer],
+            getattr(arena, "paged_attn_v")[self.layer],
+            getattr(arena, "paged_attn_k_scale")[self.layer],
+            getattr(arena, "paged_attn_v_scale")[self.layer],
+            getattr(arena, "paged_attn_k_zero")[self.layer],
+            getattr(arena, "paged_attn_v_zero")[self.layer],
+            block_tables,
+            base_seq_lens,
+            int(getattr(arena, "kv_block_size")),
+            self.cfg.attention_head_dim ** -0.5,
+            int(kv_spec.hadamard_order),
+            bool(kv_spec.uses_bdr),
+            bool(kv_spec.rotate_v),
+            _paged_int4_tiled_layout(arena),
+        ).reshape(batch * tokens, -1).contiguous()
+        if gate_flat is not None:
+            att = att * torch.sigmoid(gate_flat.to(att.dtype))
+
+        slot_mapping = plan.slot_mapping.to(device=x.device, dtype=torch.long)
+        if slot_mapping.ndim == 1:
+            row_spans = getattr(plan, "row_spans", None)
+            if row_spans is None:
+                raise RuntimeError("flat speculative slot_mapping requires row_spans")
+            rows = []
+            for row in range(batch):
+                start, end = row_spans[row]
+                slots = slot_mapping[int(start) : int(end)]
+                if slots.numel() < tokens:
+                    raise RuntimeError("slot_mapping row has fewer slots than speculative tokens")
+                rows.append(slots[:tokens])
+            slot_mapping = torch.stack(rows, dim=0).contiguous()
+        if trajectory is not None:
+            trajectory.setdefault("attn", []).append((self.layer, k_btd, v_btd, slot_mapping))
+        else:
+            append_paged_int4_spec_block(arena, self.layer, k_btd, v_btd, slot_mapping, commit_tokens)
+
+        h = residual + linear_any(self.o_proj, att)
+        residual = h
+        h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
+        return (residual + self.mlp.forward_block(h)).reshape(batch, tokens, hidden).contiguous()
+
 
 class Qwen36Model:
     def __init__(
@@ -1725,6 +2161,13 @@ class Qwen36Model:
             else:
                 raise KeyError("lm_head.weight is required when embeddings are low-bit")
         self.lm_head = lm
+        self._verify_graph_cache = CudaGraphReplayCache(
+            enabled=os.environ.get("LANGBURST_CUDA_GRAPH", "").strip().lower() in {"1", "true", "on", "yes"},
+            warmup_steps=0,
+        )
+        self._verify_graph_outputs: dict[CudaGraphKey, list[VerifyBlockResult]] = {}
+        self._spec_workspace_cache: dict[tuple[str, int, int, torch.dtype, int], dict[int, dict[str, torch.Tensor]]] = {}
+        self._spec_index_cache: dict[tuple[str, int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
         self.layers = []
         for i in range(self.cfg.num_layers):
             if self.cfg.layer_type(i) == "gdn":
@@ -1734,6 +2177,11 @@ class Qwen36Model:
 
     def reset(self) -> None:
         return None
+
+    def clear_runtime_caches(self) -> None:
+        self._verify_graph_outputs.clear()
+        self._spec_workspace_cache.clear()
+        self._spec_index_cache.clear()
 
     @torch.no_grad()
     def forward_one(
@@ -1878,7 +2326,6 @@ class Qwen36Model:
         row_spans = getattr(plan, "row_spans", None)
         draft_counts = getattr(plan, "num_draft_tokens_per_request", [0] * num_requests)
         prefill_flags = getattr(plan, "is_prefill", [False] * num_requests)
-        max_row_tokens = max((end - start for start, end in row_spans), default=1) if row_spans is not None else 1
         canonical_prefill_kv = all(has_canonical_attention_kv(state) for state in states)
         if (
             return_logits
@@ -1896,7 +2343,6 @@ class Qwen36Model:
             and any((end - start) > 1 for start, end in row_spans)
             and num_requests == 1
             and paged_prefill_block_enabled()
-            and paged_attention_kernels_enabled()
         ):
             return self._forward_prefill_paged_block_single(
                 getattr(plan, "input_ids"),
@@ -1911,7 +2357,7 @@ class Qwen36Model:
             and all(bool(v) for v in prefill_flags)
             and all(int(v) == 0 for v in draft_counts)
             and any((end - start) > 1 for start, end in row_spans)
-            and (num_requests > 1 or max_row_tokens > raw_prefill_block_tokens() or not canonical_prefill_kv)
+            and (num_requests > 1 or not canonical_prefill_kv)
         ):
             return self._forward_prefill_timestep_batch(
                 getattr(plan, "input_ids"),
@@ -1963,7 +2409,6 @@ class Qwen36Model:
         row_spans = getattr(plan, "row_spans", None)
         draft_counts = getattr(plan, "num_draft_tokens_per_request")
         prefill_flags = getattr(plan, "is_prefill", [False] * num_requests)
-        max_row_tokens = max((end - start for start, end in row_spans), default=1) if row_spans is not None else 1
         canonical_prefill_kv = all(has_canonical_attention_kv(state) for state in states)
         if (
             row_spans is not None
@@ -1981,7 +2426,6 @@ class Qwen36Model:
             and num_requests == 1
             and not canonical_prefill_kv
             and paged_prefill_block_enabled()
-            and paged_attention_kernels_enabled()
         ):
             outputs = self._forward_prefill_paged_block_single(
                 getattr(plan, "input_ids"),
@@ -1997,7 +2441,7 @@ class Qwen36Model:
             and all(bool(v) for v in prefill_flags)
             and all(int(v) == 0 for v in draft_counts)
             and any((end - start) > 1 for start, end in row_spans)
-            and (num_requests > 1 or max_row_tokens > raw_prefill_block_tokens() or not canonical_prefill_kv)
+            and (num_requests > 1 or not canonical_prefill_kv)
         ):
             outputs = self._forward_prefill_timestep_batch(
                 getattr(plan, "input_ids"),
@@ -2125,8 +2569,8 @@ class Qwen36Model:
             raise ValueError("prefill timestep batch requires non-empty rows")
 
         final_logits: list[torch.Tensor | None] = [None] * len(states)
-        max_steps = max(lengths)
-        for step in range(max_steps):
+        max_prefill_steps = max(lengths)
+        for step in range(max_prefill_steps):
             active_rows = [row for row, length in enumerate(lengths) if step < length]
             if not active_rows:
                 continue
@@ -2233,97 +2677,6 @@ class Qwen36Model:
         )
 
     @torch.no_grad()
-    def _forward_verify_block_fast(
-        self,
-        tokens: Sequence[int],
-        state: DecodeState,
-        *,
-        num_candidates: int,
-    ) -> VerifyBlockResult:
-        token_list = [int(t) for t in tokens]
-        if not token_list:
-            raise ValueError("verify block requires at least one token")
-        if num_candidates < 0 or num_candidates >= len(token_list):
-            raise ValueError("num_candidates must be in [0, len(tokens) - 1]")
-        token_tensor = torch.tensor(token_list, device=self.device, dtype=torch.long)
-        x = embed_lookup_batch(self.embed, token_tensor, self.device)
-        base_pos = state.pos
-        base_kv_len = state.kv_len
-        for layer in self.layers:
-            if isinstance(layer, Qwen36AttentionLayer):
-                x = layer.forward_block(x, state, base_pos=base_pos, base_kv_len=base_kv_len)
-            else:
-                x = layer.forward_block(x, state)
-        for _ in token_list:
-            state.finish_token()
-        state.last_raw_hidden = x[-1].contiguous().clone()
-        h = qwen_rmsnorm(x.contiguous(), self.final_norm, self.cfg.rms_norm_eps)
-        logits = linear_any(self.lm_head, h).contiguous()
-        target_ids = torch.empty((num_candidates,), device=self.device, dtype=torch.long)
-        for i in range(num_candidates):
-            logits_i = logits[i].contiguous()
-            if logits_i.device.type == "cuda":
-                target_ids[i] = cuda_ops().argmax(logits_i).reshape(())
-            else:
-                target_ids[i] = torch.argmax(logits_i, dim=-1).reshape(())
-        return VerifyBlockResult(
-            target_ids=target_ids,
-            logits=logits[-1].contiguous().clone(),
-            hidden=h[-1].contiguous().clone(),
-            state=state,
-        )
-
-    @torch.no_grad()
-    def forward_verify_block(
-        self,
-        tokens: Sequence[int],
-        state: DecodeState,
-        *,
-        num_candidates: int,
-    ) -> VerifyBlockResult:
-        """Run a speculative target block without materializing every logits row.
-
-        The verifier needs argmax IDs for candidate positions and full logits
-        only for the continuation after the final accepted token. Keeping every
-        248K-vocab row as a Python list is substantially slower than continuous-serving
-        rejection metadata, so this path stores scalar target IDs for checks.
-        """
-        token_list = [int(t) for t in tokens]
-        if not token_list:
-            raise ValueError("verify block requires at least one token")
-        if num_candidates < 0 or num_candidates >= len(token_list):
-            raise ValueError("num_candidates must be in [0, len(tokens) - 1]")
-        mode = verify_nextn_mode()
-        if mode in {"block", "fused"} and len(token_list) > 1:
-            return self._forward_verify_block_fast(
-                token_list,
-                state,
-                num_candidates=num_candidates,
-            )
-        target_ids = torch.empty((num_candidates,), device=self.device, dtype=torch.long)
-        logits: torch.Tensor | None = None
-        hidden: torch.Tensor | None = None
-        for i, token in enumerate(token_list):
-            logits, hidden = self.forward_one(
-                token,
-                state,
-                return_hidden=True,
-                return_raw_hidden=False,
-            )
-            if i < num_candidates:
-                if logits.device.type == "cuda":
-                    target_ids[i] = cuda_ops().argmax(logits.contiguous()).reshape(())
-                else:
-                    target_ids[i] = torch.argmax(logits, dim=-1).reshape(())
-        assert logits is not None and hidden is not None
-        return VerifyBlockResult(
-            target_ids=target_ids,
-            logits=logits,
-            hidden=hidden,
-            state=state,
-        )
-
-    @torch.no_grad()
     def forward_verify_batch(
         self,
         plan: object,
@@ -2333,43 +2686,323 @@ class Qwen36Model:
 
         Arena-backed serving rows must not fall back to the ordinary single-row
         block verifier: that bypasses the batch GDN/conv state kernels and the
-        paged-attention contract used by normal continuous decode.  When the
-        plan carries arena/paged state, advance candidates by timestep and batch
-        all active rows through each layer's `forward_decode_batch` path.  The
-        non-arena block verifier remains only as a local/single-state fallback.
+        paged-attention contract used by normal continuous decode.
         """
 
         num_requests = int(getattr(plan, "num_requests"))
         if len(states) != num_requests:
             raise ValueError("states length must match plan.num_requests")
+        if self._verify_batch_uses_state_hot_path(plan, states):
+            return self._forward_verify_batch_uniform_hot(plan, states)
+        raise RuntimeError("Qwen36 forward_verify_batch requires arena-backed paged speculative hot path")
+
+    def _build_uniform_spec_plan(self, plan: object, states: Sequence[DecodeState]) -> tuple[DecodeBatchPlan, torch.Tensor, torch.Tensor]:
         row_spans = getattr(plan, "row_spans")
         input_ids = getattr(plan, "input_ids")
-        draft_counts = getattr(plan, "num_draft_tokens_per_request")
-        token_rows: list[list[int]] = []
+        batch = len(states)
+        lengths = [int(end) - int(start) for start, end in row_spans]
+        if not lengths or any(length <= 0 for length in lengths):
+            raise RuntimeError("verify batch requires non-empty rows")
+        tokens = max(lengths)
+        device = torch.device(self.device)
+        token_matrix = torch.empty((batch, tokens), device=device, dtype=torch.long)
+        for row, (start, end) in enumerate(row_spans):
+            row_tokens = input_ids[int(start) : int(end)].to(device=device, dtype=torch.long)
+            token_matrix[row, : row_tokens.numel()] = row_tokens
+            if int(row_tokens.numel()) < tokens:
+                token_matrix[row, int(row_tokens.numel()) :] = row_tokens[-1]
+
+        slot_mapping = getattr(plan, "slot_mapping", None)
+        if slot_mapping is None:
+            raise RuntimeError("uniform speculative verifier requires slot_mapping")
+        slot_mapping = slot_mapping.to(device=device, dtype=torch.long)
+        if slot_mapping.ndim == 2:
+            slot_matrix = slot_mapping[:, :tokens].contiguous()
+        else:
+            slot_matrix = torch.empty((batch, tokens), device=device, dtype=torch.long)
+            for row, (start, end) in enumerate(row_spans):
+                row_slots = slot_mapping[int(start) : int(end)]
+                if int(row_slots.numel()) <= 0:
+                    raise RuntimeError("verify row has no KV slots")
+                slot_matrix[row, : row_slots.numel()] = row_slots
+                if int(row_slots.numel()) < tokens:
+                    slot_matrix[row, int(row_slots.numel()) :] = row_slots[-1]
+        arena = getattr(states[0], "arena", None) if states else None
+        state_indices = getattr(plan, "state_indices", None)
+        if arena is None or state_indices is None or not torch.is_tensor(getattr(arena, "pos", None)):
+            raise RuntimeError("uniform speculative verifier requires arena device-side position counters")
+        base_positions = _arena_positions(arena, state_indices, device=device)
+        positions = (base_positions.unsqueeze(1) + torch.arange(tokens, dtype=torch.long, device=device).unsqueeze(0)).reshape(-1).contiguous()
+        uniform = replace(
+            plan,
+            input_ids=token_matrix.reshape(-1).contiguous(),
+            positions=positions,
+            query_start_loc=torch.arange(0, (batch + 1) * tokens, tokens, dtype=torch.int32, device=device),
+            seq_lens=(base_positions + tokens).to(dtype=torch.int32),
+            logits_indices=torch.arange(0, batch * tokens, dtype=torch.long, device=device),
+            cu_num_logits=torch.arange(0, (batch + 1) * tokens, tokens, dtype=torch.int32, device=device),
+            row_spans=tuple((row * tokens, (row + 1) * tokens) for row in range(batch)),
+            num_scheduled_tokens=[tokens] * batch,
+            slot_mapping=slot_matrix.contiguous(),
+        )
+        return uniform, token_matrix, torch.tensor(lengths, device=device, dtype=torch.int32)
+
+    def _spec_workspace_for(
+        self,
+        *,
+        arena: object,
+        batch: int,
+        tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[int, dict[str, torch.Tensor]]:
+        key = (str(device), int(batch), int(tokens), dtype, int(id(arena)))
+        cached = self._spec_workspace_cache.get(key)
+        if cached is not None:
+            return cached
+        workspace: dict[int, dict[str, torch.Tensor]] = {}
+        conv_states = getattr(arena, "gdn_conv_states", {})
+        gdn_states = getattr(arena, "gdn_states", {})
+        for layer in self.layers:
+            if not isinstance(layer, Qwen36GDNLayer):
+                continue
+            conv_state = conv_states[layer.layer]
+            gdn_state = gdn_states[layer.layer]
+            conv_channels = int(conv_state.size(1))
+            conv_history = int(conv_state.size(2))
+            v_heads = int(gdn_state.size(1))
+            head_dim = int(gdn_state.size(2))
+            workspace[layer.layer] = {
+                "conv_out": torch.empty((batch, tokens, conv_channels), device=device, dtype=dtype),
+                "conv_traj": torch.empty((batch, tokens, conv_channels, conv_history), device=device, dtype=dtype),
+                "gdn_out": torch.empty((batch, tokens, v_heads, head_dim), device=device, dtype=dtype),
+                "gdn_traj": torch.empty((batch, tokens, v_heads, head_dim, head_dim), device=device, dtype=dtype),
+            }
+        self._spec_workspace_cache[key] = workspace
+        return workspace
+
+    def _spec_logit_positions(
+        self,
+        *,
+        draft_counts: Sequence[int],
+        tokens: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        counts = tuple(int(v) for v in draft_counts)
+        key = (str(device), int(tokens), counts)
+        cached = self._spec_index_cache.get(key)
+        if cached is not None:
+            return cached
+        target_positions: list[int] = []
+        bonus_positions: list[int] = []
+        for row, draft_n in enumerate(counts):
+            row_start = row * int(tokens)
+            target_positions.extend(row_start + offset for offset in range(draft_n))
+            bonus_positions.append(row_start + draft_n)
+        target_tensor = torch.tensor(target_positions, dtype=torch.long, device=device)
+        bonus_tensor = torch.tensor(bonus_positions, dtype=torch.long, device=device)
+        cached = (target_tensor, bonus_tensor)
+        self._spec_index_cache[key] = cached
+        return cached
+
+    def _forward_speculative_uniform_layers(
+        self,
+        token_matrix: torch.Tensor,
+        states: Sequence[DecodeState],
+        plan: DecodeBatchPlan,
+        commit_tokens: torch.Tensor,
+        trajectory: dict[str, list] | None = None,
+    ) -> torch.Tensor:
+        x = embed_lookup_batch(self.embed, token_matrix.reshape(-1).contiguous(), self.device)
+        x = x.reshape(token_matrix.size(0), token_matrix.size(1), -1).contiguous()
+        for layer in self.layers:
+            forward_speculative_batch = getattr(layer, "forward_speculative_batch", None)
+            if not callable(forward_speculative_batch):
+                raise RuntimeError(f"layer {type(layer).__name__} does not support uniform speculative batching")
+            x = forward_speculative_batch(x, states, commit_tokens, plan, trajectory=trajectory)
+        return x.contiguous()
+
+    def _commit_speculative_trajectory(
+        self,
+        *,
+        trajectory: dict[str, list],
+        arena: object,
+        state_indices: torch.Tensor,
+        commit_tokens: torch.Tensor,
+    ) -> None:
+        device = commit_tokens.device
+        state_idx = state_indices.to(device=device, dtype=torch.long).reshape(-1).contiguous()
+        row_index = torch.arange(int(commit_tokens.numel()), device=device, dtype=torch.long)
+        last_indices = torch.clamp(commit_tokens.to(device=device, dtype=torch.long) - 1, min=0)
+        for layer, conv_traj in trajectory.get("conv", []):
+            selected = conv_traj[row_index, last_indices].contiguous()
+            getattr(arena, "gdn_conv_states")[layer].index_copy_(0, state_idx, selected)
+        for layer, gdn_traj in trajectory.get("gdn", []):
+            selected = gdn_traj[row_index, last_indices].contiguous()
+            getattr(arena, "gdn_states")[layer].index_copy_(0, state_idx, selected)
+        for layer, k_btd, v_btd, slot_mapping in trajectory.get("attn", []):
+            append_paged_int4_spec_block(arena, layer, k_btd, v_btd, slot_mapping, commit_tokens)
+
+    def _forward_verify_batch_uniform_hot(
+        self,
+        plan: object,
+        states: Sequence[DecodeState],
+    ) -> list[VerifyBlockResult]:
+        if (
+            self._verify_graph_cache.enabled
+            and torch.cuda.is_available()
+            and torch.is_tensor(getattr(plan, "input_ids", None))
+            and getattr(plan, "input_ids").device.type == "cuda"
+        ):
+            return self._forward_verify_batch_uniform_hot_graph(plan, states)
+        return self._forward_verify_batch_uniform_hot_eager(plan, states)
+
+    def _verify_graph_key(self, plan: object, token_matrix: torch.Tensor) -> CudaGraphKey:
+        block_tables = getattr(plan, "block_tables", None)
+        slot_mapping = getattr(plan, "slot_mapping", None)
+        state_indices = getattr(plan, "state_indices", None)
+        seq_lens = getattr(plan, "seq_lens", None)
+        context_bucket = 0
+        if torch.is_tensor(block_tables):
+            context_bucket = int(block_tables.size(1))
+        ptrs = tuple(
+            int(t.data_ptr())
+            for t in (getattr(plan, "input_ids", None), block_tables, slot_mapping, state_indices, seq_lens)
+            if torch.is_tensor(t)
+        )
+        return CudaGraphKey(
+            batch_size=int(token_matrix.size(0)),
+            query_len=int(token_matrix.size(1)),
+            speculative_tokens=max(0, int(token_matrix.size(1)) - 1),
+            context_bucket=context_bucket,
+            buffer_signature=ptrs,
+        )
+
+    def _forward_verify_batch_uniform_hot_graph(
+        self,
+        plan: object,
+        states: Sequence[DecodeState],
+    ) -> list[VerifyBlockResult]:
+        _uniform_plan, token_matrix, _row_lengths = self._build_uniform_spec_plan(plan, states)
+        key = self._verify_graph_key(plan, token_matrix)
+        holder: dict[str, list[VerifyBlockResult]] = {}
+
+        def run() -> None:
+            holder["results"] = self._forward_verify_batch_uniform_hot_eager(plan, states)
+
+        executable = self._verify_graph_cache.get(key)
+        if executable is None:
+            try:
+                executable = self._verify_graph_cache.capture(key, run)
+            except Exception:
+                self._verify_graph_cache.disable()
+                self._verify_graph_outputs.clear()
+                return self._forward_verify_batch_uniform_hot_eager(plan, states)
+            self._verify_graph_outputs[key] = holder["results"]
+            return self._verify_graph_outputs[key]
+        executable.replay()
+        return self._verify_graph_outputs[key]
+
+    def _forward_verify_batch_uniform_hot_eager(
+        self,
+        plan: object,
+        states: Sequence[DecodeState],
+    ) -> list[VerifyBlockResult]:
+        metadata = getattr(plan, "spec_decode_metadata", None)
+        if metadata is None:
+            raise RuntimeError("uniform speculative verifier requires spec_decode_metadata")
+        draft_counts = [int(v) for v in getattr(plan, "num_draft_tokens_per_request")]
+        uniform_plan, token_matrix, row_lengths = self._build_uniform_spec_plan(plan, states)
+        batch, tokens = token_matrix.shape
+        arena = getattr(states[0], "arena", None) if states else None
+        state_indices = getattr(plan, "state_indices", None)
+        if arena is None or state_indices is None or not hasattr(arena, "advance_slots"):
+            raise RuntimeError("uniform speculative verifier requires arena device-side state counters")
+        zero_commit = torch.zeros((batch,), dtype=torch.int32, device=token_matrix.device)
+        trajectory: dict[str, object] = {
+            "conv": [],
+            "gdn": [],
+            "attn": [],
+            "workspace": self._spec_workspace_for(
+                arena=arena,
+                batch=batch,
+                tokens=tokens,
+                device=token_matrix.device,
+                dtype=torch.float16,
+            ),
+        }
+
+        # Single target pass: compute verifier logits and save per-token state
+        # trajectory.  The live arena is untouched until reducer-selected
+        # commit_tokens are known below.
+        probe_hidden = self._forward_speculative_uniform_layers(
+            token_matrix,
+            states,
+            uniform_plan,
+            zero_commit,
+            trajectory=trajectory,
+        )
+        probe_norm = qwen_rmsnorm(probe_hidden.reshape(batch * tokens, -1).contiguous(), self.final_norm, self.cfg.rms_norm_eps)
+        flat_probe_logits = linear_any(self.lm_head, probe_norm).contiguous()
+        probe_logits = flat_probe_logits.reshape(batch, tokens, -1)
+
+        target_position_tensor, bonus_position_tensor = self._spec_logit_positions(
+            draft_counts=draft_counts,
+            tokens=tokens,
+            device=token_matrix.device,
+        )
+        if int(target_position_tensor.numel()) > 0:
+            target_logits_tensor = flat_probe_logits.index_select(0, target_position_tensor).contiguous()
+            if target_logits_tensor.device.type == "cuda":
+                target_ids_flat = cuda_ops().argmax_many(target_logits_tensor).to(device=token_matrix.device, dtype=torch.long)
+            else:
+                target_ids_flat = torch.argmax(target_logits_tensor, dim=-1).to(device=token_matrix.device, dtype=torch.long)
+        else:
+            target_ids_flat = torch.empty((0,), device=token_matrix.device, dtype=torch.long)
+        bonus_logits_tensor = flat_probe_logits.index_select(0, bonus_position_tensor).contiguous()
+        if bonus_logits_tensor.device.type == "cuda":
+            bonus_ids = cuda_ops().argmax_many(bonus_logits_tensor).to(device=token_matrix.device, dtype=torch.long)
+        else:
+            bonus_ids = torch.argmax(bonus_logits_tensor, dim=-1).to(device=token_matrix.device, dtype=torch.long)
+        resolved = resolve_speculative_gpu(
+            metadata,
+            target_token_ids=target_ids_flat,
+            bonus_token_ids=bonus_ids,
+            scheduled_token_counts=row_lengths,
+        )
+        commit_tokens = resolved.commit_tokens.to(device=token_matrix.device, dtype=torch.int32).contiguous()
+
+        state_indices_tensor = state_indices.to(device=token_matrix.device, dtype=torch.long).reshape(-1).contiguous()
+        self._commit_speculative_trajectory(
+            trajectory=trajectory,
+            arena=arena,
+            state_indices=state_indices_tensor,
+            commit_tokens=commit_tokens,
+        )
+        arena.advance_slots(state_indices_tensor, commit_tokens)
+        row_index = torch.arange(batch, device=token_matrix.device, dtype=torch.long)
+        last_indices = torch.clamp(commit_tokens.to(device=token_matrix.device, dtype=torch.long) - 1, min=0)
+        selected_hidden = probe_norm.reshape(batch, tokens, -1).contiguous()[row_index, last_indices].contiguous()
+        selected_logits = probe_logits[row_index, last_indices].contiguous()
+        selected_raw_hidden = probe_hidden[row_index, last_indices].contiguous()
+        results: list[VerifyBlockResult] = []
+        target_offset = 0
         for row, state in enumerate(states):
-            start, end = row_spans[row]
-            token_list = [int(t) for t in input_ids[start:end].detach().cpu().tolist()]
-            if not token_list:
-                raise RuntimeError(f"verify row {row} scheduled no tokens")
-            num_candidates = int(draft_counts[row])
-            if num_candidates < 0 or num_candidates >= len(token_list):
-                raise ValueError("num_candidates must be in [0, row_token_count - 1]")
-            token_rows.append(token_list)
-
-        if self._verify_batch_uses_state_hot_path(plan, states):
-            return self._forward_verify_batch_state_hot(plan, states, token_rows, draft_counts)
-
-        if max((len(tokens) for tokens in token_rows), default=1) > 1:
-            return [
-                self.forward_verify_block(
-                    tokens,
-                    state,
-                    num_candidates=int(draft_counts[row]),
+            draft_n = draft_counts[row]
+            row_target_ids = target_ids_flat[target_offset : target_offset + draft_n].contiguous()
+            target_offset += draft_n
+            state.last_raw_hidden = selected_raw_hidden[row].contiguous().clone()
+            results.append(
+                VerifyBlockResult(
+                    target_ids=row_target_ids,
+                    logits=selected_logits[row].contiguous(),
+                    hidden=selected_hidden[row].contiguous(),
+                    state=state,
+                    state_already_committed=True,
+                    speculative_decision=resolved,
                 )
-                for row, (tokens, state) in enumerate(zip(token_rows, states, strict=True))
-            ]
-
-        return self._forward_verify_batch_state_hot(plan, states, token_rows, draft_counts)
+            )
+        return results
 
     def _verify_batch_uses_state_hot_path(self, plan: object, states: Sequence[DecodeState]) -> bool:
         if not states or _arena_batch(states) is None:
@@ -2380,72 +3013,6 @@ class Qwen36Model:
         # attention would silently fall back to per-row logical views, which is
         # useful for tests but not the vLLM-style hot path.
         return getattr(plan, "block_tables", None) is not None and getattr(plan, "slot_mapping", None) is not None
-
-    def _forward_verify_batch_state_hot(
-        self,
-        plan: object,
-        states: Sequence[DecodeState],
-        token_rows: Sequence[Sequence[int]],
-        draft_counts: Sequence[int],
-    ) -> list[VerifyBlockResult]:
-        target_ids = [
-            torch.empty((int(draft_counts[row]),), device=self.device, dtype=torch.long)
-            for row in range(len(states))
-        ]
-        final_logits: list[torch.Tensor | None] = [None] * len(states)
-        final_hidden: list[torch.Tensor | None] = [None] * len(states)
-        commit_states: list[list[DecodeState] | None] = [[] for _ in states]
-        max_steps = max(len(row) for row in token_rows)
-        for step in range(max_steps):
-            active_rows = [row for row, tokens in enumerate(token_rows) if step < len(tokens)]
-            if not active_rows:
-                continue
-            step_tokens = torch.tensor([token_rows[row][step] for row in active_rows], device=self.device, dtype=torch.long)
-            x = embed_lookup_batch(self.embed, step_tokens, self.device)
-            subplan = self._verify_subplan(plan, states, active_rows, step)
-            active_states = [states[row] for row in active_rows]
-            for layer in self.layers:
-                forward_decode_batch = getattr(layer, "forward_decode_batch", None)
-                if not callable(forward_decode_batch):
-                    raise RuntimeError(f"layer {type(layer).__name__} does not support verify batching")
-                x = forward_decode_batch(x, active_states, subplan)
-            for local_row, global_row in enumerate(active_rows):
-                states[global_row].finish_token()
-                states[global_row].last_raw_hidden = x[local_row].contiguous().clone()
-                row_commits = commit_states[global_row]
-                if row_commits is not None:
-                    fork = getattr(states[global_row], "fork", None)
-                    if callable(fork):
-                        row_commits.append(fork(clone_attention=True))
-                    else:
-                        commit_states[global_row] = None
-                h = qwen_rmsnorm(x[local_row].contiguous(), self.final_norm, self.cfg.rms_norm_eps)
-                logits = linear_any(self.lm_head, h).contiguous()
-                if step < int(draft_counts[global_row]):
-                    if logits.device.type == "cuda":
-                        target_ids[global_row][step] = cuda_ops().argmax(logits).reshape(())
-                    else:
-                        target_ids[global_row][step] = torch.argmax(logits, dim=-1).reshape(())
-                if step == len(token_rows[global_row]) - 1:
-                    final_logits[global_row] = logits
-                    final_hidden[global_row] = h.contiguous()
-
-        results: list[VerifyBlockResult] = []
-        for row, state in enumerate(states):
-            logits = final_logits[row]
-            hidden = final_hidden[row]
-            if logits is None or hidden is None:
-                raise RuntimeError(f"verify row {row} did not produce final logits")
-            results.append(
-                VerifyBlockResult(
-                    target_ids=target_ids[row],
-                    logits=logits,
-                    hidden=hidden,
-                    state=state,
-                    commit_states=commit_states[row],
-                )
-            )
-        return results
 
     def _verify_subplan(
         self,

@@ -707,6 +707,7 @@ def main() -> None:
     ap.add_argument("--max-generation-tokens", type=int, default=resource_defaults.max_generation_tokens)
     ap.add_argument("--max-num-batched-tokens", type=int, default=resource_defaults.max_num_batched_tokens)
     ap.add_argument("--batch-prefill-chunk-size", type=int, default=resource_defaults.prefill_chunk_size)
+    ap.add_argument("--max-prefill-rows-per-batch", type=int, default=resource_defaults.max_prefill_rows_per_batch)
     ap.add_argument("--decode-prefill-interleave-steps", type=int, default=resource_defaults.decode_prefill_interleave_steps)
     ap.add_argument("--kv-block-size", type=int, default=resource_defaults.kv_block_size)
     ap.add_argument("--kv-blocks", type=int, default=resource_defaults.kv_blocks)
@@ -739,6 +740,7 @@ def main() -> None:
                     max_generation_tokens=args.max_generation_tokens,
                     max_num_batched_tokens=args.max_num_batched_tokens,
                     prefill_chunk_size=args.batch_prefill_chunk_size,
+                    max_prefill_rows_per_batch=args.max_prefill_rows_per_batch,
                     decode_prefill_interleave_steps=args.decode_prefill_interleave_steps,
                     kv_block_size=args.kv_block_size,
                     kv_blocks=args.kv_blocks,

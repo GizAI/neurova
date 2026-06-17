@@ -80,6 +80,82 @@ def test_depthwise_conv_update_batch_matches_single_token_loop():
     assert torch.equal(state_batch, state_loop)
 
 
+def test_depthwise_conv_update_spec_commits_prefix_only():
+    import langburst_cuda
+
+    torch.manual_seed(0)
+    slots = 4
+    batch = 3
+    tokens = 5
+    channels = 32
+    history = 3
+    state_spec = torch.randn(slots, channels, history, device="cuda", dtype=torch.float16)
+    state_ref_full = state_spec.clone()
+    state_ref_commit = state_spec.clone()
+    state_indices = torch.tensor([2, 0, 3], device="cuda", dtype=torch.long)
+    commit_tokens = torch.tensor([5, 2, 0], device="cuda", dtype=torch.int32)
+    x = torch.randn(batch, tokens, channels, device="cuda", dtype=torch.float16)
+    weight = torch.randn(channels, history + 1, device="cuda", dtype=torch.float16)
+    bias = torch.randn(channels, device="cuda", dtype=torch.float16)
+
+    full_rows = []
+    for row in range(batch):
+        slot = int(state_indices[row].item())
+        row_out = []
+        for step in range(tokens):
+            row_out.append(langburst_cuda.depthwise_conv_update(state_ref_full[slot], x[row, step].contiguous(), weight, bias))
+        full_rows.append(torch.stack(row_out, dim=0))
+        commit_n = int(commit_tokens[row].item())
+        if commit_n > 0:
+            for step in range(commit_n):
+                langburst_cuda.depthwise_conv_update(state_ref_commit[slot], x[row, step].contiguous(), weight, bias)
+    y_ref = torch.stack(full_rows, dim=0)
+    y_spec = langburst_cuda.depthwise_conv_update_spec(state_spec, state_indices, commit_tokens, x.contiguous(), weight, bias)
+    torch.cuda.synchronize()
+
+    assert torch.equal(y_spec, y_ref)
+    assert torch.equal(state_spec, state_ref_commit)
+
+
+def test_depthwise_conv_update_spec_trajectory_out_matches_allocating_api():
+    import langburst_cuda
+
+    torch.manual_seed(0)
+    slots = 3
+    batch = 2
+    tokens = 4
+    channels = 16
+    history = 3
+    state = torch.randn(slots, channels, history, device="cuda", dtype=torch.float16)
+    state_indices = torch.tensor([1, 2], device="cuda", dtype=torch.long)
+    x = torch.randn(batch, tokens, channels, device="cuda", dtype=torch.float16)
+    weight = torch.randn(channels, history + 1, device="cuda", dtype=torch.float16)
+    bias = torch.randn(channels, device="cuda", dtype=torch.float16)
+
+    y_ref, traj_ref = langburst_cuda.depthwise_conv_update_spec_trajectory(
+        state,
+        state_indices,
+        x.contiguous(),
+        weight,
+        bias,
+    )
+    y_out = torch.empty_like(y_ref)
+    traj_out = torch.empty_like(traj_ref)
+    langburst_cuda.depthwise_conv_update_spec_trajectory_out(
+        state,
+        state_indices,
+        x.contiguous(),
+        weight,
+        bias,
+        y_out,
+        traj_out,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(y_out, y_ref)
+    assert torch.equal(traj_out, traj_ref)
+
+
 def test_gdn_recurrent_ab_scan_matches_single_token_loop():
     import langburst_cuda
 
@@ -204,6 +280,120 @@ def test_gdn_recurrent_ab_batch_matches_qwen_shape_single_token_loop():
 
     assert torch.equal(state_batch, state_loop)
     assert torch.allclose(y_batch, y_loop, atol=2e-4, rtol=2e-4)
+
+
+def test_gdn_recurrent_ab_spec_commits_prefix_only():
+    import langburst_cuda
+
+    torch.manual_seed(0)
+    slots = 4
+    batch = 3
+    tokens = 4
+    kv_heads = 4
+    v_heads = 8
+    head_dim = 128
+    q = (torch.randn(batch, tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    k = (torch.randn(batch, tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    v = (torch.randn(batch, tokens, v_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    a = (torch.randn(batch, tokens, v_heads, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    b = (torch.randn(batch, tokens, v_heads, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    a_log = (torch.randn(v_heads, device="cuda", dtype=torch.float32) * 0.01 - 1.0).contiguous()
+    dt_bias = (torch.randn(v_heads, device="cuda", dtype=torch.float32) * 0.01).contiguous()
+    state_spec = (torch.randn(slots, v_heads, head_dim, head_dim, device="cuda", dtype=torch.float16) * 0.01).contiguous()
+    state_ref_full = state_spec.clone()
+    state_ref_commit = state_spec.clone()
+    state_indices = torch.tensor([2, 0, 3], device="cuda", dtype=torch.long)
+    commit_tokens = torch.tensor([4, 2, 0], device="cuda", dtype=torch.int32)
+
+    full_rows = []
+    for row in range(batch):
+        slot = int(state_indices[row].item())
+        row_out = []
+        for step in range(tokens):
+            row_out.append(
+                langburst_cuda.gdn_recurrent_ab(
+                    q[row, step],
+                    k[row, step],
+                    v[row, step],
+                    a[row, step],
+                    b[row, step],
+                    a_log,
+                    dt_bias,
+                    state_ref_full[slot],
+                )
+            )
+        full_rows.append(torch.stack(row_out, dim=0))
+        commit_n = int(commit_tokens[row].item())
+        if commit_n > 0:
+            for step in range(commit_n):
+                langburst_cuda.gdn_recurrent_ab(
+                    q[row, step],
+                    k[row, step],
+                    v[row, step],
+                    a[row, step],
+                    b[row, step],
+                    a_log,
+                    dt_bias,
+                    state_ref_commit[slot],
+                )
+    y_ref = torch.stack(full_rows, dim=0)
+    y_spec = langburst_cuda.gdn_recurrent_ab_spec(q, k, v, a, b, a_log, dt_bias, state_spec, state_indices, commit_tokens)
+    torch.cuda.synchronize()
+
+    assert torch.allclose(y_spec, y_ref, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(state_spec, state_ref_commit, atol=2e-4, rtol=2e-4)
+
+
+def test_gdn_recurrent_ab_spec_trajectory_out_matches_allocating_api():
+    import langburst_cuda
+
+    torch.manual_seed(0)
+    slots = 3
+    batch = 2
+    tokens = 3
+    kv_heads = 2
+    v_heads = 4
+    head_dim = 128
+    q = (torch.randn(batch, tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    k = (torch.randn(batch, tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    v = (torch.randn(batch, tokens, v_heads, head_dim, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    a = (torch.randn(batch, tokens, v_heads, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    b = (torch.randn(batch, tokens, v_heads, device="cuda", dtype=torch.float16) * 0.1).contiguous()
+    a_log = (torch.randn(v_heads, device="cuda", dtype=torch.float32) * 0.01 - 1.0).contiguous()
+    dt_bias = (torch.randn(v_heads, device="cuda", dtype=torch.float32) * 0.01).contiguous()
+    state = (torch.randn(slots, v_heads, head_dim, head_dim, device="cuda", dtype=torch.float16) * 0.01).contiguous()
+    state_indices = torch.tensor([1, 2], device="cuda", dtype=torch.long)
+
+    y_ref, traj_ref = langburst_cuda.gdn_recurrent_ab_spec_trajectory(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+        state_indices,
+    )
+    y_out = torch.empty_like(y_ref)
+    traj_out = torch.empty_like(traj_ref)
+    langburst_cuda.gdn_recurrent_ab_spec_trajectory_out(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        state,
+        state_indices,
+        y_out,
+        traj_out,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.allclose(y_out, y_ref, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(traj_out, traj_ref, atol=2e-4, rtol=2e-4)
 
 
 def test_silu_mul_cuda_matches_torch():
@@ -444,3 +634,142 @@ def test_attention_decode_paged_int4_tiled_layout_is_finite_and_updates_pages():
         offset = int(slot) % block_size
         assert not torch.equal(k_pages[block, :, :, offset], before_k[block, :, :, offset])
         assert not torch.equal(v_pages[block, :, :, offset], before_v[block, :, :, offset])
+
+
+def test_attention_append_paged_int4_spec_commits_prefix_only():
+    import langburst_cuda
+
+    torch.manual_seed(5)
+    batch = 3
+    tokens = 4
+    kv_heads = 2
+    head_dim = 256
+    block_size = 8
+    num_blocks = 4
+    packed_dim = head_dim // 2
+    k_new = (torch.randn(batch, tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.03).contiguous()
+    v_new = (torch.randn(batch, tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.03).contiguous()
+    k_pages = torch.zeros((num_blocks, kv_heads, block_size, packed_dim), device="cuda", dtype=torch.uint8)
+    v_pages = torch.zeros_like(k_pages)
+    k_ref = k_pages.clone()
+    v_ref = v_pages.clone()
+    k_scales = torch.ones((num_blocks, kv_heads, block_size), device="cuda", dtype=torch.float16)
+    v_scales = torch.ones_like(k_scales)
+    k_zeros = torch.zeros_like(k_scales)
+    v_zeros = torch.zeros_like(k_scales)
+    k_ref_scales = k_scales.clone()
+    v_ref_scales = v_scales.clone()
+    k_ref_zeros = k_zeros.clone()
+    v_ref_zeros = v_zeros.clone()
+    slot_mapping = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [8, 9, 10, 11],
+            [16, 17, 18, 19],
+        ],
+        device="cuda",
+        dtype=torch.long,
+    )
+    commit_tokens = torch.tensor([4, 2, 0], device="cuda", dtype=torch.int32)
+
+    langburst_cuda.attention_append_paged_int4_spec(
+        k_new,
+        v_new,
+        k_pages,
+        v_pages,
+        k_scales,
+        v_scales,
+        k_zeros,
+        v_zeros,
+        slot_mapping,
+        commit_tokens,
+        block_size,
+        128,
+        True,
+        False,
+    )
+    for row in range(batch):
+        commit_n = int(commit_tokens[row].item())
+        if commit_n == 0:
+            continue
+        langburst_cuda.attention_append_paged_int4(
+            k_new[row, :commit_n].contiguous(),
+            v_new[row, :commit_n].contiguous(),
+            k_ref,
+            v_ref,
+            k_ref_scales,
+            v_ref_scales,
+            k_ref_zeros,
+            v_ref_zeros,
+            slot_mapping[row, :commit_n].contiguous(),
+            block_size,
+            128,
+            True,
+            False,
+        )
+    torch.cuda.synchronize()
+
+    assert torch.equal(k_pages, k_ref)
+    assert torch.equal(v_pages, v_ref)
+    assert torch.equal(k_scales, k_ref_scales)
+    assert torch.equal(v_scales, v_ref_scales)
+    assert torch.equal(k_zeros, k_ref_zeros)
+    assert torch.equal(v_zeros, v_ref_zeros)
+
+
+def test_attention_spec_decode_paged_int4_matches_candidate_causal_reference():
+    import langburst_cuda
+
+    torch.manual_seed(6)
+    batch = 2
+    tokens = 3
+    q_heads = 4
+    kv_heads = 2
+    head_dim = 256
+    block_size = 8
+    num_blocks = 2
+    packed_dim = head_dim // 2
+    scale = head_dim ** -0.5
+    q = (torch.randn(batch, tokens, q_heads, head_dim, device="cuda", dtype=torch.float16) * 0.03).contiguous()
+    k_new = (torch.randn(batch, tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.03).contiguous()
+    v_new = (torch.randn(batch, tokens, kv_heads, head_dim, device="cuda", dtype=torch.float16) * 0.03).contiguous()
+    k_pages = torch.zeros((num_blocks, kv_heads, block_size, packed_dim), device="cuda", dtype=torch.uint8)
+    v_pages = torch.zeros_like(k_pages)
+    k_scales = torch.ones((num_blocks, kv_heads, block_size), device="cuda", dtype=torch.float16)
+    v_scales = torch.ones_like(k_scales)
+    k_zeros = torch.zeros_like(k_scales)
+    v_zeros = torch.zeros_like(k_scales)
+    block_tables = torch.zeros((batch, 1), device="cuda", dtype=torch.int32)
+    base_seq_lens = torch.zeros((batch,), device="cuda", dtype=torch.int32)
+
+    y = langburst_cuda.attention_spec_decode_paged_int4(
+        q,
+        k_new,
+        v_new,
+        k_pages,
+        v_pages,
+        k_scales,
+        v_scales,
+        k_zeros,
+        v_zeros,
+        block_tables,
+        base_seq_lens,
+        block_size,
+        scale,
+        128,
+        False,
+        False,
+    )
+    ref = torch.empty_like(y)
+    ratio = q_heads // kv_heads
+    for row in range(batch):
+        for step in range(tokens):
+            for qh in range(q_heads):
+                kvh = qh // ratio
+                scores = torch.matmul(k_new[row, : step + 1, kvh].float(), q[row, step, qh].float()) * scale
+                probs = torch.softmax(scores, dim=0)
+                ref[row, step, qh] = torch.matmul(probs, v_new[row, : step + 1, kvh].float()).to(torch.float16)
+    torch.cuda.synchronize()
+
+    assert y.shape == (batch, tokens, q_heads, head_dim)
+    assert torch.allclose(y.float(), ref.float(), atol=2e-3, rtol=2e-3)

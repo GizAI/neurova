@@ -95,6 +95,12 @@ class DecodeStateWriteSnapshot:
                     state.attn_v_zero[layer][:, idx].copy_(values[:, row])
         state.pos = self.pos
         state.kv_len = self.kv_len
+        pos_tensor = getattr(state, "pos_tensor", None)
+        if torch.is_tensor(pos_tensor):
+            pos_tensor.fill_(int(self.pos))
+        kv_len_tensor = getattr(state, "kv_len_tensor", None)
+        if torch.is_tensor(kv_len_tensor):
+            kv_len_tensor.fill_(int(self.kv_len))
 
 
 @dataclass
@@ -227,7 +233,13 @@ class DecodeState:
             tensor.zero_()
         if reset_attention:
             self.kv_len = 0
+            kv_len_tensor = getattr(self, "kv_len_tensor", None)
+            if torch.is_tensor(kv_len_tensor):
+                kv_len_tensor.zero_()
         self.pos = 0
+        pos_tensor = getattr(self, "pos_tensor", None)
+        if torch.is_tensor(pos_tensor):
+            pos_tensor.zero_()
 
     def decay_gdn_(self, factor: float) -> None:
         """In-place soft reset of compressed long memory.
@@ -309,6 +321,20 @@ class DecodeState:
                     self.attn_v_zero[k].copy_(v)
         self.pos = other.pos
         self.kv_len = other.kv_len
+        pos_tensor = getattr(self, "pos_tensor", None)
+        other_pos_tensor = getattr(other, "pos_tensor", None)
+        if torch.is_tensor(pos_tensor):
+            if torch.is_tensor(other_pos_tensor):
+                pos_tensor.copy_(other_pos_tensor.to(device=pos_tensor.device, dtype=pos_tensor.dtype))
+            else:
+                pos_tensor.fill_(int(other.pos))
+        kv_len_tensor = getattr(self, "kv_len_tensor", None)
+        other_kv_len_tensor = getattr(other, "kv_len_tensor", None)
+        if torch.is_tensor(kv_len_tensor):
+            if torch.is_tensor(other_kv_len_tensor):
+                kv_len_tensor.copy_(other_kv_len_tensor.to(device=kv_len_tensor.device, dtype=kv_len_tensor.dtype))
+            else:
+                kv_len_tensor.fill_(int(other.kv_len))
 
     def speculative_write_snapshot(self, num_tokens: int) -> DecodeStateWriteSnapshot:
         """Snapshot only state locations a speculative block may overwrite.
@@ -451,6 +477,66 @@ class DecodeState:
             self.attn_v[layer][:, idx, :] = v
         return idx
 
+    def append_attention_kv_block_at(
+        self,
+        layer: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        start_logical_pos: int,
+    ) -> None:
+        """Write a contiguous prefill KV block without mutating global counters."""
+
+        if k.ndim != 3 or v.ndim != 3:
+            raise ValueError("block KV tensors must be [tokens, heads, head_dim]")
+        if k.size(0) != v.size(0):
+            raise ValueError("K and V block token counts must match")
+        num_tokens = int(k.size(0))
+        if num_tokens == 0:
+            return
+        logical = torch.arange(
+            int(start_logical_pos),
+            int(start_logical_pos) + num_tokens,
+            device=k.device,
+            dtype=torch.long,
+        )
+        if self.kv_window_policy == "ring":
+            indices = torch.remainder(logical, self.max_seq_len)
+        elif int(start_logical_pos) + num_tokens <= self.max_seq_len:
+            indices = logical
+        elif self.kv_window_policy == "error":
+            raise RuntimeError(f"attention KV window is full at {self.max_seq_len} tokens")
+        else:
+            indices = torch.arange(
+                self.max_seq_len - num_tokens,
+                self.max_seq_len,
+                device=k.device,
+                dtype=torch.long,
+            )
+
+        if self.kv_cache_spec.is_int4:
+            k_store = hadamard_transform(k, self.kv_cache_spec.hadamard_order) if self.kv_cache_spec.uses_bdr else k
+            v_store = (
+                hadamard_transform(v, self.kv_cache_spec.hadamard_order)
+                if self.kv_cache_spec.uses_bdr and self.kv_cache_spec.rotate_v
+                else v
+            )
+            tokens, k_heads, k_dim = k_store.shape
+            _, v_heads, v_dim = v_store.shape
+            k_packed, k_scale, k_zero = pack_int4_rows(k_store.reshape(tokens * k_heads, k_dim).contiguous())
+            v_packed, v_scale, v_zero = pack_int4_rows(v_store.reshape(tokens * v_heads, v_dim).contiguous())
+            self.attn_k[layer][:, indices, :] = k_packed.view(tokens, k_heads, -1).permute(1, 0, 2).contiguous()
+            self.attn_v[layer][:, indices, :] = v_packed.view(tokens, v_heads, -1).permute(1, 0, 2).contiguous()
+            if self.attn_k_scale is not None and self.attn_v_scale is not None:
+                self.attn_k_scale[layer][:, indices] = k_scale.view(tokens, k_heads).transpose(0, 1).contiguous()
+                self.attn_v_scale[layer][:, indices] = v_scale.view(tokens, v_heads).transpose(0, 1).contiguous()
+            if self.attn_k_zero is not None and self.attn_v_zero is not None:
+                self.attn_k_zero[layer][:, indices] = k_zero.view(tokens, k_heads).transpose(0, 1).contiguous()
+                self.attn_v_zero[layer][:, indices] = v_zero.view(tokens, v_heads).transpose(0, 1).contiguous()
+        else:
+            self.attn_k[layer][:, indices, :] = k.permute(1, 0, 2).contiguous()
+            self.attn_v[layer][:, indices, :] = v.permute(1, 0, 2).contiguous()
+
     def _dequant_attention_view(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.kv_cache_spec.is_int4:
             return k, v
@@ -514,8 +600,37 @@ class DecodeState:
         return k, v, live
 
     def finish_token(self) -> None:
-        self.pos += 1
-        self.kv_len = min(self.kv_len + 1, self.max_seq_len)
+        self.finish_tokens(1)
+
+    def finish_tokens(self, count: int) -> None:
+        count = int(count)
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        if count == 0:
+            return
+        self.pos += count
+        self.kv_len = min(self.kv_len + count, self.max_seq_len)
+        pos_tensor = getattr(self, "pos_tensor", None)
+        if torch.is_tensor(pos_tensor):
+            pos_tensor.add_(count)
+        kv_len_tensor = getattr(self, "kv_len_tensor", None)
+        if torch.is_tensor(kv_len_tensor):
+            kv_len_tensor.add_(count).clamp_(max=self.max_seq_len)
+
+    def sync_metadata_from_device_(self) -> None:
+        """Refresh Python metadata from arena device counters.
+
+        This is intentionally a cold-path helper for diagnostics, snapshots,
+        and request cleanup. CUDA-graphable decode/verify paths must consume
+        `pos_tensor`/`kv_len_tensor` directly instead of calling this.
+        """
+
+        pos_tensor = getattr(self, "pos_tensor", None)
+        if torch.is_tensor(pos_tensor):
+            self.pos = int(pos_tensor.detach().cpu().item())
+        kv_len_tensor = getattr(self, "kv_len_tensor", None)
+        if torch.is_tensor(kv_len_tensor):
+            self.kv_len = int(kv_len_tensor.detach().cpu().item())
 
     def snapshot_dict(self, *, include_attention_kv: bool = True) -> dict[str, Any]:
         info = StateSnapshotInfo(
@@ -676,6 +791,8 @@ class DecodeStateArena:
             )
             for layer in cfg.gdn_layers
         }
+        self.pos = torch.zeros((self.num_slots,), device=self.device, dtype=torch.int64)
+        self.kv_len = torch.zeros((self.num_slots,), device=self.device, dtype=torch.int64)
         mirror_paged_kv = _env_flag("LANGBURST_PAGED_KV_MIRROR", self.kv_cache_spec.dtype == "fp16")
         paged_attention_kernels = _env_flag("LANGBURST_PAGED_ATTENTION_KERNELS", False)
         shadow_default = (not mirror_paged_kv) or paged_attention_kernels
@@ -788,6 +905,22 @@ class DecodeStateArena:
             tensor[slot].zero_()
         for tensor in (self.attn_v_zero or {}).values():
             tensor[slot].zero_()
+        self.pos[slot].zero_()
+        self.kv_len[slot].zero_()
+
+    def advance_slots(self, state_indices: torch.Tensor, token_counts: torch.Tensor) -> None:
+        """Advance slot counters on device for fixed-shape decode/verify paths."""
+
+        idx = state_indices.to(device=self.device, dtype=torch.long).reshape(-1).contiguous()
+        counts = token_counts.to(device=self.device, dtype=torch.int64).reshape(-1).contiguous()
+        if idx.numel() != counts.numel():
+            raise ValueError("state_indices and token_counts must have the same length")
+        if idx.numel() == 0:
+            return
+        self.pos.index_add_(0, idx, counts)
+        current = self.kv_len.index_select(0, idx)
+        updated = torch.clamp(current + counts, max=self.max_seq_len)
+        self.kv_len.index_copy_(0, idx, updated)
 
     def view(self, slot: int) -> DecodeState:
         slot = int(slot)
@@ -813,6 +946,8 @@ class DecodeStateArena:
         # letting hot CUDA paths address slot-indexed arena buffers directly.
         state.arena = self  # type: ignore[attr-defined]
         state.arena_slot = slot  # type: ignore[attr-defined]
+        state.pos_tensor = self.pos[slot]  # type: ignore[attr-defined]
+        state.kv_len_tensor = self.kv_len[slot]  # type: ignore[attr-defined]
         return state
 
     @staticmethod
@@ -866,6 +1001,7 @@ class DecodeStateArena:
             "kv_cache_dtype": self.kv_cache_spec.dtype,
             "kv_storage_head_dim": self.kv_layout.storage_head_dim(self.kv_cache_spec),
             "paged_kv_enabled": self.paged_kv_enabled,
+            "device_state_counters": True,
             "memory": self.memory_summary(),
         }
         if self.paged_kv_enabled:

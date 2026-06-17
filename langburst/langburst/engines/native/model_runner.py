@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import logging
+import time
 from typing import Sequence
 
 import torch
@@ -12,9 +14,17 @@ from .cuda_memory import CudaMemoryPolicy
 from .kv_policy import KVCachePolicy
 from .prefix_cache import RadixPrefixCache
 from .state_store import BatchStateStore
-from ...speculation import DraftRequest
+from ...speculation import DraftRequest, SpeculativeAcceptanceTracker
 from ...ops import cuda_ops
-from ...speculative_batch import DecodeBatchPlan, DecodeRequestState, NativeSpecDecodeMetadata, apply_decode_post_update, resolve_greedy_speculative_metadata, select_decode_batch_rows
+from ...speculative_batch import (
+    DecodeBatchPlan,
+    DecodeRequestState,
+    NativeSpecDecodeMetadata,
+    apply_decode_post_update,
+    select_decode_batch_rows,
+)
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -23,6 +33,7 @@ class BatchedStepOutput:
     sampled_token_ids: list[list[int]]
     sampled_counts: list[int]
     rejected_counts: list[int]
+    accepted_draft_counts: list[int]
 
     def tokens_by_request(self) -> dict[str, list[int]]:
         return {
@@ -71,6 +82,8 @@ class BatchedModelRunner:
         self.prefix_cache = RadixPrefixCache(**self.kv_cache_policy.prefix_cache_kwargs(block_table=block_table))
         self.cuda_memory_policy = CudaMemoryPolicy.from_env()
         self.speculative_policy = engine.resolve_policy(self.features).speculative
+        self.speculative_tracker = SpeculativeAcceptanceTracker(self.speculative_policy)
+        self._speculative_prepare_skips: dict[str, int] = {}
 
     def add_request(
         self,
@@ -111,20 +124,11 @@ class BatchedModelRunner:
             if int(row.state_index) not in self.state_store.states:
                 self.state_store.allocate(row.state_index)
         states = self.state_store.get_many(row.state_index for row in rows)
-        spec_snapshots = self._snapshot_speculative_rows(batch, rows, states)
+        batch = self._with_physical_state_indices(batch, rows, device=device or self.engine.device)
+        step_start = time.perf_counter()
         fast_spec = self._execute_verify_batch_if_possible(batch, rows, states)
         if fast_spec is not None:
-            sampled_token_ids, sampled_counts, rejected_counts, commit_states = fast_spec
-            self._rollback_rejected_speculative_rows(
-                batch,
-                rows,
-                states,
-                spec_snapshots,
-                sampled_token_ids,
-                sampled_counts,
-                rejected_counts,
-                commit_states,
-            )
+            sampled_token_ids, sampled_counts, rejected_counts, accepted_draft_counts = fast_spec
             apply_decode_post_update(
                 rows,
                 batch=batch,
@@ -132,20 +136,30 @@ class BatchedModelRunner:
                 sampled_counts=sampled_counts,
                 rejected_counts=rejected_counts,
             )
+            self._truncate_speculative_kv_blocks(rows)
+            self._record_speculative_accounting(
+                batch=batch,
+                accepted_draft_counts=accepted_draft_counts,
+                elapsed_ms=(time.perf_counter() - step_start) * 1000.0,
+                output_tokens=sum(sampled_counts),
+            )
             self._prepare_native_nextn_drafts(rows, states, sampled_counts, rejected_counts)
             return BatchedStepOutput(
                 batch=batch,
                 sampled_token_ids=sampled_token_ids,
                 sampled_counts=sampled_counts,
                 rejected_counts=rejected_counts,
+                accepted_draft_counts=accepted_draft_counts,
             )
+        if batch.spec_decode_metadata is not None or any(row.has_draft_tokens for row in rows):
+            raise RuntimeError("speculative rows must use the production forward_verify_batch hot path")
         logits_by_row = self.engine.forward_batch_logits(batch, states)
         sampled_token_ids: list[list[int]] = [[] for _ in rows]
         sampled_counts: list[int] = [0 for _ in rows]
         rejected_counts: list[int] = [0 for _ in rows]
+        accepted_draft_counts: list[int] = [0 for _ in rows]
         plain_rows: list[int] = []
         plain_logits: list[torch.Tensor] = []
-        speculative_rows: list[int] = []
         for row_idx, (row, row_logits) in enumerate(zip(rows, logits_by_row)):
             row_was_prefilling = row.is_prefilling
             finishes_prefill = row_was_prefilling and (row.computed_tokens + batch.num_scheduled_tokens[row_idx] >= row.total_len)
@@ -153,37 +167,13 @@ class BatchedModelRunner:
                 continue
             if not row_logits:
                 raise RuntimeError(f"row {row.request_id!r} did not return logits")
-            if row.has_draft_tokens:
-                speculative_rows.append(row_idx)
-                continue
             plain_rows.append(row_idx)
             plain_logits.append(row_logits[-1])
-        if speculative_rows:
-            spec_tokens, spec_sampled, spec_rejected = self._sample_speculative_rows_batch(
-                batch,
-                speculative_rows,
-                [rows[i] for i in speculative_rows],
-                [logits_by_row[i] for i in speculative_rows],
-            )
-            for row_idx, tokens, sampled_n, rejected_n in zip(speculative_rows, spec_tokens, spec_sampled, spec_rejected, strict=True):
-                sampled_token_ids[row_idx] = tokens
-                sampled_counts[row_idx] = sampled_n
-                rejected_counts[row_idx] = rejected_n
         if plain_rows:
             plain_tokens = self._sample_plain_rows([rows[i] for i in plain_rows], plain_logits)
             for row_idx, token in zip(plain_rows, plain_tokens):
                 sampled_token_ids[row_idx] = [int(token)]
                 sampled_counts[row_idx] = 1
-        self._rollback_rejected_speculative_rows(
-            batch,
-            rows,
-            states,
-            spec_snapshots,
-            sampled_token_ids,
-            sampled_counts,
-            rejected_counts,
-            None,
-        )
         apply_decode_post_update(
             rows,
             batch=batch,
@@ -191,18 +181,26 @@ class BatchedModelRunner:
             sampled_counts=sampled_counts,
             rejected_counts=rejected_counts,
         )
+        self._truncate_speculative_kv_blocks(rows)
+        self._record_speculative_accounting(
+            batch=batch,
+            accepted_draft_counts=accepted_draft_counts,
+            elapsed_ms=(time.perf_counter() - step_start) * 1000.0 if batch.spec_decode_metadata is not None else None,
+            output_tokens=sum(sampled_counts) if batch.spec_decode_metadata is not None else None,
+        )
+        if batch.spec_decode_metadata is None:
+            self.speculative_tracker.record_baseline(
+                elapsed_ms=(time.perf_counter() - step_start) * 1000.0,
+                output_tokens=sum(sampled_counts),
+            )
         self._prepare_native_nextn_drafts(rows, states, sampled_counts, rejected_counts)
-        for row, state, did_prefill in zip(rows, states, was_prefilling, strict=True):
-            if did_prefill and not row.is_prefilling:
-                cache = getattr(state, "_prefill_fp16_kv", None)
-                if cache is not None:
-                    cache.clear()
         self._store_prefix_cache_rows(rows, states, was_prefilling)
         return BatchedStepOutput(
             batch=batch,
             sampled_token_ids=sampled_token_ids,
             sampled_counts=sampled_counts,
             rejected_counts=rejected_counts,
+            accepted_draft_counts=accepted_draft_counts,
         )
 
     def _execute_verify_batch_if_possible(
@@ -210,7 +208,7 @@ class BatchedModelRunner:
         batch: DecodeBatchPlan,
         rows: list[DecodeRequestState],
         states: list[object],
-    ) -> tuple[list[list[int]], list[int], list[int], list[list[object] | None]] | None:
+    ) -> tuple[list[list[int]], list[int], list[int], list[int]] | None:
         verify_batch = getattr(self.engine.model, "forward_verify_batch", None)
         if not callable(verify_batch):
             return None
@@ -225,10 +223,15 @@ class BatchedModelRunner:
         verify_results = verify_batch(spec_plan, states)
         if len(verify_results) != len(rows):
             raise RuntimeError("verify batch result count mismatch")
+        if not all(bool(getattr(result, "state_already_committed", False)) for result in verify_results):
+            raise RuntimeError(
+                "forward_verify_batch must commit exactly the sampled prefix; "
+                "rollback-style verifier results are not accepted in production"
+            )
         sampled_token_ids: list[list[int]] = [[] for _ in rows]
         sampled_counts: list[int] = [0 for _ in rows]
         rejected_counts: list[int] = [0 for _ in rows]
-        self._resolve_greedy_verify_results(
+        accepted_draft_counts = self._resolve_verify_batch_decision(
             metadata=metadata,
             verify_results=verify_results,
             rows=rows,
@@ -236,10 +239,9 @@ class BatchedModelRunner:
             sampled_counts=sampled_counts,
             rejected_counts=rejected_counts,
         )
-        commit_states = [getattr(result, "commit_states", None) for result in verify_results]
-        return sampled_token_ids, sampled_counts, rejected_counts, commit_states
+        return sampled_token_ids, sampled_counts, rejected_counts, accepted_draft_counts
 
-    def _resolve_greedy_verify_results(
+    def _resolve_verify_batch_decision(
         self,
         *,
         metadata: NativeSpecDecodeMetadata,
@@ -248,41 +250,59 @@ class BatchedModelRunner:
         sampled_token_ids: list[list[int]],
         sampled_counts: list[int],
         rejected_counts: list[int],
-    ) -> None:
+    ) -> list[int]:
         if metadata.batch_size != len(rows) or len(verify_results) != len(rows):
             raise ValueError("verify result batch size mismatch")
-        bonus_logits = [getattr(result, "logits") for result in verify_results]
-        bonus_ids = self._argmax_many_tensor([logit.contiguous() for logit in bonus_logits])
-        target_rows: list[torch.Tensor] = []
-        for row_idx, result in enumerate(verify_results):
-            draft_n = int(metadata.num_draft_tokens[row_idx])
-            if draft_n <= 0:
-                continue
-            targets = getattr(result, "target_ids").reshape(-1)
-            if int(targets.numel()) < draft_n:
-                raise RuntimeError("verify result did not return enough target ids")
-            target_rows.append(targets[:draft_n].to(device=bonus_ids.device, dtype=torch.long))
-        target_ids = torch.cat(target_rows, dim=0) if target_rows else torch.empty((0,), device=bonus_ids.device, dtype=torch.long)
-        decisions = resolve_greedy_speculative_metadata(
-            metadata,
-            target_token_ids=target_ids,
-            bonus_token_ids=bonus_ids,
-            scheduled_token_counts=[row.num_draft_tokens + 1 for row in rows],
+        decision = getattr(verify_results[0], "speculative_decision", None) if verify_results else None
+        if decision is None:
+            raise RuntimeError("production verify batch must return a SpeculativeGPUDecision")
+        if not all(getattr(result, "speculative_decision", None) is decision for result in verify_results):
+            raise RuntimeError("verify batch returned inconsistent speculative decisions")
+        return self._apply_speculative_gpu_decision(
+            decision,
+            row_indices=list(range(len(rows))),
+            sampled_token_ids=sampled_token_ids,
+            sampled_counts=sampled_counts,
+            rejected_counts=rejected_counts,
         )
-        for row_idx, decision in enumerate(decisions):
-            sampled_token_ids[row_idx] = decision.token_ids
-            sampled_counts[row_idx] = decision.sampled_count
-            rejected_counts[row_idx] = decision.rejected_count
 
     def _trim_cuda_cache_after_request(self) -> None:
         active_requests = self.scheduler.stats().active_requests
         self.cuda_memory_policy.release_idle_cache(active_requests=active_requests)
+
+    def _truncate_speculative_kv_blocks(self, rows: Sequence[DecodeRequestState]) -> None:
+        block_table = getattr(self.scheduler, "block_table", None)
+        if block_table is None:
+            return
+        truncate = getattr(block_table, "truncate_tokens", None)
+        if not callable(truncate):
+            return
+        for row in rows:
+            truncate(row.request_id, int(row.computed_tokens))
 
     def _row(self, request_id: str) -> DecodeRequestState:
         row = self.scheduler.get_request(request_id)
         if row is None:
             raise KeyError(f"unknown scheduled request: {request_id}")
         return row
+
+    def _with_physical_state_indices(
+        self,
+        batch: DecodeBatchPlan,
+        rows: Sequence[DecodeRequestState],
+        *,
+        device: str | torch.device,
+    ) -> DecodeBatchPlan:
+        physical = [
+            self.state_store.physical_index(int(row.state_index))
+            for row in rows
+        ]
+        physical_tensor = torch.tensor(
+            physical,
+            device=torch.device(device),
+            dtype=torch.int32,
+        )
+        return replace(batch, state_indices=physical_tensor)
 
     def clear(self) -> None:
         self.scheduler.clear()
@@ -299,6 +319,25 @@ class BatchedModelRunner:
             "kv_cache": self.kv_cache_policy.summary(),
             "cuda_cache": self.cuda_memory_policy.summary(),
         }
+
+    def speculative_summary(self) -> dict[str, object]:
+        summary = self.speculative_tracker.summary()
+        summary["features_enabled"] = bool(self.features.speculative_decoding)
+        summary["proposer_available"] = self.engine.speculative_proposer is not None
+        summary["prepare_skips"] = dict(sorted(self._speculative_prepare_skips.items()))
+        return summary
+
+    def reset_speculative_tracker(self) -> None:
+        self.speculative_tracker = SpeculativeAcceptanceTracker(self.speculative_policy)
+        self._speculative_prepare_skips.clear()
+
+    def release_idle_runtime_caches(self) -> None:
+        clear_model_caches = getattr(self.engine.model, "clear_runtime_caches", None)
+        if callable(clear_model_caches):
+            clear_model_caches()
+
+    def _record_speculative_prepare_skip(self, reason: str) -> None:
+        self._speculative_prepare_skips[reason] = self._speculative_prepare_skips.get(reason, 0) + 1
 
     def _max_reusable_prefix_len(self, token_count: int) -> int:
         if token_count <= 1:
@@ -371,145 +410,42 @@ class BatchedModelRunner:
                 namespace=row.prompt_cache_key,
             )
 
-    def _sample_speculative_row(self, row: DecodeRequestState, logits_rows: list[torch.Tensor]) -> tuple[list[int], int, int]:
-        drafts = [int(t) for t in row.draft_tensor(device=self.engine.device).detach().cpu().tolist()]
-        if not drafts:
-            token = sample_next(logits_rows[-1], _generation_config_from_row(row))
-            return [int(token)], 1, 0
-        if len(logits_rows) < len(drafts) + 1:
-            raise RuntimeError("speculative row did not return enough logits")
-        accepted = 0
-        cfg = _generation_config_from_row(row)
-        for idx, draft in enumerate(drafts):
-            target = int(sample_next(logits_rows[idx], cfg))
-            if target != draft:
-                tokens = drafts[:accepted] + [target]
-                sampled = accepted + 1
-                return tokens, sampled, len(logits_rows) - sampled
-            accepted += 1
-        bonus = int(sample_next(logits_rows[len(drafts)], cfg))
-        tokens = drafts + [bonus]
-        sampled = len(tokens)
-        return tokens, sampled, len(logits_rows) - sampled
-
-    def _sample_speculative_rows_batch(
+    def _apply_speculative_gpu_decision(
         self,
-        batch: DecodeBatchPlan,
-        row_indices: list[int],
-        rows: list[DecodeRequestState],
-        logits_by_row: list[list[torch.Tensor]],
-    ) -> tuple[list[list[int]], list[int], list[int]]:
-        """Resolve NEXTN rows using one batched greedy argmax contract.
-
-        This is the compressed vLLM-style sampler boundary for native serving:
-        target logits for draft positions and bonus positions are flattened,
-        argmaxed in batches, then reduced to per-request accepted prefixes.
-        Rows that require configured sampling fall back to the exact scalar path.
-        """
-
-        if len(rows) != len(logits_by_row):
-            raise ValueError("row/logits count mismatch")
-        sampled_token_ids: list[list[int] | None] = [None] * len(rows)
-        sampled_counts: list[int] = [0] * len(rows)
-        rejected_counts: list[int] = [0] * len(rows)
-        if len(row_indices) != len(rows):
-            raise ValueError("row_indices and rows length mismatch")
-        greedy_rows: list[int] = []
-        greedy_logits_by_row: list[list[torch.Tensor]] = []
-
-        for row_idx, (row, logits_rows) in enumerate(zip(rows, logits_by_row, strict=True)):
-            cfg = _generation_config_from_row(row)
-            if _config_needs_configured_sampling(cfg):
-                tokens, sampled_n, rejected_n = self._sample_speculative_row(row, logits_rows)
-                sampled_token_ids[row_idx] = tokens
-                sampled_counts[row_idx] = sampled_n
-                rejected_counts[row_idx] = rejected_n
-                continue
-            if not row.has_draft_tokens:
-                tokens, sampled_n, rejected_n = self._sample_speculative_row(row, logits_rows)
-                sampled_token_ids[row_idx] = tokens
-                sampled_counts[row_idx] = sampled_n
-                rejected_counts[row_idx] = rejected_n
-                continue
-            drafts = [int(t) for t in (row.draft_token_ids or [])] if row.draft_token_ids_tensor is None else [0] * row.num_draft_tokens
-            if len(logits_rows) < len(drafts) + 1:
-                raise RuntimeError("speculative row did not return enough logits")
-            greedy_rows.append(row_idx)
-            greedy_logits_by_row.append(logits_rows[: len(drafts) + 1])
-
-        if greedy_rows:
-            metadata = batch.spec_decode_metadata
-            if metadata is None:
-                raise RuntimeError("speculative batch is missing metadata")
-            self._resolve_greedy_speculative_metadata(
-                metadata=metadata.select_rows([row_indices[i] for i in greedy_rows]),
-                row_indices=greedy_rows,
-                logits_by_row=greedy_logits_by_row,
-                sampled_token_ids=sampled_token_ids,
-                sampled_counts=sampled_counts,
-                rejected_counts=rejected_counts,
-            )
-
-        for row_idx in range(len(rows)):
-            if sampled_token_ids[row_idx] is not None:
-                continue
-            raise RuntimeError("speculative sampler left a row unresolved")
-
-        return (
-            [list(tokens or []) for tokens in sampled_token_ids],
-            sampled_counts,
-            rejected_counts,
-        )
-
-    def _resolve_greedy_speculative_metadata(
-        self,
+        resolved,
         *,
-        metadata: NativeSpecDecodeMetadata,
-        row_indices: list[int],
-        logits_by_row: list[list[torch.Tensor]],
-        sampled_token_ids: list[list[int] | None],
+        row_indices: Sequence[int],
+        sampled_token_ids: list[list[int] | None] | list[list[int]],
         sampled_counts: list[int],
         rejected_counts: list[int],
-    ) -> None:
-        if metadata.batch_size != len(row_indices) or len(row_indices) != len(logits_by_row):
-            raise ValueError("speculative metadata batch size mismatch")
-        flat_logits = [logit for row_logits in logits_by_row for logit in row_logits]
-        if not flat_logits:
-            return
-        target_logits = [flat_logits[int(i)] for i in metadata.target_logits_indices.detach().cpu().tolist()]
-        bonus_logits = [flat_logits[int(i)] for i in metadata.bonus_logits_indices.detach().cpu().tolist()]
-        target_ids = self._argmax_many_tensor(target_logits)
-        bonus_ids = self._argmax_many_tensor(bonus_logits)
-        decisions = resolve_greedy_speculative_metadata(
-            metadata,
-            target_token_ids=target_ids,
-            bonus_token_ids=bonus_ids,
-            scheduled_token_counts=[len(row_logits) for row_logits in logits_by_row],
-        )
-        for global_row, decision in zip(row_indices, decisions, strict=True):
-            tokens = decision.token_ids
+    ) -> list[int]:
+        token_rows = resolved.output_rows()
+        sampled_list = resolved.output_length_list()
+        rejected_list = resolved.rejected_count_list()
+        accepted_list = resolved.accepted_draft_count_list()
+        for local_row, global_row in enumerate(row_indices):
+            tokens = token_rows[local_row]
             sampled_token_ids[global_row] = tokens
-            sampled_counts[global_row] = decision.sampled_count
-            rejected_counts[global_row] = decision.rejected_count
+            sampled_counts[global_row] = sampled_list[local_row]
+            rejected_counts[global_row] = rejected_list[local_row]
+        return accepted_list
 
-    def _argmax_many_tensor(self, logits_rows: list[torch.Tensor]) -> torch.Tensor:
-        if not logits_rows:
-            return torch.empty((0,), dtype=torch.long, device=self.engine.device)
-        if len(logits_rows) == 1:
-            logits = logits_rows[0].contiguous()
-            if logits.device.type == "cuda":
-                return cuda_ops().argmax(logits).reshape(1).to(device=logits.device, dtype=torch.long)
-            return torch.argmax(logits, dim=-1).reshape(1).to(dtype=torch.long)
-        logits = torch.stack([row.contiguous() for row in logits_rows], dim=0).contiguous()
-        if logits.device.type == "cuda":
-            return cuda_ops().argmax_many(logits).to(device=logits.device, dtype=torch.long)
-        return torch.argmax(logits, dim=-1).to(dtype=torch.long)
-
-    def _argmax_many_tensors(self, logits_rows: list[torch.Tensor]) -> list[int]:
-        if not logits_rows:
-            return []
-        token_ids = self._argmax_many_tensor(logits_rows)
-        return [int(t) for t in token_ids.detach().cpu().tolist()]
+    def _record_speculative_accounting(
+        self,
+        *,
+        batch: DecodeBatchPlan,
+        accepted_draft_counts: Sequence[int],
+        elapsed_ms: float | None = None,
+        output_tokens: int | None = None,
+    ) -> None:
+        if batch.spec_decode_metadata is None:
+            return
+        self.speculative_tracker.record(
+            accepted_counts=[int(v) for v in accepted_draft_counts],
+            verified_counts=[int(v) for v in batch.num_draft_tokens_per_request],
+            elapsed_ms=elapsed_ms,
+            output_tokens=output_tokens,
+        )
 
     def _sample_plain_rows(self, rows: list[DecodeRequestState], logits_rows: list[torch.Tensor]) -> list[int]:
         if not logits_rows:
@@ -535,73 +471,16 @@ class BatchedModelRunner:
         if len(logits_rows) == 1:
             logits = logits_rows[0].contiguous()
             if logits.device.type == "cuda":
-                return [int(cuda_ops().argmax(logits).detach().cpu().item())]
-            return [int(torch.argmax(logits, dim=-1).item())]
+                sampled = cuda_ops().argmax(logits).reshape(1)
+            else:
+                sampled = torch.argmax(logits, dim=-1).reshape(1).to(dtype=torch.long)
+            return [int(t) for t in sampled.detach().cpu().tolist()]
         logits = torch.stack([row.contiguous() for row in logits_rows], dim=0).contiguous()
         if logits.device.type == "cuda":
             sampled = cuda_ops().argmax_many(logits)
         else:
             sampled = torch.argmax(logits, dim=-1).to(dtype=torch.long)
         return [int(t) for t in sampled.detach().cpu().tolist()]
-
-    def _snapshot_speculative_rows(
-        self,
-        batch: DecodeBatchPlan,
-        rows: list[DecodeRequestState],
-        states: list[object],
-    ) -> dict[int, object]:
-        snapshots: dict[int, object] = {}
-        for row_idx, (row, state) in enumerate(zip(rows, states)):
-            if not row.has_draft_tokens:
-                continue
-            snapshot_fn = getattr(state, "speculative_write_snapshot", None)
-            if not callable(snapshot_fn):
-                continue
-            snapshots[row_idx] = snapshot_fn(int(batch.num_scheduled_tokens[row_idx]))
-        return snapshots
-
-    def _rollback_rejected_speculative_rows(
-        self,
-        batch: DecodeBatchPlan,
-        rows: list[DecodeRequestState],
-        states: list[object],
-        snapshots: dict[int, object],
-        sampled_token_ids: list[list[int]],
-        sampled_counts: list[int],
-        rejected_counts: list[int],
-        commit_states: Sequence[Sequence[object] | None] | None,
-    ) -> None:
-        for row_idx, rejected_n in enumerate(rejected_counts):
-            if int(rejected_n) <= 0:
-                continue
-            state = states[row_idx]
-            scheduled_n = int(batch.num_scheduled_tokens[row_idx])
-            commit_n = scheduled_n - int(rejected_n)
-            if commit_n > 0 and commit_states is not None and row_idx < len(commit_states):
-                row_commits = commit_states[row_idx]
-                if row_commits is not None and len(row_commits) >= commit_n:
-                    copy_from = getattr(state, "copy_from_", None)
-                    if callable(copy_from):
-                        copy_from(row_commits[commit_n - 1], copy_attention=True)
-                        continue
-            snapshot = snapshots.get(row_idx)
-            if snapshot is None:
-                continue
-            restore = getattr(snapshot, "restore_", None)
-            if not callable(restore):
-                continue
-            restore(state)
-            if commit_n <= 0:
-                continue
-            start, _end = batch.row_spans[row_idx]
-            commit_ids = [int(t) for t in batch.input_ids[start : start + commit_n].detach().cpu().tolist()]
-            if len(commit_ids) != commit_n:
-                raise RuntimeError(
-                    f"speculative rollback for {rows[row_idx].request_id!r} "
-                    f"needs {commit_n} commit tokens, got {len(commit_ids)}"
-                )
-            for token_id in commit_ids:
-                self.engine.forward_one(int(token_id), state, return_logits=False)
 
     def _prepare_native_nextn_drafts(
         self,
@@ -611,39 +490,49 @@ class BatchedModelRunner:
         rejected_counts: list[int],
     ) -> None:
         proposer = self.engine.speculative_proposer
-        if proposer is None or not self.features.speculative_decoding:
+        if proposer is None:
+            self._record_speculative_prepare_skip("proposer_unavailable")
             return
+        if not self.features.speculative_decoding:
+            self._record_speculative_prepare_skip("feature_disabled")
+            return
+        if not self.speculative_tracker.should_propose():
+            for row in rows:
+                row.clear_draft_tokens()
+            self._record_speculative_prepare_skip("policy_disabled")
+            return
+        if not self._has_speculative_vram_headroom():
+            for row in rows:
+                row.clear_draft_tokens()
+            self._record_speculative_prepare_skip("low_free_vram")
+            return
+        max_draft = int(self.speculative_tracker.current_max_draft())
         pending: list[tuple[int, DraftRequest]] = []
         for row_idx, (row, state, sampled_n, rejected_n) in enumerate(zip(rows, states, sampled_counts, rejected_counts, strict=True)):
             if int(sampled_n) <= 0:
+                self._record_speculative_prepare_skip("no_sampled_token")
                 continue
             if int(rejected_n) != 0:
+                self._record_speculative_prepare_skip("rejected_previous_step")
                 continue
             if row.last_sampled_token is None:
+                self._record_speculative_prepare_skip("missing_last_sampled_token")
                 continue
             cfg = _generation_config_from_row(row)
-            if _config_needs_configured_sampling(cfg):
+            sampling_reason = _configured_sampling_reason(cfg)
+            if sampling_reason is not None:
+                self._record_speculative_prepare_skip(f"configured_sampling:{sampling_reason}")
                 continue
             raw_hidden = getattr(state, "last_raw_hidden", None)
             if raw_hidden is None:
-                continue
-            snapshot_fn = getattr(state, "speculative_write_snapshot", None)
-            if not callable(snapshot_fn):
-                continue
-            try:
-                snapshot_fn(1 + self.speculative_policy.max_draft)
-            except Exception:
-                # Paged-KV arena states need a page-table/lookahead snapshot,
-                # not the canonical ring snapshot. Until that contract exists,
-                # do not attach drafts that would be impossible to roll back.
-                row.clear_draft_tokens()
+                self._record_speculative_prepare_skip("missing_raw_hidden")
                 continue
             pending.append(
                 (
                     row_idx,
                     DraftRequest(
                         history=row.token_ids,
-                        max_draft=int(self.speculative_policy.max_draft),
+                        max_draft=max_draft,
                         signals={
                             "raw_hidden": raw_hidden,
                             "first_token": torch.tensor(
@@ -651,12 +540,13 @@ class BatchedModelRunner:
                                 device=raw_hidden.device,
                                 dtype=torch.long,
                             ),
-                            "pos": int(getattr(state, "pos", 0)),
+                            "pos": int(row.computed_tokens),
                         },
                     ),
                 )
             )
         if not pending:
+            self._record_speculative_prepare_skip("no_pending_rows")
             return
         row_indices = [idx for idx, _request in pending]
         requests = [request for _idx, request in pending]
@@ -670,31 +560,53 @@ class BatchedModelRunner:
                     return
                 drafts = torch.stack([propose_tensors(request).reshape(-1) for request in requests], dim=0).contiguous()
         except Exception:
+            log.exception("native speculative proposer failed; clearing draft tokens")
             for idx in row_indices:
                 rows[idx].clear_draft_tokens()
             return
-        draft_rows = drafts[:, : int(self.speculative_policy.max_draft)].to(dtype=torch.long).contiguous()
+        draft_rows = drafts[:, :max_draft].to(dtype=torch.long).contiguous()
         for local_idx, idx in enumerate(row_indices):
             row_tensor = draft_rows[local_idx].reshape(-1).contiguous()
             rows[idx].draft_token_ids_tensor = row_tensor
             rows[idx].draft_token_ids = None
+        if not row_indices:
+            self._record_speculative_prepare_skip("no_draft_rows")
+
+    def _has_speculative_vram_headroom(self) -> bool:
+        min_free_mib = int(self.speculative_policy.min_free_vram_mib)
+        if min_free_mib <= 0:
+            return True
+        if not torch.cuda.is_available() or not str(self.engine.device).startswith("cuda"):
+            return True
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(torch.device(self.engine.device))
+        return free_bytes >= min_free_mib * 1024 * 1024
 
 def _config_needs_configured_sampling(cfg: GenerationConfig) -> bool:
-    return any(
-        (
-            float(cfg.temperature) > 0,
-            int(cfg.top_k) > 0,
-            float(cfg.top_p) < 1.0,
-            float(cfg.min_p) > 0.0,
-            float(cfg.repetition_penalty) != 1.0,
-            float(cfg.presence_penalty) != 0.0,
-            float(cfg.frequency_penalty) != 0.0,
-            int(cfg.no_repeat_ngram_size) > 0,
-            bool(cfg.logit_bias),
-            bool(cfg.bad_token_ids),
-            bool(cfg.suppress_tokens),
-        )
-    )
+    return _configured_sampling_reason(cfg) is not None
+
+
+def _configured_sampling_reason(cfg: GenerationConfig) -> str | None:
+    if float(cfg.temperature) > 0:
+        return "temperature"
+    if int(cfg.top_k) > 0:
+        return "top_k"
+    if float(cfg.top_p) < 1.0:
+        return "top_p"
+    if float(cfg.min_p) > 0.0:
+        return "min_p"
+    if float(cfg.repetition_penalty) != 1.0:
+        return "repetition_penalty"
+    if float(cfg.presence_penalty) != 0.0:
+        return "presence_penalty"
+    if float(cfg.frequency_penalty) != 0.0:
+        return "frequency_penalty"
+    if int(cfg.no_repeat_ngram_size) > 0:
+        return "no_repeat_ngram"
+    if bool(cfg.logit_bias):
+        return "logit_bias"
+    if bool(cfg.bad_token_ids):
+        return "bad_token_ids"
+    return None
 
 
 def _generation_config_from_row(row: object) -> GenerationConfig:

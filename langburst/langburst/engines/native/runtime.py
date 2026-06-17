@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import inspect
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,8 +19,9 @@ from ...core.text_stream import StreamingTextDecoder
 from ...speculative_batch import DecodeBatchPlan
 from ...ops import cuda_ops
 from ...speculation import SpeculativeDecodePolicy, SpeculativeDecodeResult, SpeculativeDecodeStats, SpeculativeProposer
-from ...speculative_verifier import NativeNextNVerifier, TargetVerification
 from ...tuning import marlin_direct_max_batch
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -232,8 +234,29 @@ class RuntimeEngine:
         )
         create_proposer = getattr(adapter, "create_speculative_proposer", None)
         self.speculative_proposer: SpeculativeProposer | None = (
-            create_proposer(self.model) if self.features.speculative_decoding and callable(create_proposer) else None
+            create_proposer(self.model)
+            if self.features.speculative_decoding
+            and callable(create_proposer)
+            and self._has_speculative_load_headroom()
+            else None
         )
+
+    def _has_speculative_load_headroom(self) -> bool:
+        policy = self.resolve_policy(self.features).speculative
+        min_free_mib = int(policy.min_free_vram_mib)
+        if min_free_mib <= 0:
+            return True
+        if not torch.cuda.is_available() or not str(self.device).startswith("cuda"):
+            return True
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(torch.device(self.device))
+        ok = free_bytes >= min_free_mib * 1024 * 1024
+        if not ok:
+            log.warning(
+                "skipping speculative proposer load: free_vram_mib=%d < min_free_vram_mib=%d",
+                free_bytes // (1024 * 1024),
+                min_free_mib,
+            )
+        return ok
 
     def resolve_plan(self, features: RuntimeFeatures | None = None) -> RuntimePlan:
         return resolve_runtime_plan(features or self.features, self.adapter.descriptor.capabilities)
@@ -569,15 +592,6 @@ class RuntimeEngine:
         if gen_cfg.temperature > 0 or gen_cfg.top_k > 0 or not features.gpu_sampling:
             stats.fallback_reason = "sampling_or_cpu_path"
             return SpeculativeDecodeResult(list(self.generate_ids(prompt_list, gen_cfg, state, features)), stats)
-        has_speculative_proposer = self.speculative_proposer is not None
-        if features.speculative_decoding and has_speculative_proposer:
-            return self.generate_native_nextn_result(
-                prompt_list,
-                gen_cfg,
-                state=state,
-                features=features,
-                policy=policy.speculative,
-            )
         return SpeculativeDecodeResult(
             self._generate_ids_greedy_gpu_plain(prompt_list, gen_cfg, state=state, features=features),
             stats,
@@ -698,120 +712,6 @@ class RuntimeEngine:
         return logits, raw_hidden
 
     @torch.no_grad()
-    def _verify_block_sequential_with_raw_hidden(
-        self,
-        tokens: Sequence[int],
-        state: Any,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        logits_out: list[torch.Tensor] = []
-        raw_hiddens: list[torch.Tensor] = []
-        for token in tokens:
-            logits, raw_hidden = self.model.forward_one(
-                int(token),
-                state,
-                return_hidden=True,
-                return_raw_hidden=True,
-            )
-            logits_out.append(logits.contiguous().clone())
-            raw_hiddens.append(raw_hidden.contiguous().clone())
-        return logits_out, raw_hiddens
-
-    def _target_ids_for_candidate_logits(self, logits: Sequence[torch.Tensor], num_candidates: int) -> torch.Tensor:
-        if num_candidates <= 0:
-            raise ValueError("num_candidates must be positive")
-        if len(logits) < num_candidates:
-            raise RuntimeError("target verifier did not return enough logits")
-        check_logits = torch.stack([logits[i].contiguous() for i in range(num_candidates)], dim=0)
-        if check_logits.device.type == "cuda":
-            return torch.argmax(check_logits, dim=-1).to(device=check_logits.device, dtype=torch.long)
-        return torch.argmax(check_logits, dim=-1).to(dtype=torch.long)
-
-    def _target_verification_from_block_result(self, result: Any, num_candidates: int) -> TargetVerification:
-        if not result.logits:
-            raise RuntimeError("target verifier did not return logits")
-        target_ids = self._target_ids_for_candidate_logits(result.logits, int(num_candidates))
-        final_hiddens = getattr(result, "final_hiddens", None)
-        raw_hiddens = getattr(result, "raw_hiddens", None)
-        if final_hiddens:
-            raw_hidden = final_hiddens[-1]
-        elif raw_hiddens:
-            raw_hidden = raw_hiddens[-1]
-        else:
-            raw_hidden = result.logits[-1]
-        return TargetVerification(target_ids=target_ids, logits=result.logits[-1], raw_hidden=raw_hidden)
-
-    @torch.no_grad()
-    def verify_nextn_tokens(
-        self,
-        token_ids: Sequence[int],
-        state: Any,
-        num_candidates: int,
-    ) -> TargetVerification:
-        """Verify a sampled token plus native MTP/NEXTN drafts in one target call.
-
-        This is the runtime-owned verifier boundary.  LangBurst routes it
-        through a continuous-serving batch plan first, then falls back to the older
-        single-request block/scalar paths only when an adapter has not exposed
-        `forward_verify_batch`.
-        """
-
-        verify_batch = getattr(self.model, "forward_verify_batch", None)
-        if callable(verify_batch):
-            plan = self._build_single_verify_batch_plan(token_ids, state, num_candidates)
-            result = verify_batch(plan, [state])[0]
-            return TargetVerification(target_ids=result.target_ids, logits=result.logits, raw_hidden=result.hidden)
-
-        verify_block = getattr(self.model, "forward_verify_block", None)
-        if callable(verify_block):
-            result = verify_block(token_ids, state, num_candidates=int(num_candidates))
-            return TargetVerification(target_ids=result.target_ids, logits=result.logits, raw_hidden=result.hidden)
-
-        forward_block = getattr(self.model, "forward_block", None)
-        if callable(forward_block):
-            result = forward_block(
-                token_ids,
-                state,
-                return_logits=True,
-                logits_mode="all",
-                commit=True,
-            )
-            return self._target_verification_from_block_result(result, int(num_candidates))
-
-        logits, raw_hiddens = self._verify_block_sequential_with_raw_hidden(token_ids, state)
-        target_ids = self._target_ids_for_candidate_logits(logits, int(num_candidates))
-        return TargetVerification(target_ids=target_ids, logits=logits[-1], raw_hidden=raw_hiddens[-1])
-
-    def _build_single_verify_batch_plan(
-        self,
-        token_ids: Sequence[int],
-        state: Any,
-        num_candidates: int,
-    ) -> DecodeBatchPlan:
-        token_list = [int(t) for t in token_ids]
-        if not token_list:
-            raise ValueError("verify batch requires at least one token")
-        if num_candidates < 0 or num_candidates >= len(token_list):
-            raise ValueError("num_candidates must be in [0, len(token_ids) - 1]")
-        device = torch.device(self.device)
-        pos = int(getattr(state, "pos", 0))
-        state_index = int(getattr(state, "arena_slot", 0) or 0)
-        n = len(token_list)
-        return DecodeBatchPlan(
-            request_ids=["native-nextn-verify"],
-            state_indices=torch.tensor([state_index], dtype=torch.int32, device=device),
-            input_ids=torch.tensor(token_list, dtype=torch.long, device=device),
-            positions=torch.arange(pos, pos + n, dtype=torch.long, device=device),
-            query_start_loc=torch.tensor([0, n], dtype=torch.int32, device=device),
-            seq_lens=torch.tensor([pos + n], dtype=torch.int32, device=device),
-            logits_indices=torch.arange(0, n, dtype=torch.long, device=device),
-            cu_num_logits=torch.tensor([0, n], dtype=torch.int32, device=device),
-            row_spans=((0, n),),
-            num_scheduled_tokens=[n],
-            num_draft_tokens_per_request=[int(num_candidates)],
-            is_prefill=[False],
-        )
-
-    @torch.no_grad()
     def generate_native_nextn_result(
         self,
         prompt_ids: Iterable[int],
@@ -821,86 +721,10 @@ class RuntimeEngine:
         *,
         policy: SpeculativeDecodePolicy | None = None,
     ) -> SpeculativeDecodeResult:
-        resolved = self.resolve_policy(features, speculative=policy)
-        policy = resolved.speculative
-        stats = SpeculativeDecodeStats(max_draft=policy.max_draft, verifier_mode=policy.verifier_mode)
-        if gen_cfg.max_new_tokens <= 0:
-            return SpeculativeDecodeResult([], stats)
-        if gen_cfg.temperature > 0 or gen_cfg.top_k > 0:
-            stats.fallback_reason = "non_greedy_sampling"
-            return SpeculativeDecodeResult(list(self.generate_ids(prompt_ids, gen_cfg, state, resolved.features)), stats)
-        features = resolved.features
-        if self.speculative_proposer is None:
-            stats.fallback_reason = "speculative_proposer_unavailable"
-            return SpeculativeDecodeResult(
-                self._generate_ids_greedy_gpu_plain(prompt_ids, gen_cfg, state=state, features=features),
-                stats,
-            )
-        ids = [int(t) for t in prompt_ids]
-        state = self.new_state(features) if state is None else state
-        logits, raw_hidden = self._prefill_with_raw_hidden(ids, state, features)
-        out_buf = torch.empty((gen_cfg.max_new_tokens,), device=logits.device, dtype=torch.long)
-        produced = 0
-        recent_accepts: list[int] = []
-        verifier = NativeNextNVerifier(
-            model=self.model,
-            proposer=self.speculative_proposer,
-            sample_next=lambda current_logits: sample_next_tensor(current_logits, gen_cfg),
-            max_draft=policy.max_draft,
-            mode=policy.verifier_mode,  # type: ignore[arg-type]
-            verify_tokens=self.verify_nextn_tokens,
+        raise RuntimeError(
+            "direct NativeNextNVerifier decoding was removed from the production RuntimeEngine; "
+            "native NEXTN must run through BatchedModelRunner and forward_verify_batch."
         )
-        while produced < gen_cfg.max_new_tokens:
-            step = verifier.step(
-                logits=logits,
-                raw_hidden=raw_hidden,
-                state=state,
-                remaining_tokens=gen_cfg.max_new_tokens - produced,
-            )
-            for token in step.tokens:
-                if produced >= gen_cfg.max_new_tokens:
-                    break
-                out_buf[produced] = token
-                produced += 1
-            logits = step.logits
-            raw_hidden = step.raw_hidden
-            if step.verified:
-                recent_accepts.extend([1] * step.accepted)
-                if step.rejected:
-                    recent_accepts.append(0)
-                stats.verifier_steps += 1
-                stats.accepted_draft_tokens += step.accepted
-                stats.verified_draft_tokens += step.verified
-                stats.rejected_steps += step.rejected
-                stats.rollback_tokens += step.rollback_tokens
-
-            if len(recent_accepts) > policy.min_verified:
-                del recent_accepts[: len(recent_accepts) - policy.min_verified]
-            recent_ready = len(recent_accepts) >= policy.min_verified
-            recent_rate = sum(recent_accepts) / len(recent_accepts) if recent_accepts else 0.0
-            too_many_rejections = policy.max_rejections is not None and verifier.rejected >= policy.max_rejections
-            poor_recent_acceptance = (
-                policy.adaptive
-                and verifier.verified >= policy.min_verified
-                and recent_ready
-                and recent_rate < policy.accept_threshold
-            )
-            if policy.adaptive and (too_many_rejections or poor_recent_acceptance):
-                stats.fallback_reason = "max_rejections" if too_many_rejections else "accept_rate"
-                prefix = out_buf[:produced].detach().cpu().tolist()
-                return SpeculativeDecodeResult(
-                    self._continue_ids_greedy_gpu_plain(logits, gen_cfg, state, prefix=prefix),
-                    stats,
-                )
-        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
-            torch.cuda.synchronize()
-        out = out_buf[:produced].detach().cpu().tolist()
-        if gen_cfg.eos_token_ids:
-            eos = set(gen_cfg.eos_token_ids)
-            for i, tid in enumerate(out):
-                if int(tid) in eos:
-                    return SpeculativeDecodeResult([int(t) for t in out[:i]], stats)
-        return SpeculativeDecodeResult([int(t) for t in out[: gen_cfg.max_new_tokens]], stats)
 
     def completion_tokens(
         self,

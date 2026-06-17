@@ -90,6 +90,17 @@ class KVBlockTable:
             table.block_ids.append(self._acquire_block())
         return table
 
+    def truncate_tokens(self, request_id: str, token_count: int) -> RequestBlockTable:
+        """Release speculative blocks beyond the committed token length."""
+
+        if token_count < 0:
+            raise ValueError("token_count must be >= 0")
+        table = self.get(request_id)
+        required_blocks = (int(token_count) + self.block_size - 1) // self.block_size
+        while len(table.block_ids) > required_blocks:
+            self._decref_block(table.block_ids.pop())
+        return table
+
     def attach_prefix_blocks(self, request_id: str, block_ids: Sequence[int]) -> RequestBlockTable:
         """Attach immutable cached prefix blocks to a new request table."""
 

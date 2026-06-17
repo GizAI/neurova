@@ -11,7 +11,8 @@ from langburst.core.kv_cache import KVCacheLayout, KVCacheSpec, allocate_kv_cach
 from langburst.engines.native.state_store import BatchStateStore
 from langburst.adapters.qwen36_impl.state import DecodeStateArena
 from langburst.adapters.qwen36_impl.state import DecodeState
-from langburst.adapters.qwen36_impl.model import short_prefill_sdpa_staging, sync_state_kv_to_paged
+from langburst.adapters.qwen36_impl.model import sync_state_kv_to_paged
+from langburst.tuning import prefill_attention_policy
 
 
 def tiny_qwen_cfg() -> Qwen36_27B_TextConfig:
@@ -99,6 +100,27 @@ def test_decode_state_arena_returns_slot_views_and_recycles():
     assert torch.count_nonzero(arena.attn_k[1][slot]).item() == 0
 
 
+def test_decode_state_arena_advances_slot_counters_on_device():
+    arena = DecodeStateArena(cfg=tiny_qwen_cfg(), max_seq_len=4, num_slots=2, device="cpu")
+    slot0, state0 = arena.allocate()
+    slot1, state1 = arena.allocate()
+
+    arena.advance_slots(torch.tensor([slot0, slot1]), torch.tensor([3, 5], dtype=torch.int32))
+
+    assert int(arena.pos[slot0].item()) == 3
+    assert int(arena.pos[slot1].item()) == 5
+    assert int(arena.kv_len[slot0].item()) == 3
+    assert int(arena.kv_len[slot1].item()) == 4
+
+    state0.sync_metadata_from_device_()
+    state1.sync_metadata_from_device_()
+
+    assert state0.pos == 3
+    assert state1.pos == 5
+    assert state0.kv_len == 3
+    assert state1.kv_len == 4
+
+
 def test_batch_state_store_uses_arena_for_qwen_like_engine():
     def fail_new_state(_features):
         raise AssertionError("arena-backed store should not allocate per-request state")
@@ -123,6 +145,11 @@ def test_batch_state_store_uses_arena_for_qwen_like_engine():
     first = store.allocate(10)
     second = store.allocate(11)
 
+    assert store.physical_index(10) == first.arena_slot
+    assert store.physical_index(11) == second.arena_slot
+    assert store.physical_index(10) != 10
+    assert store.physical_index(11) != 11
+
     summary = store.arena_summary()
     assert summary is not None
     assert summary["num_slots"] == 2
@@ -139,6 +166,10 @@ def test_batch_state_store_uses_arena_for_qwen_like_engine():
     assert torch.equal(store.get(10).gdn_states[0], first.gdn_states[0])
     assert not torch.equal(store.get(10).gdn_states[0], second.gdn_states[0])
     store.release(10)
+    replacement = store.allocate(12)
+    assert store.physical_index(12) == replacement.arena_slot
+    assert store.physical_index(12) == first.arena_slot
+    store.release(12)
     summary = store.arena_summary()
     assert summary is not None
     assert summary["num_slots"] == 2
@@ -151,6 +182,37 @@ def test_batch_state_store_uses_arena_for_qwen_like_engine():
     assert summary["kv_storage_head_dim"] == 2
     assert summary["paged_kv_enabled"] is False
     assert "memory" in summary
+
+
+def test_batch_state_store_uses_single_slot_arena_when_speculative_enabled():
+    def fail_new_state(_features):
+        raise AssertionError("speculative serving requires arena-backed verifier state")
+
+    engine = SimpleNamespace(
+        cfg=tiny_qwen_cfg(),
+        recent_window=4,
+        device="cpu",
+        new_state=fail_new_state,
+        create_state_arena=lambda *, features, max_slots, kv_num_blocks=None, kv_block_size=None: Qwen36Adapter().create_state_arena(
+            tiny_qwen_cfg(),
+            max_seq_len=4,
+            num_slots=max_slots,
+            device="cpu",
+            features=features,
+            kv_num_blocks=kv_num_blocks,
+            kv_block_size=kv_block_size,
+        ),
+    )
+    features = RuntimeFeatures.from_profile("stateful").with_overrides(speculative_decoding=True)
+    store = BatchStateStore(engine=engine, features=features, max_slots=1)
+
+    state = store.allocate(7)
+
+    assert state.arena is not None
+    summary = store.arena_summary()
+    assert summary is not None
+    assert summary["num_slots"] == 1
+    assert summary["active_slots"] == 1
 
 
 def test_decode_state_arena_uses_canonical_mirror_without_shadow_pages_by_default(monkeypatch):
@@ -274,7 +336,7 @@ def test_sync_state_kv_to_paged_skips_empty_canonical_int4_mirror():
     assert arena.paged_attn_k is not None
 
 
-def test_short_prefill_sdpa_staging_requires_cuda(monkeypatch):
+def test_prefill_attention_policy_is_state_scratch_free_on_cpu(monkeypatch):
     monkeypatch.setenv("LANGBURST_SHORT_PREFILL_SDPA_TOKENS", "8192")
     state = DecodeState.allocate(
         tiny_qwen_cfg(),
@@ -285,7 +347,10 @@ def test_short_prefill_sdpa_staging_requires_cuda(monkeypatch):
         kv_cache_spec=KVCacheSpec.resolve("int4_bdr", hadamard_order=4),
     )
 
-    assert short_prefill_sdpa_staging(state, layer=1, end_pos=8) is None
+    policy = prefill_attention_policy()
+
+    assert policy.allows_fresh_sdpa(tokens=8)
+    assert policy.allows_extend_sdpa(live_tokens=8)
     assert not hasattr(state, "_prefill_fp16_kv")
 
 
