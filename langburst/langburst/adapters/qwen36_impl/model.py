@@ -2356,7 +2356,6 @@ class Qwen36Model:
             and batch_prefill_steps_enabled()
             and all(bool(v) for v in prefill_flags)
             and all(int(v) == 0 for v in draft_counts)
-            and any((end - start) > 1 for start, end in row_spans)
             and (num_requests > 1 or not canonical_prefill_kv)
         ):
             return self._forward_prefill_timestep_batch(
@@ -2440,7 +2439,6 @@ class Qwen36Model:
             and batch_prefill_steps_enabled()
             and all(bool(v) for v in prefill_flags)
             and all(int(v) == 0 for v in draft_counts)
-            and any((end - start) > 1 for start, end in row_spans)
             and (num_requests > 1 or not canonical_prefill_kv)
         ):
             outputs = self._forward_prefill_timestep_batch(

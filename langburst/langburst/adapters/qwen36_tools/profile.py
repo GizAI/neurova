@@ -19,6 +19,12 @@ from ...cli_features import (
     runtime_features_from_args,
 )
 from ...engines.native.runtime import GenerationConfig, sample_next_tensor
+from ...engines.native import (
+    BatchGenerationWorker,
+    BatchedModelRunner,
+    ContinuousBatchScheduler,
+    KVBlockTable,
+)
 from ...loader import LowBitMarlinTensor, LowBitTensor
 from ...ops import cuda_ops
 from ...speculative_batch import DecodeBatchPlan
@@ -74,6 +80,9 @@ class DecodeProfiler:
         self.calls: list[TimedCall] = []
         self.cpu_counts: defaultdict[str, int] = defaultdict(int)
         self.path_counts: defaultdict[str, int] = defaultdict(int)
+        self.batch_counts: defaultdict[str, int] = defaultdict(int)
+        self.batch_rows: defaultdict[str, int] = defaultdict(int)
+        self.batch_tokens: defaultdict[str, int] = defaultdict(int)
 
     def record_cuda(self, category: str, fn: Callable, *args, **kwargs):
         if not torch.cuda.is_available():
@@ -114,6 +123,26 @@ class DecodeProfiler:
     def path_table(self) -> list[tuple[str, int]]:
         return sorted(self.path_counts.items(), key=lambda item: (-item[1], item[0]))
 
+    def record_batch(self, label: str, *, rows: int, tokens: int) -> None:
+        self.batch_counts[label] += 1
+        self.batch_rows[label] += int(rows)
+        self.batch_tokens[label] += int(tokens)
+
+    def batch_table(self) -> list[tuple[str, int, float, float]]:
+        rows: list[tuple[str, int, float, float]] = []
+        for label, count in self.batch_counts.items():
+            if count <= 0:
+                continue
+            rows.append(
+                (
+                    label,
+                    count,
+                    self.batch_rows[label] / count,
+                    self.batch_tokens[label] / count,
+                )
+            )
+        return sorted(rows, key=lambda row: row[0])
+
 
 @contextmanager
 def profile_decode() -> Iterator[DecodeProfiler]:
@@ -127,6 +156,11 @@ def profile_decode() -> Iterator[DecodeProfiler]:
     orig_gdn_gate_2d = model_mod.gdn_norm_silu_gate_2d
     orig_depthwise = model_mod.depthwise_conv_update
     orig_attention = cuda_ops().attention_decode_fp16
+    orig_paged_fp16 = getattr(cuda_ops(), "attention_decode_paged_fp16", None)
+    orig_paged_int4 = getattr(cuda_ops(), "attention_decode_paged_int4", None)
+    orig_paged_int4_flash = getattr(cuda_ops(), "attention_paged_int4_flash", None)
+    orig_append_int4 = getattr(cuda_ops(), "attention_append_paged_int4", None)
+    orig_append_int4_spec = getattr(cuda_ops(), "attention_append_paged_int4_spec", None)
     orig_gdn_ab = cuda_ops().gdn_recurrent_ab
     orig_sdpa = F.scaled_dot_product_attention
 
@@ -176,6 +210,33 @@ def profile_decode() -> Iterator[DecodeProfiler]:
     def attention_decode_fp16(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, length: int, scale: float):
         return profiler.record_cuda("attention_decode", orig_attention, q, k_cache, v_cache, length, scale)
 
+    def attention_decode_paged_fp16(*args, **kwargs):
+        return profiler.record_cuda("attention_paged_fp16", orig_paged_fp16, *args, **kwargs)
+
+    def attention_decode_paged_int4(*args, **kwargs):
+        q = args[0] if args else None
+        batch = int(q.size(0)) if torch.is_tensor(q) and q.ndim >= 1 else 0
+        profiler.count_path("attention_paged_int4", "direct_kernel", batch=batch, bits=4)
+        return profiler.record_cuda("attention_paged_int4", orig_paged_int4, *args, **kwargs)
+
+    def attention_paged_int4_flash(*args, **kwargs):
+        q = args[0] if args else None
+        batch = int(q.size(0)) if torch.is_tensor(q) and q.ndim >= 1 else 0
+        profiler.count_path("attention_paged_int4", "flash_contract_kernel", batch=batch, bits=4)
+        return profiler.record_cuda("attention_paged_int4_flash", orig_paged_int4_flash, *args, **kwargs)
+
+    def attention_append_paged_int4(*args, **kwargs):
+        k = args[0] if args else None
+        batch = int(k.size(0)) if torch.is_tensor(k) and k.ndim >= 1 else 0
+        profiler.count_path("cache_update", "append_paged_int4", batch=batch, bits=4)
+        return profiler.record_cuda("cache_update", orig_append_int4, *args, **kwargs)
+
+    def attention_append_paged_int4_spec(*args, **kwargs):
+        k = args[0] if args else None
+        batch = int(k.size(0)) if torch.is_tensor(k) and k.ndim >= 1 else 0
+        profiler.count_path("cache_update", "append_paged_int4_spec", batch=batch, bits=4)
+        return profiler.record_cuda("cache_update", orig_append_int4_spec, *args, **kwargs)
+
     def gdn_recurrent_ab(q, k, v, a, b, A_log, dt_bias, state):
         return profiler.record_cuda("gdn_recurrent", orig_gdn_ab, q, k, v, a, b, A_log, dt_bias, state)
 
@@ -192,6 +253,16 @@ def profile_decode() -> Iterator[DecodeProfiler]:
     model_mod.depthwise_conv_update = depthwise_conv_update
     try:
         setattr(cuda_ops(), "attention_decode_fp16", attention_decode_fp16)
+        if callable(orig_paged_fp16):
+            setattr(cuda_ops(), "attention_decode_paged_fp16", attention_decode_paged_fp16)
+        if callable(orig_paged_int4):
+            setattr(cuda_ops(), "attention_decode_paged_int4", attention_decode_paged_int4)
+        if callable(orig_paged_int4_flash):
+            setattr(cuda_ops(), "attention_paged_int4_flash", attention_paged_int4_flash)
+        if callable(orig_append_int4):
+            setattr(cuda_ops(), "attention_append_paged_int4", attention_append_paged_int4)
+        if callable(orig_append_int4_spec):
+            setattr(cuda_ops(), "attention_append_paged_int4_spec", attention_append_paged_int4_spec)
         setattr(cuda_ops(), "gdn_recurrent_ab", gdn_recurrent_ab)
         F.scaled_dot_product_attention = scaled_dot_product_attention
         yield profiler
@@ -205,6 +276,16 @@ def profile_decode() -> Iterator[DecodeProfiler]:
         model_mod.gdn_norm_silu_gate_2d = orig_gdn_gate_2d
         model_mod.depthwise_conv_update = orig_depthwise
         setattr(cuda_ops(), "attention_decode_fp16", orig_attention)
+        if callable(orig_paged_fp16):
+            setattr(cuda_ops(), "attention_decode_paged_fp16", orig_paged_fp16)
+        if callable(orig_paged_int4):
+            setattr(cuda_ops(), "attention_decode_paged_int4", orig_paged_int4)
+        if callable(orig_paged_int4_flash):
+            setattr(cuda_ops(), "attention_paged_int4_flash", orig_paged_int4_flash)
+        if callable(orig_append_int4):
+            setattr(cuda_ops(), "attention_append_paged_int4", orig_append_int4)
+        if callable(orig_append_int4_spec):
+            setattr(cuda_ops(), "attention_append_paged_int4_spec", orig_append_int4_spec)
         setattr(cuda_ops(), "gdn_recurrent_ab", orig_gdn_ab)
         F.scaled_dot_product_attention = orig_sdpa
 
@@ -258,10 +339,16 @@ def _print_profile_result(
         print("path,count")
         for path, count in profiler.path_table():
             print(f"{path},{count}")
+    if profiler.batch_counts:
+        print("batch_kind,calls,avg_rows,avg_tokens")
+        for label, count, avg_rows, avg_tokens in profiler.batch_table():
+            print(f"{label},{count},{avg_rows:.2f},{avg_tokens:.2f}")
 
 
 def _parse_batch_sizes(raw: str) -> list[int]:
     out: list[int] = []
+    if not raw.strip():
+        return out
     for part in raw.split(","):
         part = part.strip()
         if not part:
@@ -337,6 +424,66 @@ def _profile_decode_batch(engine, prompt_ids: list[int], cfg: GenerationConfig, 
     )
 
 
+def _profile_serving_worker(engine, prompt_ids: list[int], cfg: GenerationConfig, args, *, batch_size: int) -> None:
+    prefill_chunk_size = int(args.prefill_chunk_size) if args.prefill_chunk_size is not None else 64
+    block_table = KVBlockTable(num_blocks=int(args.worker_kv_blocks), block_size=int(args.worker_kv_block_size))
+    scheduler = ContinuousBatchScheduler(
+        max_num_requests=batch_size,
+        max_num_batched_tokens=max(1, int(args.worker_max_num_batched_tokens)),
+        prefill_chunk_size=max(1, prefill_chunk_size),
+        max_prefill_rows_per_batch=max(0, int(args.worker_max_prefill_rows_per_batch)),
+        block_table=block_table,
+    )
+    runner = BatchedModelRunner(engine=engine, scheduler=scheduler)
+    worker = BatchGenerationWorker(runner=runner, device=engine.device, max_wait_s=float(args.worker_max_wait_ms) / 1000.0)
+    try:
+        if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+            torch.cuda.synchronize()
+        with profile_decode() as profiler:
+            orig_schedule = scheduler.schedule
+
+            def schedule_with_profile(*, device: str = "cpu"):
+                batch = orig_schedule(device=device)
+                if batch is not None:
+                    if any(bool(v) for v in batch.is_prefill):
+                        label = "prefill"
+                    elif batch.spec_decode_metadata is not None:
+                        label = "spec_decode"
+                    else:
+                        label = "decode"
+                    profiler.record_batch(label, rows=len(batch.request_ids), tokens=int(batch.num_tokens))
+                return batch
+
+            scheduler.schedule = schedule_with_profile  # type: ignore[method-assign]
+            t0 = time.perf_counter()
+            handles = [
+                worker.submit(
+                    prompt_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    eos_token_ids=(),
+                    generation_config=cfg,
+                    request_id=f"profile-worker-{batch_size}-{row}",
+                    prefix_cache_enabled=False,
+                )
+                for row in range(batch_size)
+            ]
+            for handle in handles:
+                handle.wait_ids(timeout=max(30.0, args.max_new_tokens * 2.0))
+            if torch.cuda.is_available() and str(args.device).startswith("cuda"):
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
+        generated = sum(len(handle.generated) for handle in handles)
+        _print_profile_result(
+            label=f"serving_worker_paged_B{batch_size}",
+            prompt_tokens=len(prompt_ids),
+            generated=generated,
+            elapsed=elapsed,
+            profiler=profiler,
+        )
+    finally:
+        worker.shutdown()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Profile Qwen3.6 adapter target-only decode bottlenecks")
     add_model_path_args(parser)
@@ -357,6 +504,16 @@ def main() -> None:
         action="store_true",
         help="skip the direct engine.forward_one single-request profile",
     )
+    parser.add_argument(
+        "--worker-batch-sizes",
+        default="",
+        help="comma-separated serving worker batch sizes to profile through the arena/paged KV path",
+    )
+    parser.add_argument("--worker-kv-block-size", type=int, default=16)
+    parser.add_argument("--worker-kv-blocks", type=int, default=768)
+    parser.add_argument("--worker-max-num-batched-tokens", type=int, default=256)
+    parser.add_argument("--worker-max-prefill-rows-per-batch", type=int, default=1)
+    parser.add_argument("--worker-max-wait-ms", type=float, default=2.0)
     add_runtime_feature_args(parser)
     args = parser.parse_args()
     if args.adapter not in {"qwen36", "qwen36-a3b"}:
@@ -386,6 +543,9 @@ def main() -> None:
         _profile_direct_single(engine, prompt_ids, cfg, features, args)
     for batch_size in _parse_batch_sizes(args.batch_sizes):
         _profile_decode_batch(engine, prompt_ids, cfg, features, args, batch_size=batch_size)
+    if args.worker_batch_sizes.strip():
+        for batch_size in _parse_batch_sizes(args.worker_batch_sizes):
+            _profile_serving_worker(engine, prompt_ids, cfg, args, batch_size=batch_size)
 
 
 if __name__ == "__main__":

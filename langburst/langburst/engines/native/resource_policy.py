@@ -20,7 +20,8 @@ from ...tuning import marlin_direct_max_batch
 
 DEFAULT_MAX_QUEUED_REQUESTS = 8
 DEFAULT_RUNTIME_OVERHEAD_MIB = 384
-DEFAULT_MAX_PREFILL_ROWS_PER_BATCH = 1
+DEFAULT_MAX_PREFILL_ROWS_PER_BATCH = 0
+DEFAULT_BATCH_WAIT_MS = 8.0
 
 
 def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -87,6 +88,7 @@ class EngineResourcePolicy:
     prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE
     max_prefill_rows_per_batch: int = DEFAULT_MAX_PREFILL_ROWS_PER_BATCH
     decode_prefill_interleave_steps: int = 16
+    batch_wait_ms: float = DEFAULT_BATCH_WAIT_MS
     kv_block_size: int = DEFAULT_KV_BLOCK_SIZE
     kv_blocks: int = DEFAULT_KV_BLOCKS
     runtime_overhead_mib: int = DEFAULT_RUNTIME_OVERHEAD_MIB
@@ -105,8 +107,13 @@ class EngineResourcePolicy:
             max_generation_tokens=_env_int(source, "LANGBURST_MAX_GENERATION_TOKENS", DEFAULT_MAX_GENERATION_TOKENS),
             max_num_batched_tokens=_env_int(source, "LANGBURST_MAX_NUM_BATCHED_TOKENS", DEFAULT_MAX_BATCHED_TOKENS),
             prefill_chunk_size=_env_int(source, "LANGBURST_PREFILL_CHUNK_SIZE", DEFAULT_PREFILL_CHUNK_SIZE),
-            max_prefill_rows_per_batch=_env_int(source, "LANGBURST_MAX_PREFILL_ROWS_PER_BATCH", DEFAULT_MAX_PREFILL_ROWS_PER_BATCH),
+            max_prefill_rows_per_batch=_env_int(
+                source,
+                "LANGBURST_MAX_PREFILL_ROWS_PER_BATCH",
+                _env_max_active_requests(source),
+            ),
             decode_prefill_interleave_steps=_env_int(source, "LANGBURST_DECODE_PREFILL_INTERLEAVE_STEPS", 16),
+            batch_wait_ms=float(source.get("LANGBURST_BATCH_WAIT_MS", DEFAULT_BATCH_WAIT_MS)),
             kv_block_size=_env_kv_block_size(source),
             kv_blocks=_env_kv_blocks(source),
             runtime_overhead_mib=_env_int(source, "LANGBURST_RUNTIME_OVERHEAD_MIB", DEFAULT_RUNTIME_OVERHEAD_MIB),
@@ -139,6 +146,8 @@ class EngineResourcePolicy:
             raise ValueError("max_prefill_rows_per_batch must be >= 0")
         if self.decode_prefill_interleave_steps < 1:
             raise ValueError("decode_prefill_interleave_steps must be >= 1")
+        if self.batch_wait_ms < 0:
+            raise ValueError("batch_wait_ms must be >= 0")
         if self.kv_block_size < 1:
             raise ValueError("kv_block_size must be >= 1")
         if self.kv_blocks < 1:
@@ -160,6 +169,7 @@ class EngineResourcePolicy:
             "prefill_chunk_size": self.prefill_chunk_size,
             "max_prefill_rows_per_batch": self.max_prefill_rows_per_batch,
             "decode_prefill_interleave_steps": self.decode_prefill_interleave_steps,
+            "batch_wait_ms": self.batch_wait_ms,
             "kv_block_size": self.kv_block_size,
             "kv_blocks": self.kv_blocks,
             "runtime_overhead_mib": self.runtime_overhead_mib,

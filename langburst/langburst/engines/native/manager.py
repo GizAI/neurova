@@ -375,6 +375,7 @@ class EngineManager:
                 worker = BatchGenerationWorker(
                     runner=self.create_batch_runner(engine.model_name, resolved),
                     device=engine.device,
+                    max_wait_s=float(self.policy.batch_wait_ms) / 1000.0,
                 )
                 self._batch_workers[key] = worker
             return worker

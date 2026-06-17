@@ -103,7 +103,11 @@ class NativeBackend:
             max_state_pool_size=self._resource_policy.max_state_pool_size,
         )
         self._engine = engine
-        self._worker = BatchGenerationWorker(runner=runner, device=engine.device)
+        self._worker = BatchGenerationWorker(
+            runner=runner,
+            device=engine.device,
+            max_wait_s=float(self._resource_policy.batch_wait_ms) / 1000.0,
+        )
 
     def shutdown(self) -> None:
         if self._worker is not None:

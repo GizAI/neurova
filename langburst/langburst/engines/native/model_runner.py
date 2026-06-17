@@ -496,6 +496,11 @@ class BatchedModelRunner:
         if not self.features.speculative_decoding:
             self._record_speculative_prepare_skip("feature_disabled")
             return
+        if self.scheduler.block_table is None and str(self.engine.device).startswith("cuda"):
+            for row in rows:
+                row.clear_draft_tokens()
+            self._record_speculative_prepare_skip("paged_kv_required")
+            return
         if not self.speculative_tracker.should_propose():
             for row in rows:
                 row.clear_draft_tokens()

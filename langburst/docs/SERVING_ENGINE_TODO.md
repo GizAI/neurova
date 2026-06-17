@@ -4,6 +4,30 @@ This is the single backlog for production-class LangBurst serving. Do not
 scatter performance TODOs into separate notes. Promote only changes that keep
 output/state parity and show measured benefit.
 
+## Consolidated Done / Pending (Single Source)
+
+- Done
+  - multi-user continuous batching baseline, scheduler admission/buffer reuse, and cancellation cleanup are in place.
+  - slot-indexed decode arena, block table/slot mapping, and paged KV append path are in place.
+  - hot-path Qwen36 verifier now runs through `resolve_speculative_gpu(...)`, computes `accepted_draft_tokens`, `commit_tokens`, and commits only accepted prefix.
+  - commit-aware GDN/conv spec kernels are implemented/registered and connected in hot path (`gdn_recurrent_ab_spec`, `depthwise_conv_update_spec`, and trajectory variants).
+  - speculative append path writes candidates through speculative KV staging and then commits only accepted prefix into live pages.
+  - production runtime no longer depends on legacy NextN verifier for serving path; legacy modules are currently confined to research/tests.
+  - Marlin `[B, D]` decode/projection path and batch-state decode kernels are used by normal and spec verify flow.
+  - benchmark + regression gates with CPU and CUDA kernel tests are integrated.
+
+- Pending (No duplicate legacy paths)
+  - true fixed-shape decode batch `B x T` still needs stricter single-pass verification and elimination of any lingering row-by-row verifier fallbacks.
+  - remove remaining Python/CUDA boundary work in fast path metadata (not just output handoff): search for residual CPU scalar handoff in decode/verify commit path and remove.
+  - wire and measure `cuda.graph` capture/replay as true hot-path execution (bucketed by `B in {1,2,4,8}`, `T in {2,3,5,9}`) rather than planning-only.
+  - finish `K` policy auto-tuning to be speed-positive per prompt class (`{1,2,4,8}` EMA gate using `baseline_ms_per_token`, `speculative_ms_per_output_token`, `mean_accept_len`).
+  - COW/refcount for speculative page/slot mutation boundaries and prefix-cache sharing is still incomplete.
+  - paged prefill for `query_len > 1` with continuation parity and long-context extension still requires a dedicated fused/tile path and benchmark closure.
+  - full lm_head/sampling fusion (`candidate-limited logits`, `GPU argmax/top-k`, `GPU EOS`) still pending for any residual head/tensor-materialization overhead.
+  - production-observable bench matrix is still incomplete: `B=1/2/4` fixed-shape prefill/decode profiles and long-context sweeps with same prompt matrix need fresh runs.
+
+Do not add new TODO items outside this section unless they include measured evidence and a clear de-duplication decision.
+
 ## P0: Correctness Gates
 
 - Status: in progress
@@ -221,6 +245,56 @@ output/state parity and show measured benefit.
   - this removed an obvious CPU-sync pattern but did not materially improve the
     dmc8 worker benchmark; remaining gap vs direct target-only decode is in the
     serving/state/paged forward path and full-logits materialization
+  - 2026-06-17 dmc8 Q3 decode-critical-path profile, recent_window=2048,
+    INT4_BDR KV, `LANGBURST_MARLIN_OUT_CACHE_POLICY=decode_only`:
+    - direct single profile by measured kernel time:
+      `mlp_gate_up` 33.9%, `mlp_down` 14.9%, `gdn_qkvz` 10.7%,
+      `gdn_out` 8.7%, `gdn_ba` 7.0%, `lm_head` 3.1%, `sampling` 0.1%
+    - batch=2/4 projection calls are Marlin direct, not row-loop fallback, but
+      decode-only cache means batch>1 output buffers are not cached
+    - `LANGBURST_MARLIN_OUT_CACHE_POLICY=all` creates batch=2/4 cache hits but
+      did not materially change the short profiled elapsed time; keep
+      `decode_only` default until a serving benchmark proves the VRAM tradeoff
+    - serving batch=4, prompt=1, max_new=128:
+      paged KV target-only aggregate decode about 15.3 tok/s; no-paged about
+      28.7 tok/s.  Current paged INT4_BDR decode attention/state path is a
+      primary throughput drag.  No-paged is diagnostic only; production must
+      keep INT4_BDR paged KV for 16GB/32K/multi-user memory safety and optimize
+      that hot path rather than falling back to FP16/ring KV.
+    - serving batch=1, prompt=1, max_new=128: target-only about 21.0 tok/s;
+      MTP K=1 about 26.0 tok/s with 43 accepted draft tokens and 21 rejected
+      prediction tokens.  Batch=4 MTP K=1 was not speed-positive because
+      acceptance collapsed.
+    - after adding arena/worker profiling, target-only B4 with actual
+      INT4_BDR paged KV shows:
+      `mlp_gate_up` about 32-35%, `mlp_down` about 14-15%,
+      `gdn_qkvz` about 11-12%, `gdn_out` about 9%,
+      `gdn_ba` about 7-8%, `attention_paged_int4_flash` about 2-8%,
+      `lm_head` about 2%, sampling below measurement noise.  This confirms
+      full decode layer stack and GDN/MLP projections remain the primary
+      decode work.
+    - `LANGBURST_MARLIN_OUT_CACHE_POLICY=all` turns batch=4 Marlin output
+      buffers into cache hits and improved the short profiled worker run only
+      about 44.1 -> 45.3 tok/s.  Keep `decode_only` as the 16GB default;
+      promote `all` only if a longer serving benchmark proves enough speedup
+      for its VRAM cost.
+    - Do not compare worker wall-clock `generated / elapsed` against
+      `bench_serving.py`'s `aggregate_decode_tok_s`; the former includes
+      prefill and intentionally reports a lower number.  Re-running the
+      documented Q3/INT4_BDR case (`prompt_tokens=256`, `max_new=64`,
+      `requests=4`, `recent_window=2048`, `kv_blocks=256`, MTP off) reproduced
+      the old batch=4 decode class when prefill rows are admitted together:
+      `aggregate_decode_tok_s=97.05`, `aggregate_output_tok_s=19.50`,
+      `mean_ttft_s=10.49`.
+    - `LANGBURST_MAX_PREFILL_ROWS_PER_BATCH=1` is still a real serving
+      throughput limiter: the same benchmark drops to
+      `aggregate_decode_tok_s=24.00` because requests start decoding one by
+      one instead of forming a B4 decode batch.  Default this cap to
+      `max_active_requests`; the token budget still limits long prefill chunks.
+    - Worker B2 with MTP K=1, `max_prefill_rows_per_batch=2`, and 8ms batch
+      wait measured 31.2 tok/s vs 30.1 tok/s with speculative off, so keep
+      K=1 adaptive enabled.  The remaining multi-user gap is low speculative
+      occupancy (`spec_decode` avg rows 1.32), not `lm_head` or sampling.
 - Required:
   - fixed decode-critical-path profile for batch=1/2/4 before every decode
     optimization pass:
