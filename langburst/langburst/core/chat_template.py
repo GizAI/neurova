@@ -14,11 +14,10 @@ def resolve_chat_template_kwargs(
         out.update(dict(base))
     request_kwargs = getattr(request, "chat_template_kwargs", None)
     if isinstance(request_kwargs, Mapping):
-        out.update(dict(request_kwargs))
+        filtered = dict(request_kwargs)
+        filtered.pop("enable_thinking", None)
+        out.update(filtered)
     out.setdefault("enable_thinking", False)
-    enable_thinking = getattr(request, "enable_thinking", None)
-    if enable_thinking is not None:
-        out["enable_thinking"] = bool(enable_thinking)
     reasoning_effort = getattr(request, "reasoning_effort", None)
     if reasoning_effort == "none":
         out["enable_thinking"] = False

@@ -19,6 +19,8 @@ dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.29",
   "pydantic>=2",
+  "rich>=13.7",
+  "textual>=0.79",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +41,7 @@ langburst-qwen-quantize = "langburst.adapters.qwen36_tools.quantize:main"
 langburst-qwen-smoke = "langburst.adapters.qwen36_tools.smoke:main"
 langburst-doctor = "langburst.doctor:main"
 langburst-infinite-demo = "langburst.research.infinite_demo:main"
+langburst-api-chat = "langburst.client_chat:main"
 langburst-chat = "langburst.generate:main"
 langburst-qwen-audit = "langburst.adapters.qwen36_tools.audit:main"
 langburst-server = "langburst.server:main"

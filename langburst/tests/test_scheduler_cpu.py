@@ -33,6 +33,7 @@ def test_admission_controller_rejects_when_queue_is_full():
 
 def test_continuous_batch_scheduler_chunks_prefill():
     scheduler = ContinuousBatchScheduler(max_num_requests=2, max_num_batched_tokens=4, prefill_chunk_size=3)
+    assert scheduler.stats().summary()["decode_prefill_interleave_steps"] == 16
     scheduler.add_request("a", [1, 2, 3, 4, 5])
     scheduler.add_request("b", [10, 11])
 
@@ -70,6 +71,38 @@ def test_continuous_batch_scheduler_prioritizes_decode_rows():
     assert next_batch is not None
     assert next_batch.request_ids == ["prefill"]
     assert next_batch.input_ids.tolist() == [10, 11, 12, 13]
+
+
+def test_continuous_batch_scheduler_interleaves_prefill_with_long_decode():
+    scheduler = ContinuousBatchScheduler(
+        max_num_requests=2,
+        max_num_batched_tokens=4,
+        prefill_chunk_size=4,
+        decode_prefill_interleave_steps=2,
+    )
+    decode = scheduler.add_request("decode", [1, 2])
+    decode.computed_tokens = 2
+    decode.last_sampled_token = 3
+    scheduler.add_request("prefill", [10, 11, 12, 13])
+
+    first = scheduler.schedule()
+    assert first is not None
+    assert first.request_ids == ["decode"]
+    assert first.input_ids.tolist() == [3]
+    decode.computed_tokens += 1
+    decode.last_sampled_token = 4
+
+    second = scheduler.schedule()
+    assert second is not None
+    assert second.request_ids == ["decode"]
+    assert second.input_ids.tolist() == [4]
+    decode.computed_tokens += 1
+    decode.last_sampled_token = 5
+
+    prefill = scheduler.schedule()
+    assert prefill is not None
+    assert prefill.request_ids == ["prefill"]
+    assert prefill.input_ids.tolist() == [10, 11, 12, 13]
 
 
 def test_continuous_batch_scheduler_updates_block_table_and_graph_bucket():

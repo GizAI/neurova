@@ -39,7 +39,6 @@ class BatchStateStore:
         self.engine = engine
         self.features = features
         self._states: dict[int, Any] = {}
-        self._external_states: dict[int, tuple[Any, Any | None]] = {}
         self._arena = self._maybe_create_arena(max_slots=max_slots, kv_num_blocks=kv_num_blocks, kv_block_size=kv_block_size)
         self._state_to_slot: dict[int, int] = {}
         self._reuse_pool: list[Any] = []
@@ -66,31 +65,9 @@ class BatchStateStore:
         self._states[idx] = state
         return state
 
-    def attach_external(self, state_index: int, state: Any, *, release_callback: Any | None = None) -> Any:
-        """Attach a caller-owned DecodeState to a scheduler state index.
-
-        Stateful sessions need the continuous-batching runner to operate on a
-        preserved DecodeState instead of a resettable pool/arena slot. The
-        caller keeps ownership; `release()` only detaches and invokes the
-        optional callback.
-        """
-
-        idx = int(state_index)
-        if idx in self._states:
-            raise ValueError(f"state_index already allocated: {idx}")
-        self._states[idx] = state
-        self._external_states[idx] = (state, release_callback)
-        return state
-
     def release(self, state_index: int) -> Any | None:
         idx = int(state_index)
         state = self._states.pop(idx, None)
-        external = self._external_states.pop(idx, None)
-        if external is not None:
-            callback = external[1]
-            if callable(callback):
-                callback()
-            return state
         slot = self._state_to_slot.pop(idx, None)
         if slot is not None and self._arena is not None:
             self._arena.release(slot)
@@ -116,10 +93,6 @@ class BatchStateStore:
             for slot in list(self._state_to_slot.values()):
                 self._arena.release(slot)
             self._state_to_slot.clear()
-        for _idx, (_state, callback) in list(self._external_states.items()):
-            if callable(callback):
-                callback()
-        self._external_states.clear()
         self._states.clear()
         self._reuse_pool.clear()
 

@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Literal
@@ -86,7 +87,6 @@ class ChatCompletionRequest(BaseModel):
     user: str | None = None
     metadata: dict[str, Any] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
-    enable_thinking: bool | None = None
     reasoning_effort: str | None = None
     runtime_profile: Literal["original", "stateful", "research"] | None = None
     kv_window_policy: Literal["error", "shift", "ring"] | None = None
@@ -105,16 +105,12 @@ class ChatCompletionRequest(BaseModel):
     prefill_chunk_size: int | None = None
 
 
-class SessionCreateRequest(BaseModel):
-    model: str | None = None
-
-
 def _sse_payload(payload: dict[str, Any]) -> str:
     return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
 
 def _requested_generation_tokens(req: ChatCompletionRequest) -> int:
-    fallback = int(os.environ.get("LANGBURST_DEFAULT_MAX_TOKENS", "1024"))
+    fallback = int(os.environ.get("LANGBURST_DEFAULT_MAX_TOKENS", "8192"))
     return req.max_new_tokens or req.max_completion_tokens or req.max_tokens or fallback
 
 
@@ -201,6 +197,11 @@ def _native_request_timeout_s() -> float | None:
     return max(0.0, float(raw))
 
 
+def _wants_live_usage(req: ChatCompletionRequest) -> bool:
+    metadata = req.metadata or {}
+    return bool(metadata.get("langburst_cli_live_metrics"))
+
+
 def _log_native_request_metrics(*, usage: RequestUsage, stream: bool, model: str, request_id: str) -> None:
     perf = usage.performance()
     parts: list[str] = [
@@ -215,7 +216,7 @@ def _log_native_request_metrics(*, usage: RequestUsage, stream: bool, model: str
         parts.append(f"requested_completion_tokens={usage.requested_completion_tokens}")
     if usage.finish_reason is not None:
         parts.append(f"finish_reason={usage.finish_reason}")
-    for key in ("queue_wait_s", "ttft_s", "e2e_s", "decode_s", "e2e_tok_s", "decode_tok_s", "mean_itl_s"):
+    for key in ("queue_wait_s", "prefill_s", "prefill_tok_s", "ttft_s", "e2e_s", "decode_s", "e2e_tok_s", "decode_tok_s", "mean_itl_s"):
         value = perf.get(key)
         if value is not None:
             parts.append(f"{key}={float(value):.4f}")
@@ -278,10 +279,6 @@ def _native_stop_token_sequences(engine, req: ChatCompletionRequest) -> tuple[tu
     return tuple(out)
 
 
-def _uses_native_session(req: ChatCompletionRequest) -> bool:
-    return bool(req.session_id or req.stateful_session or req.previous_response_id)
-
-
 def create_app(manager: EngineManager):
     """Native LangBurst server surface backed by the in-process EngineManager.
 
@@ -310,18 +307,6 @@ def create_app(manager: EngineManager):
     def langburst_health():
         return manager.health()
 
-    @app.get("/v1/langburst/sessions")
-    def list_sessions():
-        return manager.sessions.summary()
-
-    @app.post("/v1/langburst/sessions")
-    def create_session(req: SessionCreateRequest | None = None):
-        return {"id": manager.create_session(), "model": req.model if req else None}
-
-    @app.delete("/v1/langburst/sessions/{session_id}")
-    def delete_session(session_id: str):
-        return {"deleted": manager.delete_session(session_id)}
-
     @app.delete("/v1/langburst/models/{model_name}")
     def unload_model(model_name: str):
         return {"model": model_name, "unloaded": manager.unload(model_name)}
@@ -335,13 +320,12 @@ def create_app(manager: EngineManager):
             generation_tokens = _requested_generation_tokens(req)
             manager.validate_generation_request(prompt_tokens=len(prompt_ids), generation_tokens=generation_tokens)
             manager.validate_runtime_memory(engine)
+            if req.session_id or req.stateful_session or req.previous_response_id:
+                raise ValueError(
+                    "Native LangBurst sessions were removed from the GPU hot path; "
+                    "send conversation history in messages and use prefix_cache/prompt_cache_key for reuse."
+                )
             gen_cfg = _native_generation_config(engine, req)
-            session_id = req.session_id or (manager.create_session() if req.stateful_session else None)
-            session_record = (
-                manager.get_session(session_id=session_id, model_name=engine.model_name, features=features)
-                if session_id
-                else None
-            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -360,6 +344,8 @@ def create_app(manager: EngineManager):
                 handle = None
                 visible_prefix = _thinking_visible_prefix(req, engine.model_name)
                 visible_prefix_emitted = False
+                live_usage = _wants_live_usage(req)
+                last_live_usage_s = 0.0
                 try:
                     await asyncio.to_thread(lease.__enter__)
                     acquired = True
@@ -371,7 +357,6 @@ def create_app(manager: EngineManager):
                         generation_config=gen_cfg,
                         prompt_cache_key=req.prompt_cache_key,
                         prefix_cache_enabled=features.prefix_cache,
-                        session_record=session_record,
                         stop_sequences=stop_sequences,
                         include_stop_str_in_output=req.include_stop_str_in_output,
                         request_id=request_id,
@@ -399,13 +384,26 @@ def create_app(manager: EngineManager):
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
                                     "model": engine.model_name,
-                                    **({"session_id": session_id} if session_id else {}),
                                     "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                                 }
                             )
                         usage.apply_metrics(handle.metrics())
                         usage.requested_completion_tokens = generation_tokens
                         usage.finish_reason = handle.finish_reason
+                        if live_usage:
+                            now = time.monotonic()
+                            if now - last_live_usage_s >= 0.5:
+                                last_live_usage_s = now
+                                yield _sse_payload(
+                                    {
+                                        "id": request_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": engine.model_name,
+                                        "usage": _usage_payload(usage),
+                                        "choices": [],
+                                    }
+                                )
                     tail = decoder.flush()
                     usage.apply_metrics(handle.metrics())
                     usage.requested_completion_tokens = generation_tokens
@@ -428,7 +426,6 @@ def create_app(manager: EngineManager):
                                 "object": "chat.completion.chunk",
                                 "created": int(time.time()),
                                 "model": engine.model_name,
-                                **({"session_id": session_id} if session_id else {}),
                                 "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
                             }
                         )
@@ -437,13 +434,13 @@ def create_app(manager: EngineManager):
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": engine.model_name,
-                        **({"session_id": session_id} if session_id else {}),
                         **({"usage": _usage_payload(usage)} if req.stream_options and req.stream_options.include_usage else {}),
                         "choices": [{"index": 0, "delta": {}, "finish_reason": handle.finish_reason}],
                     }
                     yield _sse_payload(done)
                     yield "data: [DONE]\n\n"
                 except BaseException as exc:
+                    traceback.print_exc()
                     if handle is not None:
                         handle.cancel()
                     yield _sse_payload({"error": {"message": str(exc), "type": type(exc).__name__}})
@@ -467,7 +464,6 @@ def create_app(manager: EngineManager):
                     generation_config=gen_cfg,
                     prompt_cache_key=req.prompt_cache_key,
                     prefix_cache_enabled=features.prefix_cache,
-                    session_record=session_record,
                     stop_sequences=stop_sequences,
                     include_stop_str_in_output=req.include_stop_str_in_output,
                     request_id=request_id,
@@ -494,7 +490,6 @@ def create_app(manager: EngineManager):
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": engine.model_name,
-                **({"session_id": session_id} if session_id else {}),
                 "choices": [
                     {
                         "index": 0,
@@ -633,6 +628,7 @@ def create_engine_app(backend: EngineBackend):
                             yield _sse_payload(done)
                     yield "data: [DONE]\n\n"
                 except BaseException as exc:
+                    traceback.print_exc()
                     yield _sse_payload({"error": {"message": str(exc), "type": type(exc).__name__}})
                     yield "data: [DONE]\n\n"
 
@@ -711,11 +707,10 @@ def main() -> None:
     ap.add_argument("--max-generation-tokens", type=int, default=resource_defaults.max_generation_tokens)
     ap.add_argument("--max-num-batched-tokens", type=int, default=resource_defaults.max_num_batched_tokens)
     ap.add_argument("--batch-prefill-chunk-size", type=int, default=resource_defaults.prefill_chunk_size)
+    ap.add_argument("--decode-prefill-interleave-steps", type=int, default=resource_defaults.decode_prefill_interleave_steps)
     ap.add_argument("--kv-block-size", type=int, default=resource_defaults.kv_block_size)
     ap.add_argument("--kv-blocks", type=int, default=resource_defaults.kv_blocks)
     ap.add_argument("--runtime-overhead-mib", type=int, default=resource_defaults.runtime_overhead_mib)
-    ap.add_argument("--max-sessions", type=int, default=resource_defaults.max_sessions)
-    ap.add_argument("--session-ttl-s", type=float, default=0.0 if resource_defaults.session_ttl_s is None else resource_defaults.session_ttl_s)
     ap.add_argument("--models-json", type=Path, default=None)
     add_runtime_feature_args(ap)
     args = ap.parse_args()
@@ -744,11 +739,10 @@ def main() -> None:
                     max_generation_tokens=args.max_generation_tokens,
                     max_num_batched_tokens=args.max_num_batched_tokens,
                     prefill_chunk_size=args.batch_prefill_chunk_size,
+                    decode_prefill_interleave_steps=args.decode_prefill_interleave_steps,
                     kv_block_size=args.kv_block_size,
                     kv_blocks=args.kv_blocks,
                     runtime_overhead_mib=args.runtime_overhead_mib,
-                    max_sessions=args.max_sessions,
-                    session_ttl_s=None if args.session_ttl_s <= 0 else args.session_ttl_s,
                 ),
             )
             app = create_app(manager)

@@ -11,12 +11,15 @@ Usage:
   ./neurova.sh langburst help
   ./neurova.sh langburst server [...]
   ./neurova.sh langburst chat [...]
+  ./neurova.sh langburst generate [...]
   ./neurova.sh langburst doctor [...]
   ./neurova.sh langburst bench [...]
   ./neurova.sh langburst install-cpu
 
 Notes:
-  server/chat/bench expect LangBurst to be installed in the active Python env.
+  chat talks to an OpenAI-compatible LangBurst API and streams replies.
+  generate loads an engine/model in-process for one-shot local generation.
+  server/bench expect LangBurst to be installed in the active Python env.
   install-cpu installs the package without building CUDA extensions.
 EOF
 }
@@ -34,6 +37,9 @@ case "$cmd" in
     exec langburst-server "$@"
     ;;
   chat)
+    exec python -m langburst.client_chat "$@"
+    ;;
+  generate|local-chat)
     exec langburst-chat "$@"
     ;;
   doctor)

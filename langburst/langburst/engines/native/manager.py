@@ -23,7 +23,6 @@ from .scheduler import AdmissionController, ContinuousBatchScheduler
 from .block_table import KVBlockTable
 from .cuda_graph import CudaGraphBucketPlanner
 from .resource_policy import EngineResourcePolicy
-from .session_store import SessionStateRecord, SessionStateStore
 
 
 @dataclass(frozen=True)
@@ -132,11 +131,11 @@ class EngineManager:
             else None
         )
         self.cuda_graph_planner = CudaGraphBucketPlanner()
-        self.sessions = SessionStateStore(max_sessions=self.policy.max_sessions, ttl_s=self.policy.session_ttl_s)
         self.batch_scheduler = ContinuousBatchScheduler(
             max_num_requests=self.policy.max_active_requests,
             max_num_batched_tokens=self.policy.max_num_batched_tokens,
             prefill_chunk_size=self.policy.prefill_chunk_size,
+            decode_prefill_interleave_steps=self.policy.decode_prefill_interleave_steps,
             block_table=self.kv_block_table,
             cuda_graph_planner=self.cuda_graph_planner,
         )
@@ -164,7 +163,6 @@ class EngineManager:
         out = []
         for spec in self.specs.values():
             adapter = adapter_registry.get(spec.adapter_id)
-            plan = adapter.descriptor.capabilities
             status = self._status[spec.model_name]
             out.append(
                 {
@@ -174,10 +172,15 @@ class EngineManager:
                     "estimated_vram_mib": spec.estimated_vram_mib,
                     "loaded": spec.model_name in self._engines,
                     "status": status.summary(),
-                    "capabilities": plan.summary(),
+                    "capabilities": self._serving_capability_summary(adapter.descriptor.capabilities),
                 }
             )
         return out
+
+    def _serving_capability_summary(self, capabilities) -> dict[str, Any]:
+        summary = dict(capabilities.summary())
+        summary["max_concurrency"] = self.policy.max_active_requests
+        return summary
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -188,7 +191,6 @@ class EngineManager:
             "batch_scheduler": self.batch_scheduler.stats().summary(),
             "batch_runners": self.batch_runner_summary(),
             "batch_workers": self.batch_worker_summary(),
-            "sessions": self.sessions.summary(),
             "resource": self.resource_summary(),
         }
 
@@ -203,7 +205,6 @@ class EngineManager:
             "batch_scheduler": self.batch_scheduler.stats().summary(),
             "batch_runners": self.batch_runner_summary(),
             "batch_workers": self.batch_worker_summary(),
-            "sessions": self.sessions.summary(),
             "resource": self.resource_summary(),
             "loaded_tensor_memory": self.loaded_tensor_memory_summary(),
             "kv_blocks": self.kv_block_table.summary() if self.kv_block_table is not None else None,
@@ -261,7 +262,6 @@ class EngineManager:
                 evicted_name, evicted_engine = self._engines.popitem(last=False)
                 evicted_engine.clear_state_pool()
                 self._drop_batch_runners(evicted_name)
-                self.sessions.delete_model(evicted_name)
                 status = self._status[evicted_name]
                 status.state = "unloaded"
                 status.unload_count += 1
@@ -326,7 +326,6 @@ class EngineManager:
             engine = self._engines.pop(name)
             engine.clear_state_pool()
             self._drop_batch_runners(name)
-            self.sessions.delete_model(name)
             status = self._status[name]
             status.state = "unloaded"
             status.unload_count += 1
@@ -393,17 +392,6 @@ class EngineManager:
             ("kv_window_policy", features.kv_window_policy),
             ("state_pool", features.state_pool),
         )
-
-    def create_session(self) -> str:
-        return self.sessions.new_session_id()
-
-    def get_session(self, *, session_id: str, model_name: str | None = None, features: RuntimeFeatures | None = None) -> SessionStateRecord:
-        engine = self.get(model_name)
-        resolved = engine.resolve_plan(features).effective
-        return self.sessions.get_or_create(session_id=session_id, engine=engine, features=resolved)
-
-    def delete_session(self, session_id: str, *, model_name: str | None = None) -> int:
-        return self.sessions.delete(session_id, model_name=model_name)
 
     def batch_runner_summary(self) -> dict[str, object]:
         return {
@@ -539,7 +527,6 @@ class EngineManager:
         self.batch_scheduler.clear()
         if self.kv_block_table is not None:
             self.kv_block_table.clear()
-        self.sessions.delete_model(name)
         status = self._status.get(name)
         if status is not None:
             status.state = "unloaded"

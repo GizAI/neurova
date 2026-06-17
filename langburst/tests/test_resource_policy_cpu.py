@@ -11,6 +11,7 @@ def test_resource_policy_from_env_derives_kv_blocks_from_context_and_concurrency
             "LANGBURST_MAX_ACTIVE_REQUESTS": "2",
             "LANGBURST_MAX_QUEUED_REQUESTS": "8",
             "LANGBURST_PREFILL_CHUNK_SIZE": "64",
+            "LANGBURST_DECODE_PREFILL_INTERLEAVE_STEPS": "3",
         }
     )
 
@@ -21,6 +22,7 @@ def test_resource_policy_from_env_derives_kv_blocks_from_context_and_concurrency
     assert policy.max_queued_requests == 8
     assert policy.max_state_pool_size == 2
     assert policy.prefill_chunk_size == 64
+    assert policy.decode_prefill_interleave_steps == 3
 
 
 def test_resource_policy_from_env_accepts_explicit_deployment_budget():
@@ -33,7 +35,6 @@ def test_resource_policy_from_env_accepts_explicit_deployment_budget():
             "LANGBURST_RESERVE_FREE_VRAM_MIB": "256",
             "LANGBURST_RUNTIME_OVERHEAD_MIB": "128",
             "LANGBURST_MAX_STATE_POOL_SIZE": "1",
-            "LANGBURST_SESSION_TTL_S": "0",
         }
     )
 
@@ -43,4 +44,3 @@ def test_resource_policy_from_env_accepts_explicit_deployment_budget():
     assert policy.reserve_free_vram_mib == 256
     assert policy.runtime_overhead_mib == 128
     assert policy.max_state_pool_size == 1
-    assert policy.session_ttl_s is None

@@ -55,9 +55,24 @@ def test_server_models_endpoint_uses_manager(tmp_path: Path):
     assert "/v1/models" in route_paths
     assert "/v1/langburst/models" in route_paths
     assert "/v1/langburst/health" in route_paths
-    assert "/v1/langburst/sessions" in route_paths
-    assert "/v1/langburst/sessions/{session_id}" in route_paths
     assert "/v1/langburst/models/{model_name}" in route_paths
+
+
+def test_models_endpoint_reports_serving_concurrency(tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(max_loaded_models=1, max_active_requests=2),
+    )
+
+    model = manager.list_models()[0]
+
+    assert model["capabilities"]["max_concurrency"] == 2
+    assert manager.health()["models"][0]["capabilities"]["max_concurrency"] == 2
 
 
 def test_server_request_model_can_fall_back_to_manager_default(tmp_path: Path):
@@ -183,7 +198,7 @@ def test_server_generation_options_are_applied_end_to_end(tmp_path: Path):
     assert stopped.json()["choices"][0]["message"]["content"] == "1"
 
 
-def test_server_default_chat_is_stateless_but_explicit_session_persists_state(tmp_path: Path):
+def test_server_rejects_removed_native_sessions_before_generation(tmp_path: Path):
     from fastapi.testclient import TestClient
 
     adapter = ToyAdapter()
@@ -193,54 +208,53 @@ def test_server_default_chat_is_stateless_but_explicit_session_persists_state(tm
         pass
     manager = EngineManager(
         [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
-        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2, max_sessions=2),
+        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2),
     )
     client = TestClient(create_app(manager))
 
-    stateless_a = client.post(
-        "/v1/chat/completions",
-        json={"model": "toy-a", "messages": [{"role": "user", "content": "a"}], "max_tokens": 1},
-    )
-    stateless_b = client.post(
-        "/v1/chat/completions",
-        json={"model": "toy-a", "messages": [{"role": "user", "content": "b"}], "max_tokens": 1},
-    )
-    assert stateless_a.status_code == 200
-    assert stateless_b.status_code == 200
-    assert stateless_a.json()["choices"][0]["message"]["content"] == "1"
-    assert stateless_b.json()["choices"][0]["message"]["content"] == "1"
-
-    session = client.post("/v1/langburst/sessions", json={"model": "toy-a"}).json()["id"]
-    first = client.post(
+    response = client.post(
         "/v1/chat/completions",
         json={
             "model": "toy-a",
             "messages": [{"role": "user", "content": "a"}],
             "max_tokens": 1,
-            "session_id": session,
-        },
-    )
-    second = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "toy-a",
-            "messages": [{"role": "user", "content": "b"}],
-            "max_tokens": 1,
-            "session_id": session,
+            "session_id": "sess-test",
         },
     )
 
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert first.json()["session_id"] == session
-    assert second.json()["session_id"] == session
-    assert first.json()["choices"][0]["message"]["content"] == "1"
-    assert second.json()["choices"][0]["message"]["content"] == "3"
-    sessions = client.get("/v1/langburst/sessions").json()
-    assert sessions["active_sessions"] == 1
-    assert sessions["sessions"][0]["turns"] == 2
-    deleted = client.delete(f"/v1/langburst/sessions/{session}").json()
-    assert deleted["deleted"] == 1
+    assert response.status_code == 413
+    assert "sessions were removed" in response.json()["detail"]
+
+
+def test_server_history_messages_replace_removed_sessions(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2),
+    )
+    client = TestClient(create_app(manager))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "toy-a",
+            "messages": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "1"},
+                {"role": "user", "content": "b"},
+            ],
+            "max_tokens": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "4"
 
 
 def test_server_stream_greedy_uses_batch_worker(tmp_path: Path):
@@ -370,11 +384,11 @@ def test_engine_manager_summary_is_server_contract(tmp_path: Path):
     summary = manager.summary()
     assert summary["data"][0]["id"] == "toy-a"
     assert summary["policy"]["max_queued_requests"] == 2
-    from langburst.core.defaults import max_prompt_tokens_default, max_state_pool_size_default
+    from langburst.core.defaults import DEFAULT_MAX_GENERATION_TOKENS, max_prompt_tokens_default, max_state_pool_size_default
 
     assert summary["policy"]["max_state_pool_size"] == max_state_pool_size_default()
     assert summary["policy"]["max_prompt_tokens"] == max_prompt_tokens_default()
-    assert summary["policy"]["max_generation_tokens"] == 1024
+    assert summary["policy"]["max_generation_tokens"] == DEFAULT_MAX_GENERATION_TOKENS
     assert summary["policy"]["max_num_batched_tokens"] == 256
     assert summary["policy"]["prefill_chunk_size"] == 64
     assert summary["admission"]["max_active_requests"] == 1

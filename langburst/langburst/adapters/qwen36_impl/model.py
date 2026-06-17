@@ -859,17 +859,25 @@ def sync_state_kv_to_paged(
             src = state.max_seq_len - 1
         tiled_layout = _paged_int4_tiled_layout(arena)
         for layer in state.cfg.attention_layers:
+            layer_k = state.attn_k.get(layer)
+            layer_v = state.attn_v.get(layer)
+            if layer_k is None or layer_v is None or layer_k.size(1) == 0 or layer_v.size(1) == 0:
+                continue
             if state.kv_cache_spec.is_int4 and tiled_layout:
-                paged_k[layer][block_id, :, :, offset].copy_(state.attn_k[layer][:, src, :])
-                paged_v[layer][block_id, :, :, offset].copy_(state.attn_v[layer][:, src, :])
+                paged_k[layer][block_id, :, :, offset].copy_(layer_k[:, src, :])
+                paged_v[layer][block_id, :, :, offset].copy_(layer_v[:, src, :])
             else:
-                paged_k[layer][block_id, :, offset, :].copy_(state.attn_k[layer][:, src, :])
-                paged_v[layer][block_id, :, offset, :].copy_(state.attn_v[layer][:, src, :])
+                paged_k[layer][block_id, :, offset, :].copy_(layer_k[:, src, :])
+                paged_v[layer][block_id, :, offset, :].copy_(layer_v[:, src, :])
             if (
                 state.attn_k_scale is not None
                 and state.attn_v_scale is not None
                 and getattr(arena, "paged_attn_k_scale", None) is not None
                 and getattr(arena, "paged_attn_v_scale", None) is not None
+                and layer in state.attn_k_scale
+                and layer in state.attn_v_scale
+                and state.attn_k_scale[layer].size(1) > 0
+                and state.attn_v_scale[layer].size(1) > 0
             ):
                 arena.paged_attn_k_scale[layer][block_id, :, offset].copy_(state.attn_k_scale[layer][:, src])
                 arena.paged_attn_v_scale[layer][block_id, :, offset].copy_(state.attn_v_scale[layer][:, src])
@@ -878,6 +886,10 @@ def sync_state_kv_to_paged(
                 and state.attn_v_zero is not None
                 and getattr(arena, "paged_attn_k_zero", None) is not None
                 and getattr(arena, "paged_attn_v_zero", None) is not None
+                and layer in state.attn_k_zero
+                and layer in state.attn_v_zero
+                and state.attn_k_zero[layer].size(1) > 0
+                and state.attn_v_zero[layer].size(1) > 0
             ):
                 arena.paged_attn_k_zero[layer][block_id, :, offset].copy_(state.attn_k_zero[layer][:, src])
                 arena.paged_attn_v_zero[layer][block_id, :, offset].copy_(state.attn_v_zero[layer][:, src])

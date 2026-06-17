@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Sequence
 
 import torch
 
@@ -80,23 +80,14 @@ class BatchedModelRunner:
         generation_config: GenerationConfig | None = None,
         prompt_cache_key: str | None = None,
         prefix_cache_enabled: bool = True,
-        external_state: object | None = None,
-        release_callback: object | None = None,
     ) -> DecodeRequestState:
         row = self.scheduler.add_request(request_id, token_ids)
         row.generation_config = generation_config or GenerationConfig()
         row.prompt_cache_key = prompt_cache_key
         row.prefix_cache_enabled = bool(prefix_cache_enabled)
         try:
-            if external_state is None:
-                state = self.state_store.allocate(row.state_index)
-                self._apply_prefix_cache(row, state)
-            else:
-                state = self.state_store.attach_external(
-                    row.state_index,
-                    external_state,
-                    release_callback=release_callback,
-                )
+            state = self.state_store.allocate(row.state_index)
+            self._apply_prefix_cache(row, state)
         except BaseException:
             self.scheduler.finish_request(request_id)
             raise

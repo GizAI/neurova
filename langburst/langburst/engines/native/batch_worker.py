@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 import uuid
-from typing import Any, Sequence
+from typing import Sequence
 
 from .cuda_memory import CudaMemoryPolicy
 from .model_runner import BatchedModelRunner
@@ -51,7 +51,6 @@ class BatchGenerationHandle:
     prompt_tokens: int = 0
     prompt_cache_key: str | None = None
     prefix_cache_enabled: bool = True
-    session_record: Any | None = None
     stop_sequences: tuple[tuple[int, ...], ...] = ()
     include_stop_str_in_output: bool = False
     output_queue: queue.Queue[object] = field(default_factory=queue.Queue)
@@ -61,6 +60,7 @@ class BatchGenerationHandle:
     error: BaseException | None = None
     created_monotonic: float = field(default_factory=time.monotonic)
     admitted_monotonic: float | None = None
+    prefill_done_monotonic: float | None = None
     first_token_monotonic: float | None = None
     finished_monotonic: float | None = None
     token_monotonic: list[float] = field(default_factory=list)
@@ -185,8 +185,11 @@ class BatchGenerationHandle:
         end = self.finished_monotonic or time.monotonic()
         admitted = self.admitted_monotonic
         first = self.first_token_monotonic
+        prefill_done = self.prefill_done_monotonic
         output_tokens = len(self.generated)
         queue_wait_s = (admitted - self.created_monotonic) if admitted is not None else None
+        prefill_s = (prefill_done - admitted) if admitted is not None and prefill_done is not None else None
+        uncached_prompt_tokens = max(0, int(self.prompt_tokens) - int(self.cached_input_tokens))
         ttft_s = (first - self.created_monotonic) if first is not None else None
         e2e_s = end - self.created_monotonic
         decode_s = (end - first) if first is not None else None
@@ -201,6 +204,12 @@ class BatchGenerationHandle:
             "accepted_prediction_tokens": int(self.accepted_prediction_tokens),
             "rejected_prediction_tokens": int(self.rejected_prediction_tokens),
             "queue_wait_s": queue_wait_s,
+            "prefill_s": prefill_s,
+            "prefill_tok_s": (
+                uncached_prompt_tokens / max(prefill_s, 1e-9)
+                if prefill_s is not None and prefill_s > 0
+                else None
+            ),
             "ttft_s": ttft_s,
             "e2e_s": e2e_s,
             "decode_s": decode_s,
@@ -255,7 +264,6 @@ class BatchGenerationWorker:
         generation_config: GenerationConfig | None = None,
         prompt_cache_key: str | None = None,
         prefix_cache_enabled: bool = True,
-        session_record: Any | None = None,
         stop_sequences: tuple[tuple[int, ...], ...] = (),
         include_stop_str_in_output: bool = False,
         request_id: str | None = None,
@@ -272,7 +280,6 @@ class BatchGenerationWorker:
             prompt_tokens=len(prompt_ids),
             prompt_cache_key=prompt_cache_key,
             prefix_cache_enabled=bool(prefix_cache_enabled),
-            session_record=session_record,
             stop_sequences=tuple(tuple(int(t) for t in seq) for seq in stop_sequences),
             include_stop_str_in_output=bool(include_stop_str_in_output),
         )
@@ -323,6 +330,7 @@ class BatchGenerationWorker:
                         continue
                     step = self.runner.execute_step(device=self.device)
                     if step is not None:
+                        self._mark_prefill_done()
                         for req_id, token_ids in step.tokens_by_request().items():
                             handle = self._active.get(req_id)
                             if handle is None:
@@ -399,25 +407,13 @@ class BatchGenerationWorker:
         if handle.cancelled.is_set():
             handle.finish()
             return
-        release_callback = None
         try:
-            external_state = None
-            if handle.session_record is not None:
-                handle.session_record.lock.acquire()
-                external_state = handle.session_record.state
-
-                def release_session_lock(record=handle.session_record):
-                    record.lock.release()
-
-                release_callback = release_session_lock
             self.runner.add_request(
                 handle.request_id,
                 prompt_ids,
                 generation_config=handle.generation_config,
                 prompt_cache_key=handle.prompt_cache_key,
                 prefix_cache_enabled=handle.prefix_cache_enabled,
-                external_state=external_state,
-                release_callback=release_callback,
             )
             scheduler = getattr(self.runner, "scheduler", None)
             get_request = getattr(scheduler, "get_request", None)
@@ -428,11 +424,6 @@ class BatchGenerationWorker:
             handle.admitted_monotonic = time.monotonic()
             self._active[handle.request_id] = handle
         except BaseException as exc:
-            if release_callback is not None:
-                try:
-                    release_callback()
-                except RuntimeError:
-                    pass
             try:
                 self.runner.finish_request(handle.request_id)
             except Exception:
@@ -444,16 +435,20 @@ class BatchGenerationWorker:
                 self._release_idle_cuda_cache()
             handle.fail(exc)
 
+    def _mark_prefill_done(self) -> None:
+        scheduler = getattr(self.runner, "scheduler", None)
+        get_request = getattr(scheduler, "get_request", None)
+        if not callable(get_request):
+            return
+        now = time.monotonic()
+        for req_id, handle in list(self._active.items()):
+            if handle.prefill_done_monotonic is not None:
+                continue
+            row = get_request(req_id)
+            if row is not None and not row.is_prefilling:
+                handle.prefill_done_monotonic = now
+
     def _finish_active(self, req_id: str, handle: BatchGenerationHandle) -> None:
-        if handle.session_record is not None and handle.generated:
-            # The scheduled decode step consumes the previous sampled token; the
-            # final emitted token has no following step, so commit it explicitly
-            # before detaching the preserved session state.
-            self.runner.engine.forward_one(int(handle.generated[-1]), handle.session_record.state, return_logits=False)
-            handle.session_record.prompt_tokens += int(handle.prompt_tokens)
-            handle.session_record.generated_tokens += len(handle.generated)
-            handle.session_record.turns += 1
-            handle.session_record.touch()
         self.runner.finish_request(req_id)
         self._active.pop(req_id, None)
         handle.finish()

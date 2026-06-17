@@ -128,6 +128,7 @@ class ContinuousBatchSchedulerStats:
     max_num_requests: int
     max_num_batched_tokens: int
     prefill_chunk_size: int
+    decode_prefill_interleave_steps: int
     waiting_requests: int
     active_requests: int
     total_added: int
@@ -140,6 +141,7 @@ class ContinuousBatchSchedulerStats:
             "max_num_requests": self.max_num_requests,
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "prefill_chunk_size": self.prefill_chunk_size,
+            "decode_prefill_interleave_steps": self.decode_prefill_interleave_steps,
             "waiting_requests": self.waiting_requests,
             "active_requests": self.active_requests,
             "total_added": self.total_added,
@@ -163,6 +165,7 @@ class ContinuousBatchScheduler:
         max_num_requests: int = 8,
         max_num_batched_tokens: int = 256,
         prefill_chunk_size: int = 64,
+        decode_prefill_interleave_steps: int = 16,
         block_table: KVBlockTable | None = None,
         cuda_graph_planner: CudaGraphBucketPlanner | None = None,
     ) -> None:
@@ -172,9 +175,12 @@ class ContinuousBatchScheduler:
             raise ValueError("max_num_batched_tokens must be >= 1")
         if prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be >= 1")
+        if decode_prefill_interleave_steps < 1:
+            raise ValueError("decode_prefill_interleave_steps must be >= 1")
         self.max_num_requests = int(max_num_requests)
         self.max_num_batched_tokens = int(max_num_batched_tokens)
         self.prefill_chunk_size = int(prefill_chunk_size)
+        self.decode_prefill_interleave_steps = int(decode_prefill_interleave_steps)
         self.block_table = block_table
         self.cuda_graph_planner = cuda_graph_planner
         self._waiting: OrderedDict[str, DecodeRequestState] = OrderedDict()
@@ -184,6 +190,7 @@ class ContinuousBatchScheduler:
         self._total_finished = 0
         self._total_scheduled_batches = 0
         self._total_scheduled_tokens = 0
+        self._decode_only_ticks = 0
         self._buffers: DecodeInputBuffers | None = None
 
     def add_request(self, request_id: str, token_ids: Sequence[int]) -> DecodeRequestState:
@@ -228,7 +235,10 @@ class ContinuousBatchScheduler:
         # Decode first, then prefill. This mirrors the reference runtime's scheduling shape and
         # prevents long prefill chunks from starving active decoders.
         active_rows = list(self._active.values())
-        for row in [r for r in active_rows if not r.is_prefilling]:
+        decode_rows = [r for r in active_rows if not r.is_prefilling]
+        prefill_rows = [r for r in active_rows if r.is_prefilling]
+        prefill_due = bool(decode_rows and prefill_rows and self._decode_only_ticks >= self.decode_prefill_interleave_steps)
+        for row in ([] if prefill_due else decode_rows):
             n = 1 + row.num_draft_tokens
             if selected and n > token_budget:
                 continue
@@ -244,7 +254,7 @@ class ContinuousBatchScheduler:
         # paged-KV arena states.
         if selected:
             token_budget = 0
-        for row in [r for r in active_rows if r.is_prefilling]:
+        for row in prefill_rows:
             n = min(row.prefill_remaining, self.prefill_chunk_size, token_budget)
             if n <= 0:
                 continue
@@ -255,6 +265,12 @@ class ContinuousBatchScheduler:
                 break
         if not selected:
             return None
+        selected_has_decode = any(not row.is_prefilling for row in selected)
+        selected_has_prefill = any(row.is_prefilling for row in selected)
+        if selected_has_decode and prefill_rows and not selected_has_prefill:
+            self._decode_only_ticks += 1
+        elif selected_has_prefill:
+            self._decode_only_ticks = 0
         if self.block_table is not None:
             for row, n in zip(selected, scheduled_tokens):
                 self.block_table.ensure_tokens(row.request_id, row.computed_tokens + n)
@@ -308,6 +324,7 @@ class ContinuousBatchScheduler:
             max_num_requests=self.max_num_requests,
             max_num_batched_tokens=self.max_num_batched_tokens,
             prefill_chunk_size=self.prefill_chunk_size,
+            decode_prefill_interleave_steps=self.decode_prefill_interleave_steps,
             waiting_requests=len(self._waiting),
             active_requests=len(self._active),
             total_added=self._total_added,
@@ -319,6 +336,7 @@ class ContinuousBatchScheduler:
     def clear(self) -> None:
         self._waiting.clear()
         self._active.clear()
+        self._decode_only_ticks = 0
         self._buffers = None
         if self.block_table is not None:
             self.block_table.clear()

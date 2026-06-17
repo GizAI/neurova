@@ -126,7 +126,7 @@ def test_native_generation_allows_think_tokens_when_explicitly_enabled(monkeypat
 
     monkeypatch.delenv("LANGBURST_SUPPRESS_THINK_TOKENS", raising=False)
 
-    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hello"}], max_tokens=128, enable_thinking=True)
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hello"}], max_tokens=128, reasoning_effort="low")
     cfg = _native_generation_config(Engine(), req)
 
     assert 248068 not in cfg.suppress_tokens
@@ -143,13 +143,13 @@ def test_visible_thinking_prefix_defaults_off_and_can_be_enabled():
         model="langburst-qwen3.6-27b-q3",
         messages=[{"role": "user", "content": "hello"}],
         max_tokens=16,
-        enable_thinking=True,
+        reasoning_effort="low",
     )
     non_qwen_req = ChatCompletionRequest(
         model="llama-test",
         messages=[{"role": "user", "content": "hello"}],
         max_tokens=16,
-        enable_thinking=True,
+        reasoning_effort="low",
     )
 
     assert _thinking_visible_prefix(default_req) == ""
@@ -160,20 +160,15 @@ def test_visible_thinking_prefix_defaults_off_and_can_be_enabled():
 def test_chat_template_policy_has_single_non_thinking_default():
     class Request:
         chat_template_kwargs = None
-        enable_thinking = None
         reasoning_effort = None
 
     assert resolve_chat_template_kwargs()["enable_thinking"] is False
     req = Request()
-    req.enable_thinking = True
-    assert resolve_chat_template_kwargs(req)["enable_thinking"] is True
+    req.chat_template_kwargs = {"enable_thinking": True}
+    assert resolve_chat_template_kwargs(req)["enable_thinking"] is False
     req.reasoning_effort = "none"
     assert resolve_chat_template_kwargs(req)["enable_thinking"] is False
-    req.enable_thinking = None
     req.reasoning_effort = "low"
-    assert resolve_chat_template_kwargs(req)["enable_thinking"] is True
-    req.reasoning_effort = None
-    req.chat_template_kwargs = {"enable_thinking": True}
     assert resolve_chat_template_kwargs(req)["enable_thinking"] is True
 
 

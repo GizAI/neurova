@@ -19,8 +19,6 @@ from ...core.defaults import (
 
 DEFAULT_MAX_QUEUED_REQUESTS = 8
 DEFAULT_RUNTIME_OVERHEAD_MIB = 384
-DEFAULT_MAX_SESSIONS = 16
-DEFAULT_SESSION_TTL_S = 3600.0
 
 
 def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -85,11 +83,10 @@ class EngineResourcePolicy:
     max_generation_tokens: int | None = DEFAULT_MAX_GENERATION_TOKENS
     max_num_batched_tokens: int = DEFAULT_MAX_BATCHED_TOKENS
     prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE
+    decode_prefill_interleave_steps: int = 16
     kv_block_size: int = DEFAULT_KV_BLOCK_SIZE
     kv_blocks: int = DEFAULT_KV_BLOCKS
     runtime_overhead_mib: int = DEFAULT_RUNTIME_OVERHEAD_MIB
-    max_sessions: int = DEFAULT_MAX_SESSIONS
-    session_ttl_s: float | None = DEFAULT_SESSION_TTL_S
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "EngineResourcePolicy":
@@ -105,11 +102,10 @@ class EngineResourcePolicy:
             max_generation_tokens=_env_int(source, "LANGBURST_MAX_GENERATION_TOKENS", DEFAULT_MAX_GENERATION_TOKENS),
             max_num_batched_tokens=_env_int(source, "LANGBURST_MAX_NUM_BATCHED_TOKENS", DEFAULT_MAX_BATCHED_TOKENS),
             prefill_chunk_size=_env_int(source, "LANGBURST_PREFILL_CHUNK_SIZE", DEFAULT_PREFILL_CHUNK_SIZE),
+            decode_prefill_interleave_steps=_env_int(source, "LANGBURST_DECODE_PREFILL_INTERLEAVE_STEPS", 16),
             kv_block_size=_env_kv_block_size(source),
             kv_blocks=_env_kv_blocks(source),
             runtime_overhead_mib=_env_int(source, "LANGBURST_RUNTIME_OVERHEAD_MIB", DEFAULT_RUNTIME_OVERHEAD_MIB),
-            max_sessions=_env_int(source, "LANGBURST_MAX_SESSIONS", DEFAULT_MAX_SESSIONS),
-            session_ttl_s=_env_optional_float(source, "LANGBURST_SESSION_TTL_S", DEFAULT_SESSION_TTL_S),
         )
 
     def __post_init__(self) -> None:
@@ -133,16 +129,14 @@ class EngineResourcePolicy:
             raise ValueError("max_num_batched_tokens must be >= 1")
         if self.prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be >= 1")
+        if self.decode_prefill_interleave_steps < 1:
+            raise ValueError("decode_prefill_interleave_steps must be >= 1")
         if self.kv_block_size < 1:
             raise ValueError("kv_block_size must be >= 1")
         if self.kv_blocks < 1:
             raise ValueError("kv_blocks must be >= 1")
         if self.runtime_overhead_mib < 0:
             raise ValueError("runtime_overhead_mib must be >= 0")
-        if self.max_sessions < 0:
-            raise ValueError("max_sessions must be >= 0")
-        if self.session_ttl_s is not None and self.session_ttl_s <= 0:
-            raise ValueError("session_ttl_s must be positive when set")
 
     def summary(self) -> dict[str, object]:
         return {
@@ -156,9 +150,8 @@ class EngineResourcePolicy:
             "max_generation_tokens": self.max_generation_tokens,
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "prefill_chunk_size": self.prefill_chunk_size,
+            "decode_prefill_interleave_steps": self.decode_prefill_interleave_steps,
             "kv_block_size": self.kv_block_size,
             "kv_blocks": self.kv_blocks,
             "runtime_overhead_mib": self.runtime_overhead_mib,
-            "max_sessions": self.max_sessions,
-            "session_ttl_s": self.session_ttl_s,
         }

@@ -34,7 +34,7 @@ class NativeBackend:
             paged_kv=True,
             prefix_cache=True,
             speculative_decoding=True,
-            stateful_sessions=True,
+            stateful_sessions=False,
             ring_kv=True,
             recurrent_state=True,
             infinite_context=True,
@@ -79,7 +79,6 @@ class NativeBackend:
             model_name=self.spec.public_name,
             features=RuntimeFeatures.from_profile(str(self.spec.extra.get("runtime_profile", "stateful"))).with_overrides(
                 kv_window_policy="ring" if self.spec.features.ring_kv else None,
-                stateful_chat=True if self.spec.features.stateful_sessions else None,
                 infinite_streaming=True if self.spec.features.infinite_context else None,
                 episodic_memory=True if self.spec.features.episodic_memory else None,
                 ttt_sidecar=True if self.spec.features.ttt_sidecar else None,

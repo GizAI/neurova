@@ -74,12 +74,37 @@ langburst-qwen-quantize /path/to/hf-model /path/to/converted-runtime-model --bit
 langburst-qwen-audit /path/to/converted-runtime-model --hf-model /path/to/hf-model
 ```
 
-## Chat
+## Interactive API Chat
+
+Use the root router for an interactive streaming chat client. It talks to an
+already-running OpenAI-compatible LangBurst server, uses readline history in a
+real terminal, and sends normal OpenAI-style message history:
+
+```bash
+./neurova.sh langburst chat
+```
+
+For a remote server:
+
+```bash
+./neurova.sh langburst chat --base-url http://192.168.0.47:8008/v1
+```
+
+Useful commands inside the prompt:
+
+```text
+/reset
+/history
+/help
+/exit
+```
+
+## One-Shot Local Generation
 
 Default native engine path:
 
 ```bash
-langburst-chat \
+./neurova.sh langburst generate \
   --adapter qwen36 \
   --runtime-profile stateful \
   --block-prefill on \
@@ -97,7 +122,7 @@ langburst-chat \
 Optional vLLM provider path:
 
 ```bash
-langburst-chat \
+./neurova.sh langburst generate \
   --engine vllm \
   --model /path/or/hf-name \
   --prompt "안녕. 너는 누구야?" \
@@ -110,7 +135,7 @@ langburst-chat \
 Force the native GPU-resident path:
 
 ```bash
-langburst-chat \
+./neurova.sh langburst generate \
   --engine native \
   --adapter qwen36 \
   --runtime-profile original \
@@ -194,10 +219,8 @@ the shared generation contract:
 - Repetition/logit controls: `repetition_penalty`, `presence_penalty`,
   `frequency_penalty`, `no_repeat_ngram_size`, `logit_bias`,
   `bad_words_ids`, `suppress_tokens`, `begin_suppress_tokens`.
-- State/cache/observability: `session_id`, `stateful_session`,
-  `reset_session`, `prompt_cache_key`, `prompt_cache_retention`,
-  `stream_options.include_usage`, `previous_response_id`, `user`,
-  `metadata`.
+- State/cache/observability: `prompt_cache_key`, `prompt_cache_retention`,
+  `stream_options.include_usage`, `user`, `metadata`.
 - Reasoning/text compatibility fields: `reasoning.effort`,
   `reasoning_effort`, `text.verbosity`, `verbosity`.
 
@@ -234,7 +257,7 @@ Responses include OpenAI-style usage accounting plus local performance metrics:
 
 ### Automatic Prefix Cache
 
-The stateful serving path includes automatic prefix caching for repeated system
+The native serving path includes automatic prefix caching for repeated system
 prompts, shared chat templates, and repeated document prefixes. LangBurst uses a
 shared `RadixPrefixCache` over token IDs and stores adapter state snapshots plus
 optional pinned paged KV block IDs. Cache hits skip already-computed prompt
@@ -248,33 +271,14 @@ that must not share cache state. Cache hits are reported as
 `usage.prompt_tokens_details.cached_tokens`; they are a latency/cost accounting
 signal, not persistent conversation memory.
 
-### Explicit Stateful Sessions
+Native GPU-resident sessions are intentionally not exposed. Persistent per-user
+DecodeState objects bypass the batch arena and can duplicate large KV/GDN
+allocations on 16GB deployments. Conversation continuity should be represented
+by the request `messages`; throughput reuse should be represented by
+`prompt_cache_key` and prefix-cache hits.
 
-The OpenAI-compatible chat endpoint is stateless by default. Pooled states and
-prefix cache are internal speed optimizations and do not imply persistent memory
-between unrelated requests. To keep native model state across turns, create or
-provide a session id:
-
-```bash
-curl -sS http://127.0.0.1:8008/v1/langburst/sessions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"langburst-qwen3.6-27b-q3"}'
-```
-
-Then send only the next turn delta with `session_id`:
-
-```bash
-curl -sS http://127.0.0.1:8008/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"langburst-qwen3.6-27b-q3","session_id":"sess-...","messages":[{"role":"user","content":"Continue."}],"max_tokens":64}'
-```
-
-Sessions are bounded by `--max-sessions` and `--session-ttl-s`, and can be
-deleted with `DELETE /v1/langburst/sessions/{session_id}`. Session requests use
-the same continuous-batching worker as stateless requests: the worker attaches
-the preserved DecodeState for the lifetime of the request, locks the session
-row, and commits the final generated token before releasing it so the next turn
-sees the real low-level model state.
+Requests that still send `session_id`, `stateful_session`, or
+`previous_response_id` fail fast instead of allocating another full DecodeState.
 
 ### KV Cache Dtypes
 

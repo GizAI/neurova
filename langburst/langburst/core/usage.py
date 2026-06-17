@@ -18,6 +18,8 @@ class RequestUsage:
     requested_completion_tokens: int | None = None
     finish_reason: str | None = None
     queue_wait_s: float | None = None
+    prefill_s: float | None = None
+    prefill_tok_s: float | None = None
     ttft_s: float | None = None
     e2e_s: float | None = None
     decode_s: float | None = None
@@ -39,7 +41,7 @@ class RequestUsage:
         self.cached_input_tokens = int(metrics.get("cached_input_tokens") or self.cached_input_tokens)
         self.accepted_prediction_tokens = int(metrics.get("accepted_prediction_tokens") or 0)
         self.rejected_prediction_tokens = int(metrics.get("rejected_prediction_tokens") or 0)
-        for key in ("queue_wait_s", "ttft_s", "e2e_s", "decode_s", "e2e_tok_s", "decode_tok_s", "mean_itl_s"):
+        for key in ("queue_wait_s", "prefill_s", "prefill_tok_s", "ttft_s", "e2e_s", "decode_s", "e2e_tok_s", "decode_tok_s", "mean_itl_s"):
             value = metrics.get(key)
             if value is not None:
                 setattr(self, key, float(value))
@@ -73,6 +75,8 @@ class RequestUsage:
     def performance(self) -> dict[str, Any]:
         return {
             "queue_wait_s": self.queue_wait_s,
+            "prefill_s": self.prefill_s,
+            "prefill_tok_s": self.prefill_tok_s,
             "ttft_s": self.ttft_s,
             "e2e_s": self.e2e_s,
             "decode_s": self.decode_s,

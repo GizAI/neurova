@@ -11,7 +11,7 @@ from langburst.core.kv_cache import KVCacheLayout, KVCacheSpec, allocate_kv_cach
 from langburst.engines.native.state_store import BatchStateStore
 from langburst.adapters.qwen36_impl.state import DecodeStateArena
 from langburst.adapters.qwen36_impl.state import DecodeState
-from langburst.adapters.qwen36_impl.model import short_prefill_sdpa_staging
+from langburst.adapters.qwen36_impl.model import short_prefill_sdpa_staging, sync_state_kv_to_paged
 
 
 def tiny_qwen_cfg() -> Qwen36_27B_TextConfig:
@@ -252,6 +252,26 @@ def test_decode_state_arena_can_allocate_int4_bdr_paged_kv_buffers():
     assert arena.summary()["kv_cache_dtype"] == "int4_bdr"
     assert arena.summary()["kv_storage_head_dim"] == 2
     assert arena.summary()["paged_kv_enabled"] is True
+
+
+def test_sync_state_kv_to_paged_skips_empty_canonical_int4_mirror():
+    arena = DecodeStateArena(
+        cfg=tiny_qwen_cfg(),
+        max_seq_len=4,
+        num_slots=1,
+        kv_num_blocks=8,
+        kv_block_size=4,
+        device="cpu",
+        kv_cache_spec=KVCacheSpec.resolve("int4_bdr", hadamard_order=4),
+    )
+    _slot, state = arena.allocate()
+    state.pos = 63
+    state.kv_len = 4
+    plan = SimpleNamespace(block_tables=torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=torch.long))
+
+    sync_state_kv_to_paged(state, plan, row=0)
+
+    assert arena.paged_attn_k is not None
 
 
 def test_short_prefill_sdpa_staging_requires_cuda(monkeypatch):
