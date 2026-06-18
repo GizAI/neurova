@@ -50,6 +50,30 @@ def test_batched_model_runner_prefill_then_decode_step(tmp_path: Path):
     assert b.token_ids[-1] == 2
 
 
+def test_plain_greedy_sampling_honors_suppress_tokens(tmp_path: Path):
+    engine = RuntimeEngine(
+        adapter=ToyAdapter(),
+        hf_model=tmp_path,
+        qb_model=tmp_path,
+        device="cpu",
+        recent_window=16,
+        weight_device="cpu",
+    )
+    runner = BatchedModelRunner(
+        engine=engine,
+        scheduler=ContinuousBatchScheduler(max_num_requests=1, max_num_batched_tokens=2, prefill_chunk_size=2),
+    )
+    row = SimpleNamespace(
+        generation_config=GenerationConfig(suppress_tokens=(2,)),
+        token_ids=[],
+        prefill_len=0,
+        sample_index=0,
+    )
+
+    assert runner._sample_plain_rows([row], [torch.tensor([0.0, 1.0, 10.0, 5.0])]) == [3]
+    assert row.sample_index == 1
+
+
 def test_batch_path_parity_splits_target_speculative_and_prefix_axes(tmp_path: Path):
     engine = RuntimeEngine(
         adapter=ToyAdapter(),

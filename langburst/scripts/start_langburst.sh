@@ -8,9 +8,10 @@ LANGBURST_ENGINE="${LANGBURST_ENGINE:-native}"
 SERVER_PORT="${SERVER_PORT:-8008}"
 ENABLE_MTP="${ENABLE_MTP:-${LANGBURST_ENABLE_MTP:-1}}"
 MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-${LANGBURST_MTP_SPECULATIVE_TOKENS:-1}}"
-CONTEXT_TIERS="${CONTEXT_TIERS:-4096,65536}"
+CONTEXT_TIERS="${CONTEXT_TIERS:-4096,81920}"
 CONTEXT_TIER_SLOTS="${CONTEXT_TIER_SLOTS:-1,1}"
-CONTEXT_WINDOW="${CONTEXT_WINDOW:-${RECENT_WINDOW:-65536}}"
+CONTEXT_WINDOW="${CONTEXT_WINDOW:-${RECENT_WINDOW:-81920}}"
+EXCLUSIVE_PREFILL_TOKENS="${EXCLUSIVE_PREFILL_TOKENS:-${LANGBURST_EXCLUSIVE_PREFILL_TOKENS:-}}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-int4_bdr}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-64}"
 DECODE_PREFILL_INTERLEAVE_STEPS="${DECODE_PREFILL_INTERLEAVE_STEPS:-16}"
@@ -23,9 +24,9 @@ MAX_PREFILL_ROWS_PER_BATCH="${MAX_PREFILL_ROWS_PER_BATCH:-1}"
 MAX_QUEUED_REQUESTS="${MAX_QUEUED_REQUESTS:-8}"
 MAX_STATE_POOL_SIZE="${MAX_STATE_POOL_SIZE:-$MAX_ACTIVE_REQUESTS}"
 MAX_GENERATION_TOKENS="${SERVE_MAX_GENERATION_TOKENS:-1024}"
-RESERVE_FREE_VRAM_MIB="${RESERVE_FREE_VRAM_MIB:-768}"
+RESERVE_FREE_VRAM_MIB="${RESERVE_FREE_VRAM_MIB:-384}"
 ALLOW_CONTEXT_OVERFLOW="${ALLOW_CONTEXT_OVERFLOW:-${LANGBURST_ALLOW_CONTEXT_OVERFLOW:-1}}"
-MARLIN_OUT_CACHE_POLICY="${MARLIN_OUT_CACHE_POLICY:-decode_only}"
+MARLIN_OUT_CACHE_POLICY="${MARLIN_OUT_CACHE_POLICY:-decode_small}"
 PREFIX_CACHE="${PREFIX_CACHE:-${LANGBURST_PREFIX_CACHE:-on}}"
 LOG_DIR="${LOG_DIR:-/tmp}"
 CPU_EMBED_ARG=()
@@ -42,6 +43,14 @@ vals=[int(v.strip()) for v in sys.argv[1].split(",") if v.strip()]
 print(max(vals) if vals else 0)
 PY
 )"
+if [ -z "$EXCLUSIVE_PREFILL_TOKENS" ]; then
+  EXCLUSIVE_PREFILL_TOKENS="$(python - "$CONTEXT_TIERS" <<'PY'
+import sys
+vals=sorted(int(v.strip()) for v in sys.argv[1].split(",") if v.strip())
+print(vals[0] + 1 if len(vals) > 1 else 0)
+PY
+)"
+fi
 if [ "$CONTEXT_TIER_MAX" -gt 0 ] && [ "$CONTEXT_WINDOW" -lt "$CONTEXT_TIER_MAX" ]; then
   CONTEXT_WINDOW="$CONTEXT_TIER_MAX"
 fi
@@ -51,7 +60,34 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate langburst
 source /home/user/workspace/neurova/langburst/scripts/langburst_cuda_env.sh
 
+RESTART_LANGBURST="${RESTART_LANGBURST:-1}"
+if [ "$RESTART_LANGBURST" = "1" ] || [ "$RESTART_LANGBURST" = "true" ] || [ "$RESTART_LANGBURST" = "on" ]; then
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${SERVER_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+  mapfile -t EXISTING_PIDS < <(
+    ps -eo pid=,args= \
+      | awk -v port="$SERVER_PORT" '
+          /python -m langburst.server/ && $0 ~ "--port " port "([^0-9]|$)" {print $1}
+        '
+  )
+  if [ "${#EXISTING_PIDS[@]}" -gt 0 ]; then
+    kill "${EXISTING_PIDS[@]}" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      if ! ss -ltn | grep -q ":${SERVER_PORT} "; then
+        break
+      fi
+      sleep 1
+    done
+    if ss -ltn | grep -q ":${SERVER_PORT} "; then
+      kill -9 "${EXISTING_PIDS[@]}" 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+fi
+
 if ! ss -ltn | grep -q ":${SERVER_PORT} "; then
+  rm -f "${LOG_DIR}/langburst_server.pid"
   nohup env \
     CUDA_HOME="$CUDA_HOME" \
     CUDACXX="$CUDACXX" \
@@ -61,6 +97,7 @@ if ! ss -ltn | grep -q ":${SERVER_PORT} "; then
     LANGBURST_CONTEXT_WINDOW="$CONTEXT_WINDOW" \
     LANGBURST_CONTEXT_TIERS="$CONTEXT_TIERS" \
     LANGBURST_CONTEXT_TIER_SLOTS="$CONTEXT_TIER_SLOTS" \
+    LANGBURST_EXCLUSIVE_PREFILL_TOKENS="$EXCLUSIVE_PREFILL_TOKENS" \
     LANGBURST_ALLOW_CONTEXT_OVERFLOW="$ALLOW_CONTEXT_OVERFLOW" \
     LANGBURST_PREFILL_CHUNK_SIZE="$PREFILL_CHUNK_SIZE" \
     LANGBURST_MAX_PREFILL_ROWS_PER_BATCH="$MAX_PREFILL_ROWS_PER_BATCH" \
@@ -84,16 +121,17 @@ if ! ss -ltn | grep -q ":${SERVER_PORT} "; then
     LANGBURST_PAGED_ATTENTION_BACKEND="${LANGBURST_PAGED_ATTENTION_BACKEND:-auto}" \
     LANGBURST_INT4_KV_LAYOUT="${LANGBURST_INT4_KV_LAYOUT:-tiled}" \
     LANGBURST_MARLIN_OUT_CACHE_POLICY="$MARLIN_OUT_CACHE_POLICY" \
+    LANGBURST_MARLIN_OUT_CACHE_MAX_BATCH="${LANGBURST_MARLIN_OUT_CACHE_MAX_BATCH:-4}" \
     LANGBURST_MARLIN_DIRECT_MAX_BATCH="${LANGBURST_MARLIN_DIRECT_MAX_BATCH:-256}" \
-    LANGBURST_CUDA_GRAPH="${LANGBURST_CUDA_GRAPH:-0}" \
+    LANGBURST_CUDA_GRAPH="${LANGBURST_CUDA_GRAPH:-1}" \
     LANGBURST_MARLIN_INTERNAL_ARGMAX="${LANGBURST_MARLIN_INTERNAL_ARGMAX:-0}" \
     LANGBURST_VERIFY_FULL_LOGITS="${LANGBURST_VERIFY_FULL_LOGITS:-0}" \
     LANGBURST_GDN_RECURRENT_NORM_GATE_FUSED="${LANGBURST_GDN_RECURRENT_NORM_GATE_FUSED:-0}" \
     LANGBURST_GDN_BA_LOWBIT_PAIR="${LANGBURST_GDN_BA_LOWBIT_PAIR:-0}" \
     LANGBURST_MLP_TENSORCORE_DOWN_SILU_A="${LANGBURST_MLP_TENSORCORE_DOWN_SILU_A:-1}" \
     LANGBURST_MLP_SCALAR_STREAMING_DEBUG="${LANGBURST_MLP_SCALAR_STREAMING_DEBUG:-0}" \
-    LANGBURST_MTP_MAX_DRAFT="${LANGBURST_MTP_MAX_DRAFT:-5}" \
-    LANGBURST_MTP_DRAFT_CANDIDATES="${LANGBURST_MTP_DRAFT_CANDIDATES:-5}" \
+    LANGBURST_MTP_MAX_DRAFT="${LANGBURST_MTP_MAX_DRAFT:-2}" \
+    LANGBURST_MTP_DRAFT_CANDIDATES="${LANGBURST_MTP_DRAFT_CANDIDATES:-2}" \
     LANGBURST_MTP_LEGACY_LIST_CACHE="${LANGBURST_MTP_LEGACY_LIST_CACHE:-1}" \
     LANGBURST_MTP_LOCAL_TKH_ATTENTION="${LANGBURST_MTP_LOCAL_TKH_ATTENTION:-0}" \
     LANGBURST_MTP_BATCH_PROPOSER="${LANGBURST_MTP_BATCH_PROPOSER:-0}" \
@@ -131,6 +169,7 @@ if ! ss -ltn | grep -q ":${SERVER_PORT} "; then
       --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
       --prefill-chunk-size "$PREFILL_CHUNK_SIZE" \
       --max-prefill-rows-per-batch "$MAX_PREFILL_ROWS_PER_BATCH" \
+      --exclusive-prefill-tokens "$EXCLUSIVE_PREFILL_TOKENS" \
       --reserve-free-vram-mib "$RESERVE_FREE_VRAM_MIB" \
       --context-tiers "$CONTEXT_TIERS" \
       --context-tier-slots "$CONTEXT_TIER_SLOTS" \
@@ -138,13 +177,28 @@ if ! ss -ltn | grep -q ":${SERVER_PORT} "; then
       "${CPU_EMBED_ARG[@]}" \
       --kv-cache-dtype "$KV_CACHE_DTYPE" \
       --prefix-cache "$PREFIX_CACHE" \
-    > "${LOG_DIR}/langburst_server.log" 2>&1 &
-  echo $! > "${LOG_DIR}/langburst_server.pid"
+    > "${LOG_DIR}/langburst_server.log" 2>&1 < /dev/null &
+  SERVER_PID="$!"
+  echo "$SERVER_PID" > "${LOG_DIR}/langburst_server.pid"
+  sleep 1
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "langburst server exited during startup; see ${LOG_DIR}/langburst_server.log" >&2
+    tail -n 120 "${LOG_DIR}/langburst_server.log" >&2 || true
+    exit 1
+  fi
 fi
 
 for _ in $(seq 1 120); do
   if curl -fsS "http://127.0.0.1:${SERVER_PORT}/v1/models" >/dev/null 2>&1; then
     break
+  fi
+  if [ -f "${LOG_DIR}/langburst_server.pid" ]; then
+    SERVER_PID="$(cat "${LOG_DIR}/langburst_server.pid" 2>/dev/null || true)"
+    if [ -n "$SERVER_PID" ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "langburst server exited before readiness; see ${LOG_DIR}/langburst_server.log" >&2
+      tail -n 120 "${LOG_DIR}/langburst_server.log" >&2 || true
+      exit 1
+    fi
   fi
   sleep 1
 done

@@ -393,6 +393,8 @@ class BatchedModelRunner:
     def _apply_prefix_cache(self, row: DecodeRequestState, state: object) -> None:
         if not bool(getattr(row, "prefix_cache_enabled", True)):
             return
+        if not getattr(row, "prompt_cache_key", None):
+            return
         max_prefix_len = self._max_reusable_prefix_len(len(row.token_ids))
         max_prefix_len = min(max_prefix_len, int(row.kv_token_capacity))
         if max_prefix_len <= 0:
@@ -426,6 +428,8 @@ class BatchedModelRunner:
             if not did_prefill or row.computed_tokens <= 0:
                 continue
             if not bool(getattr(row, "prefix_cache_enabled", True)):
+                continue
+            if not getattr(row, "prompt_cache_key", None):
                 continue
             prefix_len = int(row.computed_tokens)
             if prefix_len > int(row.kv_token_capacity):
@@ -663,6 +667,8 @@ def _configured_sampling_reason(cfg: GenerationConfig) -> str | None:
         return "logit_bias"
     if bool(cfg.bad_token_ids):
         return "bad_token_ids"
+    if bool(cfg.suppress_tokens):
+        return "suppress_tokens"
     return None
 
 

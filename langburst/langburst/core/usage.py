@@ -17,6 +17,7 @@ class RequestUsage:
     rejected_prediction_tokens: int = 0
     requested_completion_tokens: int | None = None
     finish_reason: str | None = None
+    finish_detail: str | None = None
     queue_wait_s: float | None = None
     prefill_s: float | None = None
     prefill_tok_s: float | None = None
@@ -41,6 +42,10 @@ class RequestUsage:
         self.cached_input_tokens = int(metrics.get("cached_input_tokens") or self.cached_input_tokens)
         self.accepted_prediction_tokens = int(metrics.get("accepted_prediction_tokens") or 0)
         self.rejected_prediction_tokens = int(metrics.get("rejected_prediction_tokens") or 0)
+        if metrics.get("finish_reason") is not None:
+            self.finish_reason = str(metrics["finish_reason"])
+        if metrics.get("finish_detail") is not None:
+            self.finish_detail = str(metrics["finish_detail"])
         for key in ("queue_wait_s", "prefill_s", "prefill_tok_s", "ttft_s", "e2e_s", "decode_s", "e2e_tok_s", "decode_tok_s", "mean_itl_s"):
             value = metrics.get(key)
             if value is not None:
@@ -85,4 +90,5 @@ class RequestUsage:
             "mean_itl_s": self.mean_itl_s,
             "requested_completion_tokens": self.requested_completion_tokens,
             "finish_reason": self.finish_reason,
+            "finish_detail": self.finish_detail,
         }

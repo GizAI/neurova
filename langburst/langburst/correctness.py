@@ -212,6 +212,7 @@ def _batch_generate_ids_once(
     *,
     runner: BatchedModelRunner | None = None,
     request_id: str = "batch-parity",
+    prompt_cache_key: str | None = None,
 ) -> tuple[list[int], int]:
     local_runner = runner
     if local_runner is None:
@@ -222,7 +223,12 @@ def _batch_generate_ids_once(
             kv_window_tokens=engine.recent_window,
         )
         local_runner = BatchedModelRunner(engine=engine, scheduler=scheduler, features=features, max_state_pool_size=0)
-    row = local_runner.add_request(request_id, prompt_ids, generation_config=gen_cfg)
+    row = local_runner.add_request(
+        request_id,
+        prompt_ids,
+        generation_config=gen_cfg,
+        prompt_cache_key=prompt_cache_key,
+    )
     out: list[int] = []
     eos = set(int(t) for t in gen_cfg.eos_token_ids)
     stop_ids = set(int(t) for t in gen_cfg.stop_token_ids)
@@ -270,7 +276,16 @@ def run_batch_path_parity(
         kv_window_tokens=engine.recent_window,
     )
     runner = BatchedModelRunner(engine=engine, scheduler=scheduler, features=prefix_features, max_state_pool_size=0)
-    _batch_generate_ids_once(engine, prompt_ids, gen_cfg, prefix_features, runner=runner, request_id="prefix-warm")
+    prefix_key = "batch-path-parity"
+    _batch_generate_ids_once(
+        engine,
+        prompt_ids,
+        gen_cfg,
+        prefix_features,
+        runner=runner,
+        request_id="prefix-warm",
+        prompt_cache_key=prefix_key,
+    )
     batch_prefix, hit_tokens = _batch_generate_ids_once(
         engine,
         prompt_ids,
@@ -278,6 +293,7 @@ def run_batch_path_parity(
         prefix_features,
         runner=runner,
         request_id="prefix-hit",
+        prompt_cache_key=prefix_key,
     )
 
     direct = [int(t) for t in direct_target]

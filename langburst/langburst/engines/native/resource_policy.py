@@ -41,6 +41,16 @@ def _env_optional_float(env: Mapping[str, str], name: str, default: float | None
     return float(raw)
 
 
+def _env_optional_int(env: Mapping[str, str], name: str, default: int | None) -> int | None:
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    text = raw.strip().lower()
+    if text in {"0", "none", "off", "false"}:
+        return None
+    return int(raw)
+
+
 def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
     raw = env.get(name)
     if raw is None or raw.strip() == "":
@@ -118,6 +128,7 @@ class EngineResourcePolicy:
     prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE
     max_prefill_rows_per_batch: int = DEFAULT_MAX_PREFILL_ROWS_PER_BATCH
     decode_prefill_interleave_steps: int = 16
+    exclusive_prefill_tokens: int | None = None
     batch_wait_ms: float = DEFAULT_BATCH_WAIT_MS
     kv_block_size: int = DEFAULT_KV_BLOCK_SIZE
     kv_blocks: int = DEFAULT_KV_BLOCKS
@@ -129,6 +140,11 @@ class EngineResourcePolicy:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "EngineResourcePolicy":
         source = os.environ if env is None else env
+        context_tiers = _env_int_tuple(source, "LANGBURST_CONTEXT_TIERS")
+        context_tier_slots = _env_int_tuple(source, "LANGBURST_CONTEXT_TIER_SLOTS")
+        exclusive_prefill_tokens = _env_optional_int(source, "LANGBURST_EXCLUSIVE_PREFILL_TOKENS", None)
+        if "LANGBURST_EXCLUSIVE_PREFILL_TOKENS" not in source and len(context_tiers) > 1:
+            exclusive_prefill_tokens = sorted(context_tiers)[0] + 1
         return cls(
             max_loaded_models=_env_int(source, "LANGBURST_MAX_LOADED_MODELS", 1),
             max_active_requests=_env_max_active_requests(source),
@@ -146,12 +162,13 @@ class EngineResourcePolicy:
                 _env_max_active_requests(source),
             ),
             decode_prefill_interleave_steps=_env_int(source, "LANGBURST_DECODE_PREFILL_INTERLEAVE_STEPS", 16),
+            exclusive_prefill_tokens=exclusive_prefill_tokens,
             batch_wait_ms=float(source.get("LANGBURST_BATCH_WAIT_MS", DEFAULT_BATCH_WAIT_MS)),
             kv_block_size=_env_kv_block_size(source),
             kv_blocks=_env_kv_blocks(source),
             runtime_overhead_mib=_env_int(source, "LANGBURST_RUNTIME_OVERHEAD_MIB", DEFAULT_RUNTIME_OVERHEAD_MIB),
-            context_tiers=_env_int_tuple(source, "LANGBURST_CONTEXT_TIERS"),
-            context_tier_slots=_env_int_tuple(source, "LANGBURST_CONTEXT_TIER_SLOTS"),
+            context_tiers=context_tiers,
+            context_tier_slots=context_tier_slots,
             allow_context_overflow=_env_bool(source, "LANGBURST_ALLOW_CONTEXT_OVERFLOW", True),
         )
 
@@ -182,6 +199,8 @@ class EngineResourcePolicy:
             raise ValueError("max_prefill_rows_per_batch must be >= 0")
         if self.decode_prefill_interleave_steps < 1:
             raise ValueError("decode_prefill_interleave_steps must be >= 1")
+        if self.exclusive_prefill_tokens is not None and self.exclusive_prefill_tokens < 1:
+            raise ValueError("exclusive_prefill_tokens must be >= 1")
         if self.batch_wait_ms < 0:
             raise ValueError("batch_wait_ms must be >= 0")
         if self.kv_block_size < 1:
@@ -222,6 +241,7 @@ class EngineResourcePolicy:
             "prefill_chunk_size": self.prefill_chunk_size,
             "max_prefill_rows_per_batch": self.max_prefill_rows_per_batch,
             "decode_prefill_interleave_steps": self.decode_prefill_interleave_steps,
+            "exclusive_prefill_tokens": self.exclusive_prefill_tokens,
             "batch_wait_ms": self.batch_wait_ms,
             "kv_block_size": self.kv_block_size,
             "kv_blocks": self.kv_blocks,

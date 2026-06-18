@@ -15,8 +15,10 @@ from langburst.engines.native.model_runner import BatchedModelRunner
 from langburst.engines.native.runtime import GenerationConfig, RuntimeEngine
 from langburst.engines.native.scheduler import ContinuousBatchScheduler
 from langburst.adapters.hf_causal import HFCausalState
+from langburst.adapters.qwen36 import Qwen36Adapter
 from langburst.adapters.qwen36_impl.model import Qwen36Model
 from langburst.speculative_batch import DecodeRequestState, build_decode_batch_plan, resolve_speculative_gpu
+from langburst.adapters.qwen36_impl.model import _verify_cuda_graph_enabled
 
 
 @dataclass
@@ -205,6 +207,23 @@ def test_builtin_qwen_adapter_is_registered():
     assert any(d.adapter_id == "qwen36-a3b" for d in adapter_registry.list())
     assert any(d.adapter_id == "gemma4" for d in adapter_registry.list())
     assert any(d.adapter_id == "hf-auto" for d in adapter_registry.list())
+
+
+def test_qwen_adapter_uses_chat_eos_not_pad_as_stop_token():
+    tokenizer = SimpleNamespace(eos_token_id=248046, pad_token_id=248044)
+
+    assert Qwen36Adapter().eos_token_ids(tokenizer) == (248046,)
+
+
+def test_qwen_verifier_cuda_graph_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("LANGBURST_CUDA_GRAPH", "1")
+    monkeypatch.delenv("LANGBURST_VERIFY_CUDA_GRAPH", raising=False)
+
+    assert not _verify_cuda_graph_enabled()
+
+    monkeypatch.setenv("LANGBURST_VERIFY_CUDA_GRAPH", "1")
+
+    assert _verify_cuda_graph_enabled()
 
 
 def test_gemma4_adapter_uses_conservative_transformer_capabilities():
@@ -487,7 +506,7 @@ def test_batched_runner_reuses_prefix_cache_blocks_and_state(tmp_path: Path):
     )
     runner = BatchedModelRunner(engine=engine, scheduler=scheduler, features=engine.features)
 
-    first = runner.add_request("first", [1, 2, 3])
+    first = runner.add_request("first", [1, 2, 3], prompt_cache_key="shared-prefix")
     out = runner.execute_step(device="cpu")
     assert out is not None
     assert first.computed_tokens == 2
@@ -496,7 +515,7 @@ def test_batched_runner_reuses_prefix_cache_blocks_and_state(tmp_path: Path):
     runner.finish_request("first")
     assert blocks.summary()["used_blocks"] == 1
 
-    second = runner.add_request("second", [1, 2, 4])
+    second = runner.add_request("second", [1, 2, 4], prompt_cache_key="shared-prefix")
     assert second.prefix_cache_hit_tokens == 2
     assert second.computed_tokens == 2
     assert tuple(blocks.get("second").block_ids[:1]) == first_blocks

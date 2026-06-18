@@ -285,8 +285,8 @@ def test_server_stream_greedy_uses_batch_worker(tmp_path: Path):
         body = response.read().decode("utf-8")
 
     assert response.status_code == 200
-    assert '"content": "2"' in body
-    assert '"content": "3"' in body
+    assert '"role": "assistant"' in body
+    assert '"content": "23"' in body
     assert '"usage"' in body
     assert '"completion_tokens": 2' in body
     assert "data: [DONE]" in body
@@ -511,6 +511,31 @@ def test_batch_worker_honors_request_prefix_cache_flag_without_new_runner(tmp_pa
     assert manager.health()["batch_runners"]["runners"] == 1
 
 
+def test_batch_worker_requires_prompt_cache_key_for_prefix_cache(tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(max_active_requests=2, max_num_batched_tokens=4, prefill_chunk_size=2, kv_block_size=2),
+    )
+    worker = manager.create_batch_worker("toy-a", RuntimeFeatures.from_profile("stateful").with_overrides(prefix_cache=True))
+
+    first = worker.submit([1, 2, 3], max_new_tokens=1, prefix_cache_enabled=True, request_id="no-key-1")
+    assert first.wait_ids(timeout=2.0)
+    second = worker.submit([1, 2, 4], max_new_tokens=1, prefix_cache_enabled=True, request_id="no-key-2")
+    assert second.wait_ids(timeout=2.0)
+
+    state_stores = manager.health()["batch_runners"]["state_stores"]
+    prefix_cache = state_stores["toy-a"]["prefix_cache"]
+    assert first.cached_input_tokens == 0
+    assert second.cached_input_tokens == 0
+    assert prefix_cache["entries"] == 0
+    assert prefix_cache["hits"] == 0
+
+
 def test_engine_manager_creates_cached_batch_worker(tmp_path: Path):
     adapter = ToyAdapter()
     try:
@@ -622,10 +647,13 @@ def test_active_runtime_memory_validation_clears_model_runtime_cache(monkeypatch
         [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cuda", weight_device="cpu")],
         policy=EngineResourcePolicy(reserve_free_vram_mib=512),
     )
-    cleared = {"count": 0}
+    cleared = {"model": 0, "runner": 0}
 
     def clear_runtime_caches():
-        cleared["count"] += 1
+        cleared["model"] += 1
+
+    def release_idle_runtime_caches():
+        cleared["runner"] += 1
 
     engine = SimpleNamespace(
         device="cuda",
@@ -638,7 +666,7 @@ def test_active_runtime_memory_validation_clears_model_runtime_cache(monkeypatch
         estimated_state_bytes=lambda: 0,
     )
     manager._engines["toy-a"] = engine
-    manager._batch_runners[("toy-a", ())] = object()
+    manager._batch_runners[("toy-a", ())] = SimpleNamespace(release_idle_runtime_caches=release_idle_runtime_caches)
     free_values = iter([19 * 1024 * 1024, 768 * 1024 * 1024])
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -649,7 +677,7 @@ def test_active_runtime_memory_validation_clears_model_runtime_cache(monkeypatch
 
     manager.validate_runtime_memory(engine)
 
-    assert cleared["count"] == 1
+    assert cleared == {"model": 1, "runner": 1}
 
 
 def test_active_runtime_memory_reserve_scales_with_active_requests(monkeypatch, tmp_path: Path):

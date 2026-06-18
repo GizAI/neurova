@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from langburst.loader import LowBitTensor, MARLIN_DIRECT_MAX_BATCH
+from langburst.loader import LowBitTensor, MARLIN_DIRECT_MAX_BATCH, marlin_should_cache_out
 from langburst.adapters.qwen36_tools.quantize import quantize_symmetric_lowbit
 
 
@@ -61,4 +61,14 @@ def test_lowbit_tensor_supports_q3_without_model_code_changes():
 
 
 def test_marlin_direct_batch_default_matches_t4_gate():
-    assert MARLIN_DIRECT_MAX_BATCH == 64
+    assert MARLIN_DIRECT_MAX_BATCH == 256
+
+
+def test_marlin_decode_small_cache_policy_bounds_prefill_batches(monkeypatch):
+    monkeypatch.setenv("LANGBURST_MARLIN_OUT_CACHE_POLICY", "decode_small")
+    monkeypatch.setenv("LANGBURST_MARLIN_OUT_CACHE_MAX_BATCH", "2")
+
+    assert marlin_should_cache_out(1)
+    assert marlin_should_cache_out(2)
+    assert not marlin_should_cache_out(3)
+    assert not marlin_should_cache_out(256)

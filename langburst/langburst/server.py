@@ -28,7 +28,7 @@ from .core.defaults import (
 from .core.chat_template import resolve_chat_template_kwargs
 from .core.features import RuntimeFeatures
 from .core.platform import PLATFORM_NAME
-from .core.text_stream import StreamingTextDecoder
+from .core.text_stream import StreamingTextDecoder, ThinkingTextFilter, hide_thinking_text
 from .core.usage import RequestUsage
 from .engines import ensure_engines_loaded, engine_registry
 from .engines.base import EngineBackend, EngineChatRequest, EngineSamplingParams
@@ -142,7 +142,7 @@ def _repetition_stop_repeats() -> int:
 
 
 def _default_suppress_tokens(engine) -> tuple[int, ...]:
-    if os.environ.get("LANGBURST_SUPPRESS_THINK_TOKENS", "1").strip().lower() in {"0", "false", "off", "no"}:
+    if os.environ.get("LANGBURST_SUPPRESS_THINK_TOKENS", "0").strip().lower() in {"0", "false", "off", "no"}:
         return ()
     out: list[int] = []
     tokenizer = getattr(engine, "tokenizer", None)
@@ -159,7 +159,20 @@ def _default_suppress_tokens(engine) -> tuple[int, ...]:
 
 
 def _request_messages(req: ChatCompletionRequest) -> list[dict[str, Any]]:
-    return [{"role": m.role, "content": m.content} for m in req.messages]
+    out: list[dict[str, Any]] = []
+    for message in req.messages:
+        content = message.content
+        if message.role == "assistant":
+            empty_text = content is None or (isinstance(content, str) and not content.strip())
+            empty_parts = isinstance(content, list) and not any(
+                str(part.get("text", "")).strip()
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+            if empty_text or empty_parts:
+                continue
+        out.append({"role": message.role, "content": content})
+    return out
 
 
 def _chat_template_kwargs(req: ChatCompletionRequest) -> dict[str, Any]:
@@ -228,6 +241,9 @@ def _log_native_request_metrics(*, usage: RequestUsage, stream: bool, model: str
         parts.append(f"requested_completion_tokens={usage.requested_completion_tokens}")
     if usage.finish_reason is not None:
         parts.append(f"finish_reason={usage.finish_reason}")
+    finish_detail = perf.get("finish_detail")
+    if finish_detail:
+        parts.append(f"finish_detail={finish_detail}")
     for key in ("queue_wait_s", "prefill_s", "prefill_tok_s", "ttft_s", "e2e_s", "decode_s", "e2e_tok_s", "decode_tok_s", "mean_itl_s"):
         value = perf.get(key)
         if value is not None:
@@ -360,6 +376,8 @@ def create_app(manager: EngineManager):
                 acquired = False
                 handle = None
                 visible_prefix = _thinking_visible_prefix(req, engine.model_name)
+                hide_thinking = not _chat_template_kwargs(req)["enable_thinking"]
+                thinking_filter = ThinkingTextFilter(enabled=hide_thinking)
                 visible_prefix_emitted = False
                 live_usage = _wants_live_usage(req)
                 last_live_usage_s = 0.0
@@ -379,6 +397,15 @@ def create_app(manager: EngineManager):
                         request_id=request_id,
                     )
                     decoder = StreamingTextDecoder(engine.tokenizer, skip_special_tokens=False)
+                    yield _sse_payload(
+                        {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": engine.model_name,
+                            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                        }
+                    )
                     while True:
                         if await request.is_disconnected():
                             handle.cancel()
@@ -389,6 +416,8 @@ def create_app(manager: EngineManager):
                         if token_id is None:
                             continue
                         text = decoder.push(token_id)
+                        if text:
+                            text = thinking_filter.push(text)
                         if text:
                             text, visible_prefix_emitted = _with_visible_prefix_once(
                                 text,
@@ -422,6 +451,7 @@ def create_app(manager: EngineManager):
                                     }
                                 )
                     tail = decoder.flush()
+                    tail = thinking_filter.push(tail, final=True)
                     usage.apply_metrics(handle.metrics())
                     usage.requested_completion_tokens = generation_tokens
                     usage.finish_reason = handle.finish_reason
@@ -513,7 +543,11 @@ def create_app(manager: EngineManager):
                         "message": {
                             "role": "assistant",
                             "content": _with_visible_prefix_once(
-                                engine.tokenizer.decode(ids, skip_special_tokens=True),
+                                (
+                                    engine.tokenizer.decode(ids, skip_special_tokens=True)
+                                    if _chat_template_kwargs(req)["enable_thinking"]
+                                    else hide_thinking_text(engine.tokenizer.decode(ids, skip_special_tokens=True))
+                                ),
                                 _thinking_visible_prefix(req, engine.model_name),
                                 emitted=False,
                             )[0],
@@ -726,6 +760,7 @@ def main() -> None:
     ap.add_argument("--batch-prefill-chunk-size", type=int, default=resource_defaults.prefill_chunk_size)
     ap.add_argument("--max-prefill-rows-per-batch", type=int, default=resource_defaults.max_prefill_rows_per_batch)
     ap.add_argument("--decode-prefill-interleave-steps", type=int, default=resource_defaults.decode_prefill_interleave_steps)
+    ap.add_argument("--exclusive-prefill-tokens", type=int, default=resource_defaults.exclusive_prefill_tokens)
     ap.add_argument("--kv-block-size", type=int, default=resource_defaults.kv_block_size)
     ap.add_argument("--kv-blocks", type=int, default=resource_defaults.kv_blocks)
     ap.add_argument("--runtime-overhead-mib", type=int, default=resource_defaults.runtime_overhead_mib)
@@ -765,6 +800,7 @@ def main() -> None:
                     prefill_chunk_size=args.batch_prefill_chunk_size,
                     max_prefill_rows_per_batch=args.max_prefill_rows_per_batch,
                     decode_prefill_interleave_steps=args.decode_prefill_interleave_steps,
+                    exclusive_prefill_tokens=args.exclusive_prefill_tokens,
                     kv_block_size=args.kv_block_size,
                     kv_blocks=args.kv_blocks,
                     runtime_overhead_mib=args.runtime_overhead_mib,

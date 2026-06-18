@@ -23,6 +23,24 @@ def _marlin_out_cache_policy() -> str:
     return os.environ.get("LANGBURST_MARLIN_OUT_CACHE_POLICY", "off").strip().lower()
 
 
+def _marlin_out_cache_max_batch() -> int:
+    raw = os.environ.get("LANGBURST_MARLIN_OUT_CACHE_MAX_BATCH", "2").strip()
+    if not raw:
+        return 2
+    return max(1, int(raw))
+
+
+def marlin_should_cache_out(batch: int) -> bool:
+    policy = _marlin_out_cache_policy()
+    if policy in {"0", "false", "off", "none", "no_cache"}:
+        return False
+    if policy == "decode_only":
+        return int(batch) == 1
+    if policy in {"decode_small", "small", "bounded"}:
+        return int(batch) <= _marlin_out_cache_max_batch()
+    return True
+
+
 @dataclass
 class LowBitTensor:
     name: str
@@ -112,10 +130,7 @@ class LowBitMarlinTensor:
             rows = [self.gemm(row.reshape(1, -1)).reshape(-1).clone() for row in x]
             return torch.stack(rows, dim=0).contiguous()
         rows = int(self.qweight.size(1) // 2)
-        cache_policy = _marlin_out_cache_policy()
-        cache_out = cache_policy not in {"0", "false", "off", "none", "no_cache"} and (
-            cache_policy != "decode_only" or batch == 1
-        )
+        cache_out = marlin_should_cache_out(batch)
         out = self._out_cache.get(batch) if cache_out else None
         if out is None or out.device != self.qweight.device or out.size(1) != rows:
             out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
@@ -152,11 +167,13 @@ class LowBitMarlinTensor:
         mixed = mixed.to(device=self.qweight.device, dtype=torch.float16).contiguous()
         batch = int(mixed.size(0))
         rows = int(self.qweight.size(1) // 2)
+        cache_out = marlin_should_cache_out(batch)
         if out is None:
-            out = self._out_cache.get(batch)
+            out = self._out_cache.get(batch) if cache_out else None
             if out is None or out.device != self.qweight.device or out.size(1) != rows:
                 out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
-                self._out_cache[batch] = out
+                if cache_out:
+                    self._out_cache[batch] = out
         else:
             if out.device != self.qweight.device or out.shape != (batch, rows) or out.dtype != torch.float16:
                 raise ValueError("out must be fp16 CUDA tensor with shape [batch, rows]")
@@ -187,10 +204,7 @@ class LowBitMarlinTensor:
         x = x.to(device=self.qweight.device, dtype=torch.float16).contiguous()
         batch = int(x.size(0))
         rows = int(self.qweight.size(1) // 2)
-        cache_policy = _marlin_out_cache_policy()
-        cache_out = cache_policy not in {"0", "false", "off", "none", "no_cache"} and (
-            cache_policy != "decode_only" or batch == 1
-        )
+        cache_out = marlin_should_cache_out(batch)
         scratch_out = self._out_cache.get(batch) if cache_out else None
         if scratch_out is None or scratch_out.device != self.qweight.device or scratch_out.size(1) != rows:
             scratch_out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)

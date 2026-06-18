@@ -44,6 +44,31 @@ def test_resource_policy_from_env_derives_kv_blocks_from_context_tiers():
     assert policy.max_active_requests == 2
     assert policy.max_state_pool_size == 2
     assert policy.max_prompt_tokens == 49152
+    assert policy.exclusive_prefill_tokens == 4097
+
+
+def test_resource_policy_accepts_exclusive_prefill_override():
+    policy = EngineResourcePolicy.from_env(
+        {
+            "LANGBURST_CONTEXT_TIERS": "4096,24576",
+            "LANGBURST_CONTEXT_TIER_SLOTS": "1,1",
+            "LANGBURST_EXCLUSIVE_PREFILL_TOKENS": "8192",
+        }
+    )
+
+    assert policy.exclusive_prefill_tokens == 8192
+
+
+def test_resource_policy_can_disable_exclusive_prefill():
+    policy = EngineResourcePolicy.from_env(
+        {
+            "LANGBURST_CONTEXT_TIERS": "4096,24576",
+            "LANGBURST_CONTEXT_TIER_SLOTS": "1,1",
+            "LANGBURST_EXCLUSIVE_PREFILL_TOKENS": "0",
+        }
+    )
+
+    assert policy.exclusive_prefill_tokens is None
 
 
 def test_resource_policy_from_env_accepts_explicit_deployment_budget():

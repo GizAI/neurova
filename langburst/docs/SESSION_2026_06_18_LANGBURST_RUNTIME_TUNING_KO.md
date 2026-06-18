@@ -19,30 +19,37 @@ Q3의 역할:
 
 ## 2026-06-18 최종 정정: 현재 운영 champion
 
-이번 세션 후반에 같은 ml-dmc8 / conda `langburst` / Q4 fused / `int4_bdr` / MTP K=5 조건으로 다시 분리 측정했다. 최종 운영 결론은 다음이다.
+반복 문제 수정 이후 decode 회귀를 다시 분해했다. 원인은 두 가지였다.
+
+1. Qwen thinking token을 logits에서 suppress하던 설정은 긴 문맥 품질을 망가뜨리므로 기본 OFF가 맞다.
+2. K=5는 현재 코드/빌드에서 MTP acceptance trajectory가 `324/616/189`가 아니라 `285/845/227`로 바뀌어 더 이상 champion이 아니다.
+
+현재 ml-dmc8 / conda `langburst` / Q4 fused / `int4_bdr` 기준 운영 champion은 K=2와 bounded Marlin output cache다.
 
 ```text
 start script 기본:
   QB_DIR=/home/user/models/Qwen3.6-27B-qb4-marlin-fused
   MODEL_NAME=langburst-qwen3.6-27b-q4
   KV_CACHE_DTYPE=int4_bdr
-  CONTEXT_TIERS=4096,73728
+  CONTEXT_TIERS=4096,81920  # ml-dmc8 16GB, Wan2GP 비활성화 후 멀티턴 reserve 기준 안정 상한
   CONTEXT_TIER_SLOTS=1,1
-  CONTEXT_WINDOW=73728
-  LANGBURST_MARLIN_OUT_CACHE_POLICY=decode_only
-  LANGBURST_MTP_MAX_DRAFT=5
-  LANGBURST_MTP_DRAFT_CANDIDATES=5
+  LANGBURST_MARLIN_OUT_CACHE_POLICY=decode_small
+  LANGBURST_MARLIN_OUT_CACHE_MAX_BATCH=4
+  LANGBURST_MTP_MAX_DRAFT=2
+  LANGBURST_MTP_DRAFT_CANDIDATES=2
   LANGBURST_MTP_LEGACY_LIST_CACHE=1
   LANGBURST_MTP_BATCH_PROPOSER=0
   LANGBURST_MTP_LOCAL_TKH_ATTENTION=0
   LANGBURST_MARLIN_INTERNAL_ARGMAX=0
-  LANGBURST_CUDA_GRAPH=0
+  LANGBURST_CUDA_GRAPH=1
+  LANGBURST_VERIFY_CUDA_GRAPH=0
   LANGBURST_MLP_TENSORCORE_DOWN_SILU_A=1
   LANGBURST_MLP_SCALAR_STREAMING_DEBUG=0
   LANGBURST_GDN_RECURRENT_NORM_GATE_FUSED=0
+  LANGBURST_SUPPRESS_THINK_TOKENS=0
 ```
 
-`LANGBURST_MARLIN_OUT_CACHE_POLICY=all`은 더 이상 운영 기본이 아니다. 같은 조건에서 `decode_only`가 decode와 short/medium prefill 모두 더 좋았다.
+`LANGBURST_MARLIN_OUT_CACHE_POLICY=all`은 decode 단독으로는 가장 빠른 경우가 있지만 fresh prefill에서 OOM을 재현했다. `decode_small`은 small decode/MTP batch만 캐시하고 prefill batch는 캐시하지 않아 decode와 prefill을 동시에 지킨다.
 
 ### Decode 재측정
 
@@ -51,7 +58,7 @@ start script 기본:
 ```text
 Q4 fused
 KV=int4_bdr
-MTP K=5 fixed
+MTP K=2 fixed
 recent_window=2048
 prompt_tokens=1
 max_new_tokens=512
@@ -64,40 +71,99 @@ max_num_batched_tokens=256
 결과:
 
 ```text
-cache=all:
-  aggregate_decode_tok_s: 50.66~50.72
-  accepted/rejected: 324 / 616
-  scheduled_batches: 189
+K=5 + decode_only:
+  aggregate_decode_tok_s: 53.16~54.19
+  accepted/rejected: 285 / 845
+  scheduled_batches: 227
 
-cache=off:
-  aggregate_decode_tok_s: 59.09
-  accepted/rejected: 312 / 683
-  scheduled_batches: 200
+K=2 + decode_only:
+  aggregate_decode_tok_s: 57.91~57.94
+  accepted/rejected: 271 / 209
+  scheduled_batches: 241
 
-cache=decode_only:
-  aggregate_decode_tok_s: 62.58~62.64
-  accepted/rejected: 324 / 616
-  scheduled_batches: 189
+K=2 + cache=all:
+  aggregate_decode_tok_s: 59.38~60.29
+  accepted/rejected: 271 / 209
+  scheduled_batches: 241
+  문제: 1K fresh prefill에서 OOM 재현
+
+K=2 + cache=decode_small + max_batch=4:
+  aggregate_decode_tok_s: 59.61
+  accepted/rejected: 271 / 209
+  scheduled_batches: 241
+  1K fresh prefill: 789.57 tok/s, OOM 없음
 ```
 
 해석:
 
 ```text
-decode champion은 cache=decode_only.
-MTP candidate trajectory도 기존 champion과 같은 324/616/189를 유지한다.
-과거 52 tok/s보다 낮아진 것이 아니라, 잘못된 cache=all 기본값 때문에 성능을 잃고 있었다.
+현재 운영 champion은 K=2 + decode_small(max_batch=4).
+K=5는 reject 비용이 커져 champion이 아니다.
+cache=all은 decode microbench에서는 더 빠를 수 있지만 prefill OOM을 만들기 때문에 운영 금지.
 ```
 
 256 token decode 참고:
 
 ```text
-cache=all + MTP on:         54.35 tok/s
-cache=decode_only + MTP on: 56.78 tok/s
-cache=off + MTP on:         52.97 tok/s
-cache=all + MTP off:        19.24 tok/s
+K=1: 49.53 tok/s
+K=2: 57.94 tok/s
+K=3: 57.63 tok/s
+K=4: 56.58 tok/s
+K=5: 53.67 tok/s
+K=6: 51.68 tok/s
+K=7: 50.94 tok/s
+K=8: 49.24 tok/s
 ```
 
-MTP off는 19 tok/s 수준으로 크게 느리므로 현재 Q4 운영 default는 MTP K=5 on이 맞다.
+MTP off는 19 tok/s 수준으로 크게 느리므로 현재 Q4 운영 default는 MTP ON이 맞다. 단 K는 5가 아니라 2다.
+
+### Batch throughput 재측정
+
+현재 Q4 fused / `int4_bdr` / K=2 / `decode_small(max_batch=4)` 기준:
+
+```text
+batch=1:
+  aggregate_decode_tok_s: 59.00
+  mean_request_decode_tok_s: 59.00
+
+batch=2:
+  aggregate_decode_tok_s: 89.49
+  mean_request_decode_tok_s: 48.43
+  accepted/rejected:
+    req A: 266 / 224
+    req B: 255 / 257
+
+batch=4:
+  Wan2GP를 중지한 뒤에도 context를 1K까지 내려도 14MiB allocation OOM.
+  Q4 weight + MTP + arena + runtime scratch가 이미 15GiB대라 운영 기본은 max_concurrency=2가 맞다.
+```
+
+### Context window 재측정
+
+K=2 / `decode_small(max_batch=4)` / reserve 384MiB / `CONTEXT_TIERS=4096,X` / `CONTEXT_TIER_SLOTS=1,1` 기준:
+
+```text
+Wan2GP active:
+  X=65536: OK
+  X=67584: 첫 짧은 요청은 OK, 이후 free가 375MiB로 reserve 384MiB 아래로 떨어져 다음 긴 요청 503
+
+Wan2GP stopped/disabled:
+  X=73728: 긴 2.9K prompt OK, free 약 662MiB
+  X=81920: 짧은 요청 + 긴 2.9K prompt OK, free 약 518MiB
+  X=90112: 짧은 요청만 OK, free 약 396MiB라 reserve에 너무 가까움
+  X=98304: 503, free=291MiB required=384MiB
+```
+
+따라서 현재 ml-dmc8 기본은 `4096,81920`이다. 90K는 첫 요청은 될 수 있지만 reserve가 너무 얇아 운영 기본으로 두지 않는다.
+
+Wan2GP 처리:
+
+```text
+wgp-api1.service stopped
+wgp-api1.service disabled
+```
+
+mask는 root interactive auth가 필요해 실패했지만, 현재 inactive/disabled라 자동 기동 대상은 아니다.
 
 ### Prefill 재측정
 

@@ -34,6 +34,19 @@ from ...profiling import decode_profile_scope
 TensorLike = LowBitTensor | LowBitMarlinTensor | FP16Tensor
 
 
+def _verify_cuda_graph_enabled() -> bool:
+    """Verifier graph capture must be an explicit, separate opt-in.
+
+    `LANGBURST_CUDA_GRAPH` is the broad decode-graph switch.  The speculative
+    verifier mutates arena GDN/KV state and returns Python decision objects, so
+    treating that broad switch as permission to capture verifier state is not a
+    safe production contract.  Keep verifier capture behind its own flag until
+    the path is fully tensor-output/stateless across warmup, capture, and replay.
+    """
+
+    return os.environ.get("LANGBURST_VERIFY_CUDA_GRAPH", "").strip().lower() in {"1", "true", "on", "yes"}
+
+
 def _paged_int4_tiled_layout(arena: object) -> bool:
     return bool(getattr(arena, "paged_int4_tiled_layout", False))
 
@@ -2518,7 +2531,7 @@ class Qwen36Model:
                 raise KeyError("lm_head.weight is required when embeddings are low-bit")
         self.lm_head = lm
         self._verify_graph_cache = CudaGraphReplayCache(
-            enabled=os.environ.get("LANGBURST_CUDA_GRAPH", "").strip().lower() in {"1", "true", "on", "yes"},
+            enabled=_verify_cuda_graph_enabled(),
             warmup_steps=0,
         )
         self._verify_graph_outputs: dict[CudaGraphKey, list[VerifyBlockResult]] = {}

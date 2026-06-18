@@ -11,6 +11,36 @@ from langburst.engines.native.scheduler import ContinuousBatchScheduler
 from test_adapter_runtime_cpu import ToyAdapter
 
 
+def test_batch_generation_handle_records_finish_detail_for_length():
+    handle = BatchGenerationHandle(
+        request_id="r1",
+        max_new_tokens=1,
+        generation_config=GenerationConfig(ignore_eos=True),
+    )
+
+    assert handle.push_tokens([11]) is True
+    metrics = handle.metrics()
+
+    assert handle.finish_reason == "length"
+    assert handle.finish_detail == "max_new_tokens"
+    assert metrics["finish_reason"] == "length"
+    assert metrics["finish_detail"] == "max_new_tokens"
+
+
+def test_batch_generation_handle_records_finish_detail_for_eos():
+    handle = BatchGenerationHandle(
+        request_id="r1",
+        max_new_tokens=8,
+        eos_token_ids=(2,),
+        generation_config=GenerationConfig(ignore_eos=False),
+    )
+
+    assert handle.push_tokens([2]) is True
+
+    assert handle.finish_reason == "stop"
+    assert handle.finish_detail == "eos_token:2"
+
+
 class FailingRunner:
     def __init__(self):
         self.engine = type("Engine", (), {"lock": __import__("threading").Lock()})()
@@ -82,6 +112,25 @@ class CapacityRunner:
     def add_request(self, request_id, token_ids, **kwargs):
         if len(self.added) - len(self.finished) >= 1:
             raise AssertionError("worker admitted a pending request while capacity was full")
+        self.added.append(request_id)
+
+    def execute_step(self, *, device=None):
+        return None
+
+    def finish_request(self, request_id):
+        self.finished.append(request_id)
+
+
+class MultiCapacityIdleRunner:
+    def __init__(self, capacity: int = 2):
+        import threading
+
+        self.engine = type("Engine", (), {"lock": threading.Lock()})()
+        self.scheduler = type("Scheduler", (), {"max_num_requests": int(capacity)})()
+        self.added: list[str] = []
+        self.finished: list[str] = []
+
+    def add_request(self, request_id, token_ids, **kwargs):
         self.added.append(request_id)
 
     def execute_step(self, *, device=None):
@@ -236,5 +285,71 @@ def test_batch_generation_worker_does_not_admit_pending_when_active_capacity_is_
         assert second.wait_ids(timeout=2.0) == []
         assert runner.added == ["first", "second"]
         assert runner.finished == ["first", "second"]
+    finally:
+        worker.shutdown()
+
+
+def test_batch_generation_worker_defers_exclusive_request_until_active_rows_finish():
+    runner = MultiCapacityIdleRunner(capacity=2)
+    worker = BatchGenerationWorker(
+        runner=runner,
+        device="cpu",
+        max_wait_s=0.001,
+        exclusive_prefill_tokens=4,
+    )
+    try:
+        short = worker.submit([1], max_new_tokens=8, request_id="short")
+        long = worker.submit([2, 3, 4, 5], max_new_tokens=8, request_id="long")
+
+        deadline = time.monotonic() + 0.2
+        while runner.added != ["short"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert runner.added == ["short"]
+
+        short.cancel()
+        assert short.wait_ids(timeout=2.0) == []
+        deadline = time.monotonic() + 2.0
+        while runner.added != ["short", "long"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert runner.added == ["short", "long"]
+
+        long.cancel()
+        assert long.wait_ids(timeout=2.0) == []
+        assert runner.finished == ["short", "long"]
+    finally:
+        worker.shutdown()
+
+
+def test_batch_generation_worker_keeps_later_rows_out_while_exclusive_request_is_active():
+    runner = MultiCapacityIdleRunner(capacity=2)
+    worker = BatchGenerationWorker(
+        runner=runner,
+        device="cpu",
+        max_wait_s=0.001,
+        exclusive_prefill_tokens=4,
+    )
+    try:
+        long = worker.submit([1, 2, 3, 4], max_new_tokens=8, request_id="long")
+        short = worker.submit([5], max_new_tokens=8, request_id="short")
+
+        deadline = time.monotonic() + 0.2
+        while runner.added != ["long"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert runner.added == ["long"]
+
+        long.prefill_done_monotonic = time.monotonic()
+        time.sleep(0.05)
+        assert runner.added == ["long"]
+
+        long.cancel()
+        assert long.wait_ids(timeout=2.0) == []
+        deadline = time.monotonic() + 2.0
+        while runner.added != ["long", "short"] and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert runner.added == ["long", "short"]
+
+        short.cancel()
+        assert short.wait_ids(timeout=2.0) == []
+        assert runner.finished == ["long", "short"]
     finally:
         worker.shutdown()

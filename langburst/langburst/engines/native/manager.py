@@ -386,6 +386,7 @@ class EngineManager:
                     runner=self.create_batch_runner(engine.model_name, resolved),
                     device=engine.device,
                     max_wait_s=float(self.policy.batch_wait_ms) / 1000.0,
+                    exclusive_prefill_tokens=self.policy.exclusive_prefill_tokens,
                 )
                 self._batch_workers[key] = worker
             return worker
@@ -506,14 +507,7 @@ class EngineManager:
         arena_allocated = any(key[0] == engine.model_name for key in self._batch_runners)
         if arena_allocated:
             if execution_reserve_mib > 0 and free_mib < execution_reserve_mib:
-                clear_model_caches = getattr(getattr(engine, "model", None), "clear_runtime_caches", None)
-                if callable(clear_model_caches):
-                    clear_model_caches()
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-                free_bytes, _ = torch.cuda.mem_get_info()
-                free_mib = free_bytes // (1024 * 1024)
+                free_mib = self._release_runtime_caches_for_memory_check(engine)
             if execution_reserve_mib > 0 and free_mib < execution_reserve_mib:
                 raise RuntimeMemoryPressure(
                     f"insufficient free GPU memory for active runtime: free={free_mib} MiB "
@@ -523,6 +517,16 @@ class EngineManager:
                     "Wait for current requests, reduce LANGBURST_CONTEXT_TIERS, or lower generation limits."
                 )
             return
+
+        required_mib = weight_mib + state_mib + self.policy.runtime_overhead_mib + self.policy.reserve_free_vram_mib
+        if required_mib > total_mib:
+            raise RuntimeError(
+                f"configuration exceeds GPU memory budget: total={total_mib} MiB "
+                f"required={required_mib} MiB weights={weight_mib} MiB "
+                f"state={state_mib} MiB overhead={self.policy.runtime_overhead_mib} MiB "
+                f"reserve={self.policy.reserve_free_vram_mib} MiB. "
+                "Lower LANGBURST_CONTEXT_WINDOW or use a smaller checkpoint."
+            )
         if loaded_weight:
             required_mib = state_mib + self.policy.runtime_overhead_mib + self.policy.reserve_free_vram_mib
             if required_mib > free_mib:
@@ -534,15 +538,70 @@ class EngineManager:
                     "Lower LANGBURST_CONTEXT_WINDOW, reduce LANGBURST_MAX_ACTIVE_REQUESTS, or wait for current requests."
                 )
             return
-        required_mib = weight_mib + state_mib + self.policy.runtime_overhead_mib + self.policy.reserve_free_vram_mib
-        if required_mib > total_mib:
-            raise RuntimeError(
-                f"configuration exceeds GPU memory budget: total={total_mib} MiB "
-                f"required={required_mib} MiB weights={weight_mib} MiB "
-                f"state={state_mib} MiB overhead={self.policy.runtime_overhead_mib} MiB "
-                f"reserve={self.policy.reserve_free_vram_mib} MiB. "
-                "Lower LANGBURST_CONTEXT_WINDOW or use a smaller checkpoint."
-            )
+
+    def _release_runtime_caches_for_memory_check(self, engine: RuntimeEngine) -> int:
+        """Release idle runtime caches before rejecting a request for headroom.
+
+        The batch runner owns prefix-cache and adapter scratch cleanup.  Calling
+        only the model-level cache hook here can leave hundreds of MiB idle but
+        still reserved, causing false admission failures after long chats.
+        Never touch runner-owned caches while requests are active or queued:
+        the decode worker may be inside a CUDA/state update for the same runner.
+        """
+
+        for (model_name, _key), runner in list(self._batch_runners.items()):
+            if model_name != engine.model_name:
+                continue
+            if not self._runner_idle_for_cache_release(model_name, runner):
+                continue
+            release_idle = getattr(runner, "release_idle_runtime_caches", None)
+            if callable(release_idle):
+                release_idle()
+        if not self._model_has_active_batch_work(engine.model_name):
+            clear_model_caches = getattr(getattr(engine, "model", None), "clear_runtime_caches", None)
+        else:
+            clear_model_caches = None
+        if callable(clear_model_caches):
+            clear_model_caches()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        free_bytes, _ = torch.cuda.mem_get_info()
+        return int(free_bytes // (1024 * 1024))
+
+    def _model_has_active_batch_work(self, model_name: str) -> bool:
+        for (worker_model_name, _key), worker in list(self._batch_workers.items()):
+            if worker_model_name != model_name:
+                continue
+            stats = worker.stats()
+            if int(stats.get("active_requests", 0) or 0) > 0:
+                return True
+            if int(stats.get("pending_requests", 0) or 0) > 0:
+                return True
+        for (runner_model_name, _key), runner in list(self._batch_runners.items()):
+            if runner_model_name != model_name:
+                continue
+            scheduler = getattr(runner, "scheduler", None)
+            if scheduler is None:
+                continue
+            stats = scheduler.stats()
+            if int(getattr(stats, "active_requests", 0) or 0) > 0:
+                return True
+            if int(getattr(stats, "waiting_requests", 0) or 0) > 0:
+                return True
+        return False
+
+    def _runner_idle_for_cache_release(self, model_name: str, runner: object) -> bool:
+        if self._model_has_active_batch_work(model_name):
+            return False
+        scheduler = getattr(runner, "scheduler", None)
+        if scheduler is None:
+            return True
+        stats = scheduler.stats()
+        return (
+            int(getattr(stats, "active_requests", 0) or 0) == 0
+            and int(getattr(stats, "waiting_requests", 0) or 0) == 0
+        )
 
     def clear_runtime_pools(self, model_name: str | None = None) -> int:
         with self._lock:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import statistics
 import queue
@@ -68,20 +69,24 @@ class BatchGenerationHandle:
     accepted_prediction_tokens: int = 0
     rejected_prediction_tokens: int = 0
     finish_reason: str = "stop"
+    finish_detail: str | None = None
 
     def push_tokens(self, token_ids: Sequence[int]) -> bool:
         should_finish = False
         if self.cancelled.is_set():
             self.finish_reason = "cancelled"
+            self.finish_detail = "cancelled"
             return True
         eos = set(int(t) for t in self.eos_token_ids)
         for token in token_ids:
             if self.cancelled.is_set():
                 self.finish_reason = "cancelled"
+                self.finish_detail = "cancelled"
                 should_finish = True
                 break
             if len(self.generated) >= self.max_new_tokens:
                 self.finish_reason = "length"
+                self.finish_detail = "max_new_tokens"
                 should_finish = True
                 break
             token_id = int(token)
@@ -89,10 +94,12 @@ class BatchGenerationHandle:
             can_stop = len(self.generated) >= int(cfg.min_new_tokens)
             if can_stop and not cfg.ignore_eos and token_id in eos:
                 self.finish_reason = "stop"
+                self.finish_detail = f"eos_token:{token_id}"
                 should_finish = True
                 break
             if can_stop and token_id in set(int(t) for t in cfg.stop_token_ids):
                 self.finish_reason = "stop"
+                self.finish_detail = f"stop_token_id:{token_id}"
                 should_finish = True
                 break
             now = time.monotonic()
@@ -103,11 +110,13 @@ class BatchGenerationHandle:
             self.output_queue.put(token_id)
             if can_stop and self._matched_repetition_stop():
                 self.finish_reason = "repetition"
+                self.finish_detail = "repetition_ngram"
                 should_finish = True
                 break
             matched_stop = self._matched_stop_sequence()
             if can_stop and matched_stop:
                 self.finish_reason = "stop"
+                self.finish_detail = f"stop_sequence:{len(matched_stop)}"
                 if not self.include_stop_str_in_output:
                     remove_n = len(matched_stop)
                     if remove_n:
@@ -120,6 +129,7 @@ class BatchGenerationHandle:
                 break
             if len(self.generated) >= self.max_new_tokens:
                 self.finish_reason = "length"
+                self.finish_detail = "max_new_tokens"
                 should_finish = True
                 break
         return should_finish
@@ -223,6 +233,8 @@ class BatchGenerationHandle:
             "cached_input_tokens": int(self.cached_input_tokens),
             "accepted_prediction_tokens": int(self.accepted_prediction_tokens),
             "rejected_prediction_tokens": int(self.rejected_prediction_tokens),
+            "finish_reason": self.finish_reason,
+            "finish_detail": self.finish_detail,
             "queue_wait_s": queue_wait_s,
             "prefill_s": prefill_s,
             "prefill_tok_s": (
@@ -261,13 +273,18 @@ class BatchGenerationWorker:
         runner: BatchedModelRunner,
         device: str,
         max_wait_s: float = 0.002,
+        exclusive_prefill_tokens: int | None = None,
     ) -> None:
         if max_wait_s < 0:
             raise ValueError("max_wait_s must be >= 0")
+        if exclusive_prefill_tokens is not None and exclusive_prefill_tokens < 1:
+            raise ValueError("exclusive_prefill_tokens must be >= 1")
         self.runner = runner
         self.device = device
         self.max_wait_s = float(max_wait_s)
+        self.exclusive_prefill_tokens = int(exclusive_prefill_tokens) if exclusive_prefill_tokens is not None else None
         self._pending: queue.Queue[tuple[BatchGenerationHandle, list[int]]] = queue.Queue()
+        self._deferred: deque[tuple[BatchGenerationHandle, list[int]]] = deque()
         self._active: dict[str, BatchGenerationHandle] = {}
         self._completed: list[dict[str, float | int | str | None]] = []
         self._cuda_memory_policy = CudaMemoryPolicy.from_env()
@@ -320,6 +337,9 @@ class BatchGenerationWorker:
                 handle, _prompt_ids = self._pending.get_nowait()
             except queue.Empty:
                 break
+            handle.cancel()
+        while self._deferred:
+            handle, _prompt_ids = self._deferred.popleft()
             handle.cancel()
         self._thread.join(timeout=timeout)
 
@@ -398,29 +418,67 @@ class BatchGenerationWorker:
         capacity = int(getattr(scheduler, "max_num_requests", 1))
         if len(self._active) >= capacity:
             return
+        if self._active_exclusive_request():
+            return
         deadline = time.monotonic() + self.max_wait_s
         first_timeout = self.max_wait_s if wait_for_first else 0
-        try:
-            item = self._pending.get(timeout=first_timeout)
-        except queue.Empty:
+        item = self._get_pending(timeout=first_timeout)
+        if item is None:
             return
-        self._admit(item)
+        if not self._try_admit(item):
+            return
         # external serving engine admits already-queued requests up to the active batch capacity
         # before running a model step. State allocation can be nontrivial on the
         # first request, so a pure wall-clock drain deadline can accidentally
         # split an otherwise ready batch and destroy TTFT/throughput.
         while len(self._active) < capacity:
-            try:
-                self._admit(self._pending.get_nowait())
-            except queue.Empty:
+            item = self._get_pending_nowait()
+            if item is None:
+                break
+            if not self._try_admit(item):
                 break
         while time.monotonic() < deadline:
             if len(self._active) >= capacity:
                 break
-            try:
-                self._admit(self._pending.get_nowait())
-            except queue.Empty:
+            item = self._get_pending_nowait()
+            if item is None:
                 break
+            if not self._try_admit(item):
+                break
+
+    def _get_pending(self, *, timeout: float) -> tuple[BatchGenerationHandle, list[int]] | None:
+        if self._deferred:
+            return self._deferred.popleft()
+        try:
+            return self._pending.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def _get_pending_nowait(self) -> tuple[BatchGenerationHandle, list[int]] | None:
+        if self._deferred:
+            return self._deferred.popleft()
+        try:
+            return self._pending.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _try_admit(self, item: tuple[BatchGenerationHandle, list[int]]) -> bool:
+        handle, _prompt_ids = item
+        if self._active_exclusive_request():
+            self._deferred.appendleft(item)
+            return False
+        if self._is_exclusive_request(handle) and self._active:
+            self._deferred.appendleft(item)
+            return False
+        self._admit(item)
+        return True
+
+    def _is_exclusive_request(self, handle: BatchGenerationHandle) -> bool:
+        threshold = self.exclusive_prefill_tokens
+        return threshold is not None and int(handle.prompt_tokens) >= int(threshold)
+
+    def _active_exclusive_request(self) -> bool:
+        return any(self._is_exclusive_request(handle) for handle in self._active.values())
 
     def _admit(self, item: tuple[BatchGenerationHandle, list[int]]) -> None:
         handle, prompt_ids = item

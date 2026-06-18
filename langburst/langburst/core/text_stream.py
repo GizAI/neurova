@@ -52,3 +52,66 @@ class StreamingTextDecoder:
         delta = visible[len(self.emitted) :]
         self.emitted = visible
         return delta
+
+
+class ThinkingTextFilter:
+    """Remove Qwen visible-thinking spans without changing model logits.
+
+    Qwen chat templates may place or emit ``<think>`` / ``</think>`` boundary
+    tokens even when the caller asked for a non-thinking answer. Suppressing
+    those token IDs at sampling time changes the model distribution and can
+    make long prompts collapse into instruction-copying. This filter keeps the
+    token stream intact and only removes the reasoning span from API text.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._buffer = ""
+        self._hiding = False
+        self._keep = max(len(self.OPEN), len(self.CLOSE)) - 1
+
+    def push(self, text: str, *, final: bool = False) -> str:
+        if not self.enabled or not text and not final:
+            return text
+        self._buffer += text
+        out: list[str] = []
+        while self._buffer:
+            if self._hiding:
+                close_idx = self._buffer.find(self.CLOSE)
+                if close_idx < 0:
+                    if final:
+                        self._buffer = ""
+                    elif len(self._buffer) > self._keep:
+                        self._buffer = self._buffer[-self._keep :]
+                    break
+                self._buffer = self._buffer[close_idx + len(self.CLOSE) :].lstrip()
+                self._hiding = False
+                continue
+
+            open_idx = self._buffer.find(self.OPEN)
+            close_idx = self._buffer.find(self.CLOSE)
+            candidates = [idx for idx in (open_idx, close_idx) if idx >= 0]
+            if not candidates:
+                if final:
+                    out.append(self._buffer)
+                    self._buffer = ""
+                elif len(self._buffer) > self._keep:
+                    out.append(self._buffer[:-self._keep])
+                    self._buffer = self._buffer[-self._keep :]
+                break
+
+            idx = min(candidates)
+            out.append(self._buffer[:idx])
+            if open_idx == idx:
+                self._buffer = self._buffer[idx + len(self.OPEN) :]
+                self._hiding = True
+            else:
+                self._buffer = self._buffer[idx + len(self.CLOSE) :].lstrip()
+        return "".join(out)
+
+
+def hide_thinking_text(text: str) -> str:
+    return ThinkingTextFilter(enabled=True).push(text, final=True)

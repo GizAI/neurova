@@ -223,12 +223,11 @@ class Qwen36Adapter:
         return [int(t) for t in tokenizer.encode(text)]
 
     def eos_token_ids(self, tokenizer) -> tuple[int, ...]:
-        ids = []
-        for name in ("eos_token_id", "pad_token_id"):
-            val = getattr(tokenizer, name, None)
-            if isinstance(val, int):
-                ids.append(val)
-        return tuple(set(ids))
+        eos = getattr(tokenizer, "eos_token_id", None)
+        if isinstance(eos, int):
+            return (int(eos),)
+        pad = getattr(tokenizer, "pad_token_id", None)
+        return (int(pad),) if isinstance(pad, int) else ()
 
     def create_speculative_proposer(self, model: Qwen36Model):
         return native_mtp1_proposer_for_model(model)

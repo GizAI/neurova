@@ -5,6 +5,7 @@ from pathlib import Path
 
 from langburst.core.defaults import DEFAULT_SERVING_RECENT_WINDOW
 from langburst.core.chat_template import resolve_chat_template_kwargs
+from langburst.core.text_stream import ThinkingTextFilter, hide_thinking_text
 from langburst.core.features import RuntimeFeatures
 from langburst.engines.native.manager import load_model_specs
 from langburst.server import (
@@ -115,6 +116,27 @@ def test_native_generation_defaults_disable_thinking_and_min_output(monkeypatch)
     cfg = _native_generation_config(Engine(), req)
 
     assert cfg.min_new_tokens == 0
+    assert 248068 not in cfg.suppress_tokens
+    assert 248069 not in cfg.suppress_tokens
+
+
+def test_native_generation_can_opt_into_think_token_suppression(monkeypatch):
+    class Tokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return {"<think>": [248068], "</think>": [248069]}[text]
+
+    class Engine:
+        tokenizer = Tokenizer()
+
+        @staticmethod
+        def eos_token_ids():
+            return (248046,)
+
+    monkeypatch.setenv("LANGBURST_SUPPRESS_THINK_TOKENS", "1")
+
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hello"}], max_tokens=128)
+    cfg = _native_generation_config(Engine(), req)
+
     assert 248068 in cfg.suppress_tokens
     assert 248069 in cfg.suppress_tokens
 
@@ -225,6 +247,28 @@ def test_request_messages_preserves_content_without_hidden_rewrite():
     assert messages[1]["content"] == [{"type": "text", "text": "kept"}]
 
 
+def test_request_messages_drops_empty_assistant_turns_only():
+    req = ChatCompletionRequest(
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": ""},
+            {"role": "assistant", "content": "   "},
+            {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+            {"role": "assistant", "content": "kept"},
+            {"role": "user", "content": ""},
+        ],
+        max_tokens=16,
+    )
+
+    messages = _request_messages(req)
+
+    assert messages == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "kept"},
+        {"role": "user", "content": ""},
+    ]
+
+
 def test_visible_thinking_prefix_is_prepended_once():
     text, emitted = _with_visible_prefix_once("reasoning", "<think>\n", emitted=False)
     assert text == "<think>\nreasoning"
@@ -237,3 +281,20 @@ def test_visible_thinking_prefix_is_prepended_once():
     text, emitted = _with_visible_prefix_once("<think>\nalready", "<think>\n", emitted=False)
     assert text == "<think>\nalready"
     assert emitted
+
+
+def test_hide_thinking_text_removes_reasoning_spans():
+    assert hide_thinking_text("a <think>hidden</think> b") == "a b"
+    assert hide_thinking_text("</think>\nanswer") == "answer"
+
+
+def test_thinking_text_filter_handles_split_tags():
+    filt = ThinkingTextFilter(enabled=True)
+    out = []
+
+    out.append(filt.push("hello <thi"))
+    out.append(filt.push("nk>secret"))
+    out.append(filt.push("</thi"))
+    out.append(filt.push("nk> answer", final=True))
+
+    assert "".join(out) == "hello answer"
