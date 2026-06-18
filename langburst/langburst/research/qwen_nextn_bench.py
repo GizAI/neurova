@@ -462,7 +462,7 @@ def generate_native_nextn_timed(
     features = engine.features.with_overrides(speculative_decoding=True)
     state = engine.new_state(features)
     logits, raw_hidden = engine._prefill_with_raw_hidden([int(t) for t in prompt_ids], state, features)
-    return _run_nextn_from_prefill(
+    return _generate_native_nextn_from_prefill(
         engine,
         base_state=state,
         logits=logits,

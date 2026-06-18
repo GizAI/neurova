@@ -186,13 +186,53 @@ __device__ inline void barrier_release(int* lock, bool reset = false) {
 }
 
 
+__device__ inline unsigned int marlin_argmax_ordered_float(float v) {
+  unsigned int bits = __float_as_uint(v);
+  return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
+
+__device__ inline unsigned long long marlin_argmax_pack(float v, unsigned int idx) {
+  // Higher value wins.  For exact ties, smaller token id wins to match
+  // torch.argmax's first-index behavior.
+  return (static_cast<unsigned long long>(marlin_argmax_ordered_float(v)) << 32) |
+         static_cast<unsigned long long>(0xffffffffu - idx);
+}
+
+__device__ inline void marlin_argmax_update(unsigned long long* state, int row, unsigned int idx, float v) {
+  atomicMax(&state[row], marlin_argmax_pack(v, idx));
+}
+
+__device__ inline float marlin_silu(float x) {
+  return x / (1.0f + __expf(-x));
+}
+
+__device__ inline int4 marlin_silu_packed_a_vec(const int4* __restrict__ mixed_a, int a_vec_idx, int prob_k) {
+  const half* mixed = reinterpret_cast<const half*>(mixed_a);
+  const int half_base = a_vec_idx * 8;
+  const int row = half_base / prob_k;
+  const int col = half_base - row * prob_k;
+  const int64_t mixed_base = static_cast<int64_t>(row) * (2 * static_cast<int64_t>(prob_k)) + col;
+  int4 out;
+  half* dst = reinterpret_cast<half*>(&out);
+  #pragma unroll
+  for (int h = 0; h < 8; ++h) {
+    float g = __half2float(mixed[mixed_base + h]);
+    float u = __half2float(mixed[mixed_base + prob_k + h]);
+    dst[h] = __float2half_rn(marlin_silu(g) * u);
+  }
+  return out;
+}
+
+
 template <
   const int threads, // number of threads in a threadblock
   const int thread_m_blocks, // number of 16x16 blocks in the m dimension (batchsize) of the threadblock
   const int thread_n_blocks, // same for n dimension (output)
   const int thread_k_blocks, // same for k dimension (reduction)
   const int stages, // number of stages for the async global->shared fetch pipeline
-  const int group_blocks = -1 // number of consecutive 16x16 blocks with a separate quantization scale
+  const int group_blocks = -1, // number of consecutive 16x16 blocks with a separate quantization scale
+  const bool track_argmax = false,
+  const bool a_silu_packed = false
 >
 __global__ void Marlin(
   const int4* __restrict__ A, // fp16 input matrix of shape mxk
@@ -202,7 +242,11 @@ __global__ void Marlin(
   int  prob_m, // batch dimension m
   int  prob_n, // output dimension n
   int  prob_k, // reduction dimension k
-  int* locks // extra global storage for barrier synchronization
+  int* locks, // extra global storage for barrier synchronization
+  unsigned long long* argmax_state, // optional [m] packed max/index state
+  long long* argmax_out, // optional [m] token id output
+  int* argmax_sync, // optional [2] init-ready epoch and completion count
+  int argmax_epoch
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the same size, which might involve multiple
   // column "slices" (of width 16 * `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM example:
@@ -212,6 +256,30 @@ __global__ void Marlin(
   // While this kind of partitioning makes things somewhat more complicated, it ensures good utilization of all SMs
   // for many kinds of shape and GPU configurations, while requiring as few slow global cross-threadblock reductions as
   // possible.
+
+  const int argmax_rows = prob_m;
+  if constexpr (track_argmax) {
+    // Single-kernel contract: initialize the packed max/index state inside the
+    // Marlin launch, then publish an epoch so other resident blocks can safely
+    // start their tile work without a host-side memset kernel.
+    if (blockIdx.x == 0) {
+      for (int r = threadIdx.x; r < argmax_rows; r += threads) {
+        argmax_state[r] = 0ULL;
+        argmax_out[r] = 0;
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        argmax_sync[1] = 0;
+        argmax_sync[0] = 0;
+        __threadfence();
+        argmax_sync[1] = argmax_epoch;
+      }
+    }
+    if (threadIdx.x == 0) {
+      while (atomicAdd(&argmax_sync[1], 0) != argmax_epoch) {}
+    }
+    __syncthreads();
+  }
 
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a better partitioning with less reductions
   int parallel = 1;
@@ -237,7 +305,7 @@ __global__ void Marlin(
 
   // We can easily implement parallel problem execution by just remapping indices and advancing global pointers
   if (slice_col_par >= n_tiles) {
-    A += (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_k / 8;
+    A += (slice_col_par / n_tiles) * 16 * thread_m_blocks * ((a_silu_packed ? 2 : 1) * prob_k) / 8;
     C += (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_n / 8;
     locks += (slice_col_par / n_tiles) * n_tiles;
     slice_col = slice_col_par % n_tiles;
@@ -270,7 +338,7 @@ __global__ void Marlin(
       }
     }
     if (slice_col == n_tiles) {
-      A += 16 * thread_m_blocks * prob_k / 8;
+      A += 16 * thread_m_blocks * ((a_silu_packed ? 2 : 1) * prob_k) / 8;
       C += 16 * thread_m_blocks * prob_n / 8;
       locks += n_tiles;
       slice_col = 0;
@@ -389,11 +457,18 @@ __global__ void Marlin(
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
       #pragma unroll
       for (int i = 0; i < a_sh_wr_iters; i++) {
-        cp_async4_pred(
-          &sh_a_stage[a_sh_wr_trans[i]],
-          &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
-          a_sh_wr_pred[i]
-        );
+        int a_src_idx = a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off;
+        if constexpr (a_silu_packed) {
+          if (a_sh_wr_pred[i]) {
+            sh_a_stage[a_sh_wr_trans[i]] = marlin_silu_packed_a_vec(A, a_src_idx, prob_k);
+          }
+        } else {
+          cp_async4_pred(
+            &sh_a_stage[a_sh_wr_trans[i]],
+            &A[a_src_idx],
+            a_sh_wr_pred[i]
+          );
+        }
       }
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
       #pragma unroll
@@ -607,12 +682,51 @@ __global__ void Marlin(
     }
     __syncthreads();
 
+    unsigned long long local_argmax = 0ULL;
     #pragma unroll
     for (int i = 0; i < ceildiv(16 * thread_m_blocks, threads / (2 * thread_n_blocks)); i++) {
       if (c_gl_wr < c_gl_wr_end) {
-        C[c_gl_wr] = sh[c_sh_rd];
+        int4 out_vec = sh[c_sh_rd];
+        if constexpr (!track_argmax) {
+          C[c_gl_wr] = out_vec;
+        }
+        if constexpr (track_argmax) {
+          int row_idx = c_gl_wr / c_gl_stride;
+          int col_base = (c_gl_wr - row_idx * c_gl_stride) * 8;
+          __half* vals = reinterpret_cast<__half*>(&out_vec);
+          #pragma unroll
+          for (int h = 0; h < 8; ++h) {
+            int col = col_base + h;
+            if (col < prob_n) {
+              unsigned long long packed = marlin_argmax_pack(__half2float(vals[h]), static_cast<unsigned int>(col));
+              if (prob_m == 1) {
+                local_argmax = packed > local_argmax ? packed : local_argmax;
+              } else {
+                marlin_argmax_update(argmax_state, row_idx, static_cast<unsigned int>(col), __half2float(vals[h]));
+              }
+            }
+          }
+        }
         c_gl_wr += c_gl_wr_delta;
         c_sh_rd += c_sh_rd_delta;
+      }
+    }
+    if constexpr (track_argmax) {
+      if (prob_m == 1) {
+        unsigned long long* red = reinterpret_cast<unsigned long long*>(sh);
+        red[threadIdx.x] = local_argmax;
+        __syncthreads();
+        for (int stride = threads / 2; stride > 0; stride >>= 1) {
+          if (threadIdx.x < stride) {
+            unsigned long long other = red[threadIdx.x + stride];
+            red[threadIdx.x] = other > red[threadIdx.x] ? other : red[threadIdx.x];
+          }
+          __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+          atomicMax(&argmax_state[0], red[0]);
+        }
+        __syncthreads();
       }
     }
   };
@@ -697,6 +811,22 @@ __global__ void Marlin(
       }
     }
   }
+
+  if constexpr (track_argmax) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      __threadfence();
+      atomicAdd(&argmax_sync[0], 1);
+      while (atomicAdd(&argmax_sync[0], 0) < gridDim.x) {}
+    }
+    __syncthreads();
+    if (blockIdx.x == 0) {
+      for (int r = threadIdx.x; r < argmax_rows; r += threads) {
+        unsigned int inv_idx = static_cast<unsigned int>(argmax_state[r] & 0xffffffffULL);
+        argmax_out[r] = static_cast<long long>(0xffffffffu - inv_idx);
+      }
+    }
+  }
 }
 
 
@@ -717,11 +847,49 @@ const int SHARED_MEM = 96 * 1024; // max shared memory on compute capability 8.6
       SHARED_MEM \
     ); \
     Marlin< \
-      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS \
+      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, false \
     ><<<blocks, THREADS, SHARED_MEM, stream>>>( \
       A_ptr, B_ptr, C_ptr, s_ptr, \
       prob_m, prob_n, prob_k, \
-      locks \
+      locks, nullptr, nullptr, nullptr, 0 \
+    ); \
+  }
+
+#define CALL_IF_ARGMAX(THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, GROUP_BLOCKS) \
+  else if ( \
+    thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS && thread_k_blocks == THREAD_K_BLOCKS && \
+    group_blocks == GROUP_BLOCKS \
+  ) { \
+    cudaFuncSetAttribute( \
+      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, true>, \
+      cudaFuncAttributeMaxDynamicSharedMemorySize, \
+      SHARED_MEM \
+    ); \
+    Marlin< \
+      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, true \
+    ><<<blocks, THREADS, SHARED_MEM, stream>>>( \
+      A_ptr, B_ptr, C_ptr, s_ptr, \
+      prob_m, prob_n, prob_k, \
+      locks, argmax_state, argmax_out, argmax_sync, argmax_epoch \
+    ); \
+  }
+
+#define CALL_IF_SILU_PACKED_A(THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, GROUP_BLOCKS) \
+  else if ( \
+    thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS && thread_k_blocks == THREAD_K_BLOCKS && \
+    group_blocks == GROUP_BLOCKS \
+  ) { \
+    cudaFuncSetAttribute( \
+      Marlin<THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, false, true>, \
+      cudaFuncAttributeMaxDynamicSharedMemorySize, \
+      SHARED_MEM \
+    ); \
+    Marlin< \
+      THREADS, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, STAGES, GROUP_BLOCKS, false, true \
+    ><<<blocks, THREADS, SHARED_MEM, stream>>>( \
+      A_ptr, B_ptr, C_ptr, s_ptr, \
+      prob_m, prob_n, prob_k, \
+      locks, nullptr, nullptr, nullptr, 0 \
     ); \
   }
 
@@ -812,6 +980,185 @@ int marlin_cuda(
       ret = ERR_KERN_SHAPE;
 
     A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par;
+    C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par;
+  }
+
+  return ret;
+}
+
+int marlin_cuda_argmax(
+  const void* A,
+  const void* B,
+        void* C,
+        void* s,
+  int prob_m,
+  int prob_n,
+  int prob_k,
+  void* workspace,
+  void* argmax_state_void,
+  void* argmax_out_void,
+  void* argmax_sync_void,
+  int argmax_epoch,
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 16
+) {
+  int tot_m = prob_m;
+  int tot_m_blocks = ceildiv(tot_m, 16);
+  int pad = 16 * tot_m_blocks - tot_m;
+
+  if (sms == -1)
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  if (thread_k == -1 || thread_n == -1) {
+    if (prob_m <= 16) {
+      thread_k = 128;
+      thread_n = 128;
+    } else {
+      thread_k = 64;
+      thread_n = 256;
+    }
+  }
+
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
+  int group_blocks = (groupsize == -1) ? -1 : groupsize / 16;
+  int blocks = sms;
+
+  if (prob_n % thread_n != 0 || prob_k % thread_k != 0 || (group_blocks != -1 && prob_k % group_blocks != 0))
+    return ERR_PROB_SHAPE;
+  if (prob_m == 0 || prob_n == 0 || prob_k == 0)
+    return 0;
+
+  const int4* A_ptr = (const int4*) A;
+  const int4* B_ptr = (const int4*) B;
+  int4* C_ptr = (int4*) C;
+  const int4* s_ptr = (const int4*) s;
+  unsigned long long* argmax_state = (unsigned long long*) argmax_state_void;
+  long long* argmax_out = (long long*) argmax_out_void;
+  int* argmax_sync = (int*) argmax_sync_void;
+
+  int cols = prob_n / thread_n;
+  int* locks = (int*) workspace;
+
+  int ret = 0;
+  for (int i = 0; i < tot_m_blocks; i += 4) {
+    int thread_m_blocks = tot_m_blocks - i;
+    prob_m = tot_m - 16 * i;
+    int par = 1;
+    if (thread_m_blocks > 4) {
+      par = (16 * thread_m_blocks - pad) / 64;
+      if (par > max_par)
+        par = max_par;
+      prob_m = 64 * par;
+      i += 4 * (par - 1);
+      thread_m_blocks = 4;
+    }
+
+    if (false) {}
+    CALL_IF_ARGMAX(1,  8,  8, -1)
+    CALL_IF_ARGMAX(1,  8,  8,  8)
+    CALL_IF_ARGMAX(1, 16,  4, -1)
+    CALL_IF_ARGMAX(1, 16,  4,  8)
+    CALL_IF_ARGMAX(2, 16,  4, -1)
+    CALL_IF_ARGMAX(2, 16,  4,  8)
+    CALL_IF_ARGMAX(3, 16,  4, -1)
+    CALL_IF_ARGMAX(3, 16,  4,  8)
+    CALL_IF_ARGMAX(4, 16,  4, -1)
+    CALL_IF_ARGMAX(4, 16,  4,  8)
+    else
+      ret = ERR_KERN_SHAPE;
+
+    A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par;
+    C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par;
+    argmax_state += 16 * thread_m_blocks * par;
+    argmax_out += 16 * thread_m_blocks * par;
+  }
+
+  return ret;
+}
+
+int marlin_cuda_silu_packed(
+  const void* A,
+  const void* B,
+        void* C,
+        void* s,
+  int prob_m,
+  int prob_n,
+  int prob_k,
+  void* workspace,
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 16
+) {
+  int tot_m = prob_m;
+  int tot_m_blocks = ceildiv(tot_m, 16);
+  int pad = 16 * tot_m_blocks - tot_m;
+
+  if (sms == -1)
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  if (thread_k == -1 || thread_n == -1) {
+    if (prob_m <= 16) {
+      thread_k = 128;
+      thread_n = 128;
+    } else {
+      thread_k = 64;
+      thread_n = 256;
+    }
+  }
+
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
+  int group_blocks = (groupsize == -1) ? -1 : groupsize / 16;
+  int blocks = sms;
+
+  if (prob_n % thread_n != 0 || prob_k % thread_k != 0 || (group_blocks != -1 && prob_k % group_blocks != 0))
+    return ERR_PROB_SHAPE;
+  if (prob_m == 0 || prob_n == 0 || prob_k == 0)
+    return 0;
+
+  const int4* A_ptr = (const int4*) A;
+  const int4* B_ptr = (const int4*) B;
+  int4* C_ptr = (int4*) C;
+  const int4* s_ptr = (const int4*) s;
+  int* locks = (int*) workspace;
+
+  int ret = 0;
+  for (int i = 0; i < tot_m_blocks; i += 4) {
+    int thread_m_blocks = tot_m_blocks - i;
+    prob_m = tot_m - 16 * i;
+    int par = 1;
+    if (thread_m_blocks > 4) {
+      par = (16 * thread_m_blocks - pad) / 64;
+      if (par > max_par)
+        par = max_par;
+      prob_m = 64 * par;
+      i += 4 * (par - 1);
+      thread_m_blocks = 4;
+    }
+
+    if (false) {}
+    CALL_IF_SILU_PACKED_A(1,  8,  8, -1)
+    CALL_IF_SILU_PACKED_A(1,  8,  8,  8)
+    CALL_IF_SILU_PACKED_A(1, 16,  4, -1)
+    CALL_IF_SILU_PACKED_A(1, 16,  4,  8)
+    CALL_IF_SILU_PACKED_A(2, 16,  4, -1)
+    CALL_IF_SILU_PACKED_A(2, 16,  4,  8)
+    CALL_IF_SILU_PACKED_A(3, 16,  4, -1)
+    CALL_IF_SILU_PACKED_A(3, 16,  4,  8)
+    CALL_IF_SILU_PACKED_A(4, 16,  4, -1)
+    CALL_IF_SILU_PACKED_A(4, 16,  4,  8)
+    else
+      ret = ERR_KERN_SHAPE;
+
+    A_ptr += 16 * thread_m_blocks * (2 * prob_k / 8) * par;
     C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par;
   }
 

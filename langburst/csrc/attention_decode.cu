@@ -177,6 +177,151 @@ torch::Tensor attention_decode_fp16(torch::Tensor q, torch::Tensor k_cache, torc
 }
 
 template<int D>
+__global__ void attention_decode_gated_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    const half* __restrict__ gate,
+    half* __restrict__ out,
+    int q_heads,
+    int kv_heads,
+    int max_seq,
+    int seq_len,
+    float scale) {
+  int qh = blockIdx.x;
+  int dim = threadIdx.x;
+  if (qh >= q_heads || dim >= D) return;
+  int ratio = q_heads / kv_heads;
+  int kvh = qh / ratio;
+  __shared__ float qk[QB_ATT_BLOCK];
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc = 0.0f;
+  for (int t = 0; t < seq_len; ++t) {
+    float prod = __half2float(q[qh * D + dim]) * __half2float(k_cache[(static_cast<int64_t>(kvh) * max_seq + t) * D + dim]);
+    qk[dim] = prod;
+    __syncthreads();
+    for (int stride = D / 2; stride > 0; stride >>= 1) {
+      if (dim < stride) qk[dim] += qk[dim + stride];
+      __syncthreads();
+    }
+    float s = qk[0] * scale;
+    float new_m = fmaxf(m, s);
+    float alpha = __expf(m - new_m);
+    float p = __expf(s - new_m);
+    float vv = __half2float(v_cache[(static_cast<int64_t>(kvh) * max_seq + t) * D + dim]);
+    acc = acc * alpha + p * vv;
+    l = l * alpha + p;
+    m = new_m;
+  }
+  float att = acc / fmaxf(l, 1e-20f);
+  float gv = __half2float(gate[qh * D + dim]);
+  out[qh * D + dim] = __float2half_rn(att / (1.0f + expf(-gv)));
+}
+
+torch::Tensor attention_decode_fp16_gated(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor gate, int64_t seq_len, double softmax_scale) {
+  QB_CHECK_CUDA(q); QB_CHECK_CUDA(k_cache); QB_CHECK_CUDA(v_cache); QB_CHECK_CUDA(gate);
+  QB_CHECK_CONTIGUOUS(q); QB_CHECK_CONTIGUOUS(k_cache); QB_CHECK_CONTIGUOUS(v_cache); QB_CHECK_CONTIGUOUS(gate);
+  QB_CHECK_HALF(q); QB_CHECK_HALF(k_cache); QB_CHECK_HALF(v_cache); QB_CHECK_HALF(gate);
+  TORCH_CHECK(q.dim() == 2 && gate.dim() == 2, "q and gate must be [q_heads, head_dim]");
+  TORCH_CHECK(q.sizes() == gate.sizes(), "q/gate shape mismatch");
+  TORCH_CHECK(k_cache.dim() == 3 && v_cache.dim() == 3, "cache must be [kv_heads, max_seq, head_dim]");
+  int q_heads = static_cast<int>(q.size(0));
+  int kv_heads = static_cast<int>(k_cache.size(0));
+  int max_seq = static_cast<int>(k_cache.size(1));
+  int head_dim = static_cast<int>(q.size(1));
+  TORCH_CHECK(v_cache.size(0) == kv_heads && v_cache.size(1) == max_seq && v_cache.size(2) == head_dim, "v_cache shape mismatch");
+  TORCH_CHECK(k_cache.size(2) == head_dim, "k_cache dim mismatch");
+  TORCH_CHECK(q_heads % kv_heads == 0, "q_heads must be divisible by kv_heads");
+  TORCH_CHECK(seq_len >= 1 && seq_len <= max_seq, "seq_len out of range");
+  TORCH_CHECK(head_dim == 256, "gated attention kernel currently specializes head_dim=256");
+  auto out = torch::empty({q_heads * head_dim}, q.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  attention_decode_gated_kernel<256><<<q_heads, QB_ATT_BLOCK, 0, stream>>>(
+      reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(k_cache.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v_cache.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(gate.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      q_heads, kv_heads, max_seq, static_cast<int>(seq_len), static_cast<float>(softmax_scale));
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
+template<int D>
+__global__ void attention_decode_gated_tkh_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    const half* __restrict__ gate,
+    half* __restrict__ out,
+    int q_heads,
+    int kv_heads,
+    int max_seq,
+    int seq_len,
+    float scale) {
+  int qh = blockIdx.x;
+  int dim = threadIdx.x;
+  if (qh >= q_heads || dim >= D) return;
+  int ratio = q_heads / kv_heads;
+  int kvh = qh / ratio;
+  __shared__ float qk[QB_ATT_BLOCK];
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc = 0.0f;
+  for (int t = 0; t < seq_len; ++t) {
+    float prod = __half2float(q[qh * D + dim]) * __half2float(k_cache[(static_cast<int64_t>(t) * kv_heads + kvh) * D + dim]);
+    qk[dim] = prod;
+    __syncthreads();
+    for (int stride = D / 2; stride > 0; stride >>= 1) {
+      if (dim < stride) qk[dim] += qk[dim + stride];
+      __syncthreads();
+    }
+    float s = qk[0] * scale;
+    float new_m = fmaxf(m, s);
+    float alpha = __expf(m - new_m);
+    float p = __expf(s - new_m);
+    float vv = __half2float(v_cache[(static_cast<int64_t>(t) * kv_heads + kvh) * D + dim]);
+    acc = acc * alpha + p * vv;
+    l = l * alpha + p;
+    m = new_m;
+  }
+  float att = acc / fmaxf(l, 1e-20f);
+  float gv = __half2float(gate[qh * D + dim]);
+  out[qh * D + dim] = __float2half_rn(att / (1.0f + expf(-gv)));
+}
+
+torch::Tensor attention_decode_fp16_gated_tkh(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor gate, int64_t seq_len, double softmax_scale) {
+  QB_CHECK_CUDA(q); QB_CHECK_CUDA(k_cache); QB_CHECK_CUDA(v_cache); QB_CHECK_CUDA(gate);
+  QB_CHECK_CONTIGUOUS(q); QB_CHECK_CONTIGUOUS(k_cache); QB_CHECK_CONTIGUOUS(v_cache); QB_CHECK_CONTIGUOUS(gate);
+  QB_CHECK_HALF(q); QB_CHECK_HALF(k_cache); QB_CHECK_HALF(v_cache); QB_CHECK_HALF(gate);
+  TORCH_CHECK(q.dim() == 2 && gate.dim() == 2, "q and gate must be [q_heads, head_dim]");
+  TORCH_CHECK(q.sizes() == gate.sizes(), "q/gate shape mismatch");
+  TORCH_CHECK(k_cache.dim() == 3 && v_cache.dim() == 3, "cache must be [max_seq, kv_heads, head_dim]");
+  int q_heads = static_cast<int>(q.size(0));
+  int max_seq = static_cast<int>(k_cache.size(0));
+  int kv_heads = static_cast<int>(k_cache.size(1));
+  int head_dim = static_cast<int>(q.size(1));
+  TORCH_CHECK(v_cache.size(0) == max_seq && v_cache.size(1) == kv_heads && v_cache.size(2) == head_dim, "v_cache shape mismatch");
+  TORCH_CHECK(k_cache.size(2) == head_dim, "k_cache dim mismatch");
+  TORCH_CHECK(q_heads % kv_heads == 0, "q_heads must be divisible by kv_heads");
+  TORCH_CHECK(seq_len >= 1 && seq_len <= max_seq, "seq_len out of range");
+  TORCH_CHECK(head_dim == 256, "gated time-major attention kernel currently specializes head_dim=256");
+  auto out = torch::empty({q_heads * head_dim}, q.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  attention_decode_gated_tkh_kernel<256><<<q_heads, QB_ATT_BLOCK, 0, stream>>>(
+      reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(k_cache.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v_cache.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(gate.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      q_heads, kv_heads, max_seq, static_cast<int>(seq_len), static_cast<float>(softmax_scale));
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
+
+template<int D>
 __global__ void attention_kv_append_batch_kernel(
     const half* __restrict__ k_new,
     const half* __restrict__ v_new,

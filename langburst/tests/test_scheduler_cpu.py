@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from langburst.engines.native.block_table import KVBlockTable
 from langburst.engines.native.cuda_graph import CudaGraphBucketPlanner
 from langburst.engines.native.scheduler import AdmissionController, ContinuousBatchScheduler
@@ -31,6 +33,72 @@ def test_admission_controller_rejects_when_queue_is_full():
     assert stats.total_rejected == 1
 
 
+def test_admission_controller_context_tiers_admit_independent_slots():
+    scheduler = AdmissionController(
+        max_active_requests=2,
+        max_queued_requests=1,
+        context_tiers=(4, 16),
+        context_tier_slots=(1, 1),
+    )
+
+    with scheduler.acquire(prompt_tokens=12):
+        with pytest.raises(TimeoutError, match="admission timed out"):
+            with scheduler.acquire(timeout_s=0, prompt_tokens=10):
+                raise AssertionError("second large request should wait for the large tier")
+
+        with scheduler.acquire(prompt_tokens=4):
+            stats = scheduler.stats()
+            assert stats.active_requests == 2
+            assert stats.active_by_tier == (1, 1)
+
+    stats = scheduler.stats()
+    assert stats.active_requests == 0
+    assert stats.total_admitted == 2
+    assert stats.total_completed == 2
+    assert stats.total_timed_out == 1
+
+
+def test_admission_controller_context_tiers_overflow_small_request_to_larger_free_slot():
+    scheduler = AdmissionController(
+        max_active_requests=2,
+        max_queued_requests=1,
+        context_tiers=(4, 16),
+        context_tier_slots=(1, 1),
+    )
+
+    with scheduler.acquire(prompt_tokens=2):
+        with scheduler.acquire(prompt_tokens=3):
+            stats = scheduler.stats()
+            assert stats.active_requests == 2
+            assert stats.active_by_tier == (1, 1)
+
+
+def test_admission_controller_context_tiers_reject_prompt_over_largest_tier():
+    scheduler = AdmissionController(
+        max_active_requests=1,
+        context_tiers=(4, 16),
+        context_tier_slots=(1, 1),
+        allow_context_overflow=False,
+    )
+
+    with pytest.raises(ValueError, match="prompt too long"):
+        with scheduler.acquire(prompt_tokens=17):
+            raise AssertionError("oversized prompt should not be admitted")
+
+
+def test_admission_controller_context_tiers_overflow_uses_largest_tier():
+    scheduler = AdmissionController(
+        max_active_requests=1,
+        context_tiers=(4, 16),
+        context_tier_slots=(1, 1),
+        allow_context_overflow=True,
+    )
+
+    with scheduler.acquire(prompt_tokens=100):
+        stats = scheduler.stats()
+        assert stats.active_by_tier == (0, 1)
+
+
 def test_continuous_batch_scheduler_chunks_prefill():
     scheduler = ContinuousBatchScheduler(max_num_requests=2, max_num_batched_tokens=4, prefill_chunk_size=3)
     assert scheduler.stats().summary()["decode_prefill_interleave_steps"] == 16
@@ -45,6 +113,42 @@ def test_continuous_batch_scheduler_chunks_prefill():
     assert batch.positions.tolist() == [0, 1, 2, 0]
     assert batch.query_start_loc.tolist() == [0, 3, 4]
     assert batch.num_scheduled_tokens == [3, 1]
+
+
+def test_continuous_batch_scheduler_bounds_kv_blocks_for_overflow_prompt():
+    blocks = KVBlockTable(num_blocks=4, block_size=4)
+    scheduler = ContinuousBatchScheduler(
+        max_num_requests=1,
+        max_num_batched_tokens=4,
+        prefill_chunk_size=4,
+        block_table=blocks,
+        kv_window_tokens=8,
+    )
+    row = scheduler.add_request("long", list(range(20)))
+
+    assert blocks.summary()["used_blocks"] == 2
+    first = scheduler.schedule()
+    assert first is not None
+    first_positions = first.positions.tolist()
+    first_slots = first.slot_mapping.tolist()
+    row.computed_tokens += 4
+    second = scheduler.schedule()
+    assert second is not None
+    second_positions = second.positions.tolist()
+    second_slots = second.slot_mapping.tolist()
+    row.computed_tokens += 4
+    third = scheduler.schedule()
+    assert third is not None
+    third_positions = third.positions.tolist()
+    third_slots = third.slot_mapping.tolist()
+
+    assert first_positions == [0, 1, 2, 3]
+    assert second_positions == [4, 5, 6, 7]
+    assert third_positions == [8, 9, 10, 11]
+    assert first_slots == [0, 1, 2, 3]
+    assert second_slots == [4, 5, 6, 7]
+    assert third_slots == [0, 1, 2, 3]
+    assert blocks.summary()["used_blocks"] == 2
 
 
 def test_continuous_batch_scheduler_prioritizes_decode_rows():
@@ -93,6 +197,34 @@ def test_continuous_batch_scheduler_does_not_mix_speculative_and_plain_decode_ro
     speculative.computed_tokens += 3
     speculative.last_sampled_token = 6
     scheduler.finish_request("spec")
+    second = scheduler.schedule()
+
+    assert second is not None
+    assert second.request_ids == ["plain"]
+    assert second.input_ids.tolist() == [12]
+    assert second.num_draft_tokens_per_request == [0]
+
+
+def test_continuous_batch_scheduler_alternates_speculative_and_plain_decode_rows():
+    scheduler = ContinuousBatchScheduler(max_num_requests=3, max_num_batched_tokens=8, prefill_chunk_size=4)
+    speculative = scheduler.add_request("spec", [1, 2])
+    speculative.computed_tokens = 2
+    speculative.last_sampled_token = 3
+    speculative.draft_token_ids = [4, 5]
+    plain = scheduler.add_request("plain", [10, 11])
+    plain.computed_tokens = 2
+    plain.last_sampled_token = 12
+
+    first = scheduler.schedule()
+    assert first is not None
+    assert first.request_ids == ["spec"]
+    assert first.num_draft_tokens_per_request == [2]
+
+    # If the speculative row produces another draft immediately, the plain row
+    # still gets the next decode tick instead of waiting for spec to finish.
+    speculative.computed_tokens += 3
+    speculative.last_sampled_token = 6
+    speculative.draft_token_ids = [7, 8]
     second = scheduler.schedule()
 
     assert second is not None

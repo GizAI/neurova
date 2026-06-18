@@ -20,7 +20,12 @@ class RequestBlockTable:
     def logical_to_physical(self, token_pos: int, *, block_size: int) -> KVBlockRef:
         if token_pos < 0:
             raise ValueError("token_pos must be >= 0")
-        block_index, offset = divmod(int(token_pos), int(block_size))
+        token_pos = int(token_pos)
+        block_size = int(block_size)
+        capacity = len(self.block_ids) * block_size
+        if capacity > 0:
+            token_pos %= capacity
+        block_index, offset = divmod(token_pos, block_size)
         if block_index >= len(self.block_ids):
             raise IndexError("token position is not allocated")
         return KVBlockRef(block_id=self.block_ids[block_index], offset=offset)

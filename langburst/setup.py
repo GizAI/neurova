@@ -102,6 +102,7 @@ def get_extensions():
         "csrc/langburst_ext.cpp",
         "csrc/lowbit_gemv.cu",
         "csrc/marlin_cuda_kernel.cu",
+        "csrc/marlin_mlp_stream.cu",
         "csrc/rmsnorm.cu",
         "csrc/gdn_recurrent.cu",
         "csrc/attention_decode.cu",

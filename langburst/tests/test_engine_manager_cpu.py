@@ -7,7 +7,7 @@ import langburst.adapters  # noqa: F401
 import torch
 from langburst.core.adapter import adapter_registry
 from langburst.core.features import RuntimeFeatures
-from langburst.engines.native.manager import EngineManager, EngineResourcePolicy, ModelResourceSpec
+from langburst.engines.native.manager import EngineManager, EngineResourcePolicy, ModelResourceSpec, RuntimeMemoryPressure
 from langburst.engines.native.runtime import GenerationConfig
 from langburst.server import create_app
 
@@ -304,7 +304,7 @@ def test_server_rejects_over_limit_prompt_before_generation(tmp_path: Path):
         pass
     manager = EngineManager(
         [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
-        policy=EngineResourcePolicy(max_prompt_tokens=2, max_generation_tokens=4),
+        policy=EngineResourcePolicy(max_prompt_tokens=2, max_generation_tokens=4, allow_context_overflow=False),
     )
     app = create_app(manager)
     response = TestClient(app).post(
@@ -483,6 +483,8 @@ def test_engine_manager_does_not_duplicate_runner_for_request_level_feature_flag
     second = manager.create_batch_worker("toy-a", base.with_overrides(prefix_cache=True, speculative_decoding=True))
 
     assert first is second
+    assert first.runner.features.prefix_cache is False
+    assert first.runner.features.speculative_decoding is False
     assert manager.health()["batch_runners"]["runners"] == 1
     assert manager.health()["batch_workers"]["workers"] == 1
 
@@ -539,7 +541,7 @@ def test_engine_manager_generation_admission_limits(tmp_path: Path):
         pass
     manager = EngineManager(
         [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
-        policy=EngineResourcePolicy(max_prompt_tokens=4, max_generation_tokens=2),
+        policy=EngineResourcePolicy(max_prompt_tokens=4, max_generation_tokens=2, allow_context_overflow=False),
     )
     manager.validate_generation_request(prompt_tokens=4, generation_tokens=2)
     try:
@@ -554,7 +556,28 @@ def test_engine_manager_generation_admission_limits(tmp_path: Path):
         assert "generation too long" in str(exc)
 
 
-def test_active_runtime_memory_reserve_is_not_a_request_rejection(monkeypatch, tmp_path: Path):
+def test_engine_manager_allows_overflow_prompt_with_bounded_admission_tokens(tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-overflow", "toy", tmp_path, tmp_path, device="cpu", weight_device="cpu")],
+        policy=EngineResourcePolicy(
+            max_prompt_tokens=16,
+            max_generation_tokens=4,
+            context_tiers=(4, 16),
+            context_tier_slots=(1, 1),
+            allow_context_overflow=True,
+        ),
+    )
+
+    manager.validate_generation_request(prompt_tokens=100, generation_tokens=4)
+    assert manager.effective_admission_tokens(prompt_tokens=100, generation_tokens=4) == 20
+
+
+def test_active_runtime_memory_pressure_is_caught_before_generation(monkeypatch, tmp_path: Path):
     adapter = ToyAdapter()
     try:
         adapter_registry.register(adapter)
@@ -582,7 +605,180 @@ def test_active_runtime_memory_reserve_is_not_a_request_rejection(monkeypatch, t
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args, **kwargs: (19 * 1024 * 1024, 16 * 1024 * 1024 * 1024))
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args, **kwargs: SimpleNamespace(total_memory=16 * 1024 * 1024 * 1024))
 
+    try:
+        manager.validate_runtime_memory(engine)
+        raise AssertionError("low active runtime headroom should fail before model forward")
+    except RuntimeMemoryPressure as exc:
+        assert "active runtime" in str(exc)
+
+
+def test_active_runtime_memory_validation_clears_model_runtime_cache(monkeypatch, tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cuda", weight_device="cpu")],
+        policy=EngineResourcePolicy(reserve_free_vram_mib=512),
+    )
+    cleared = {"count": 0}
+
+    def clear_runtime_caches():
+        cleared["count"] += 1
+
+    engine = SimpleNamespace(
+        device="cuda",
+        model_name="toy-a",
+        model=SimpleNamespace(clear_runtime_caches=clear_runtime_caches),
+        adapter=SimpleNamespace(estimate_arena_state_bytes=None),
+        cfg=object(),
+        features=object(),
+        estimated_weight_bytes=lambda: 0,
+        estimated_state_bytes=lambda: 0,
+    )
+    manager._engines["toy-a"] = engine
+    manager._batch_runners[("toy-a", ())] = object()
+    free_values = iter([19 * 1024 * 1024, 768 * 1024 * 1024])
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args, **kwargs: (next(free_values), 16 * 1024 * 1024 * 1024))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args, **kwargs: SimpleNamespace(total_memory=16 * 1024 * 1024 * 1024))
+
     manager.validate_runtime_memory(engine)
+
+    assert cleared["count"] == 1
+
+
+def test_active_runtime_memory_reserve_scales_with_active_requests(monkeypatch, tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cuda", weight_device="cpu")],
+        policy=EngineResourcePolicy(reserve_free_vram_mib=512),
+    )
+    engine = SimpleNamespace(
+        device="cuda",
+        model_name="toy-a",
+        adapter=SimpleNamespace(estimate_arena_state_bytes=None),
+        cfg=object(),
+        features=object(),
+        estimated_weight_bytes=lambda: 0,
+        estimated_state_bytes=lambda: 0,
+    )
+    manager._engines["toy-a"] = engine
+    manager._batch_runners[("toy-a", ())] = object()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args, **kwargs: (768 * 1024 * 1024, 16 * 1024 * 1024 * 1024))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args, **kwargs: SimpleNamespace(total_memory=16 * 1024 * 1024 * 1024))
+
+    manager.validate_runtime_memory(engine, active_requests=1)
+    try:
+        manager.validate_runtime_memory(engine, active_requests=2)
+        raise AssertionError("two active requests must reserve two execution headrooms")
+    except RuntimeMemoryPressure as exc:
+        assert "active_requests=2" in str(exc)
+
+
+def test_memory_aware_request_lease_retries_while_another_request_is_active(monkeypatch, tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cuda", weight_device="cpu")],
+        policy=EngineResourcePolicy(
+            max_active_requests=2,
+            max_queued_requests=2,
+            admission_timeout_s=1.0,
+            reserve_free_vram_mib=512,
+            context_tiers=(4, 16),
+            context_tier_slots=(1, 1),
+        ),
+    )
+    engine = SimpleNamespace(
+        device="cuda",
+        model_name="toy-a",
+        adapter=SimpleNamespace(estimate_arena_state_bytes=None),
+        cfg=object(),
+        features=object(),
+        estimated_weight_bytes=lambda: 0,
+        estimated_state_bytes=lambda: 0,
+    )
+    manager._engines["toy-a"] = engine
+    manager._batch_runners[("toy-a", ())] = object()
+
+    free_values = iter([
+        19 * 1024 * 1024,
+        19 * 1024 * 1024,
+        1024 * 1024 * 1024,
+    ])
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda *args, **kwargs: (next(free_values), 16 * 1024 * 1024 * 1024),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args, **kwargs: SimpleNamespace(total_memory=16 * 1024 * 1024 * 1024))
+
+    with manager.acquire_request(prompt_tokens=12):
+        with manager.acquire_request(prompt_tokens=4, engine=engine):
+            stats = manager.admission.stats()
+            assert stats.active_requests == 2
+
+
+def test_memory_aware_request_lease_does_not_wait_on_itself(monkeypatch, tmp_path: Path):
+    adapter = ToyAdapter()
+    try:
+        adapter_registry.register(adapter)
+    except ValueError:
+        pass
+    manager = EngineManager(
+        [ModelResourceSpec("toy-a", "toy", tmp_path, tmp_path, device="cuda", weight_device="cpu")],
+        policy=EngineResourcePolicy(
+            max_active_requests=2,
+            max_queued_requests=2,
+            admission_timeout_s=1.0,
+            reserve_free_vram_mib=512,
+        ),
+    )
+    engine = SimpleNamespace(
+        device="cuda",
+        model_name="toy-a",
+        adapter=SimpleNamespace(estimate_arena_state_bytes=None),
+        cfg=object(),
+        features=object(),
+        estimated_weight_bytes=lambda: 0,
+        estimated_state_bytes=lambda: 0,
+    )
+    manager._engines["toy-a"] = engine
+    manager._batch_runners[("toy-a", ())] = object()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args, **kwargs: (19 * 1024 * 1024, 16 * 1024 * 1024 * 1024))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args, **kwargs: SimpleNamespace(total_memory=16 * 1024 * 1024 * 1024))
+
+    try:
+        with manager.acquire_request(prompt_tokens=4, engine=engine):
+            raise AssertionError("self-only pressure should not be admitted")
+    except RuntimeMemoryPressure:
+        pass
+
+    assert manager.admission.stats().active_requests == 0
 
 
 def test_resource_policy_validates_limits():

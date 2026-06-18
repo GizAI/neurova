@@ -101,6 +101,10 @@ class BatchGenerationHandle:
             self.generated.append(token_id)
             self.token_monotonic.append(now)
             self.output_queue.put(token_id)
+            if can_stop and self._matched_repetition_stop():
+                self.finish_reason = "repetition"
+                should_finish = True
+                break
             matched_stop = self._matched_stop_sequence()
             if can_stop and matched_stop:
                 self.finish_reason = "stop"
@@ -127,6 +131,22 @@ class BatchGenerationHandle:
             if seq and len(self.generated) >= len(seq) and tuple(self.generated[-len(seq) :]) == tuple(seq):
                 return tuple(seq)
         return ()
+
+    def _matched_repetition_stop(self) -> bool:
+        cfg = self.generation_config
+        max_n = int(getattr(cfg, "repetition_stop_ngram_size", 0) or 0)
+        repeats = int(getattr(cfg, "repetition_stop_repeats", 0) or 0)
+        if max_n <= 0 or repeats <= 1:
+            return False
+        for n in range(1, max_n + 1):
+            total = n * repeats
+            if len(self.generated) < total:
+                continue
+            tail = self.generated[-total:]
+            unit = tail[-n:]
+            if all(tail[i : i + n] == unit for i in range(0, total, n)):
+                return True
+        return False
 
     def cancel(self) -> None:
         self.cancelled.set()

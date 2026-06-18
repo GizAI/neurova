@@ -172,6 +172,30 @@ torch::Tensor argmax(torch::Tensor logits) {
   return argmax_many(logits).slice(0, 0, 1);
 }
 
+__global__ void argmax_unpack_state_kernel(const unsigned long long* __restrict__ state, int64_t* __restrict__ out, int64_t rows) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  unsigned long long packed = state[row];
+  unsigned int tie = static_cast<unsigned int>(packed & 0xffffffffULL);
+  out[row] = static_cast<int64_t>(0xffffffffu - tie);
+}
+
+void argmax_unpack_state_out(torch::Tensor state, torch::Tensor out) {
+  QB_CHECK_CUDA(state); QB_CHECK_CUDA(out);
+  QB_CHECK_CONTIGUOUS(state); QB_CHECK_CONTIGUOUS(out);
+  QB_CHECK_INT64(state); QB_CHECK_INT64(out);
+  TORCH_CHECK(state.dim() == 1 && out.dim() == 1, "state/out must be 1D");
+  TORCH_CHECK(state.numel() == out.numel(), "state/out length mismatch");
+  int64_t rows = state.numel();
+  if (rows == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int threads = 128;
+  int blocks = static_cast<int>((rows + threads - 1) / threads);
+  argmax_unpack_state_kernel<<<blocks, threads, 0, stream>>>(
+      reinterpret_cast<const unsigned long long*>(state.data_ptr<int64_t>()), out.data_ptr<int64_t>(), rows);
+  QB_CUDA_CHECK(cudaGetLastError());
+}
+
 torch::Tensor count_prefix_matches(torch::Tensor proposed, torch::Tensor verified) {
   QB_CHECK_CUDA(proposed); QB_CHECK_CUDA(verified);
   QB_CHECK_CONTIGUOUS(proposed); QB_CHECK_CONTIGUOUS(verified);

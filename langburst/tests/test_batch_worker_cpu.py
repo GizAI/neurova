@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from langburst.engines.native.batch_worker import BatchGenerationWorker
+from langburst.engines.native.batch_worker import BatchGenerationHandle, BatchGenerationWorker
 from langburst.engines.native.model_runner import BatchedModelRunner
 from langburst.engines.native.runtime import GenerationConfig, RuntimeEngine
 from langburst.engines.native.scheduler import ContinuousBatchScheduler
@@ -186,6 +186,34 @@ def test_batch_generation_worker_cancel_releases_active_request():
         assert worker.stats()["active_requests"] == 0
     finally:
         worker.shutdown()
+
+
+def test_batch_generation_handle_stops_repeated_token_loop():
+    handle = BatchGenerationHandle(
+        request_id="repeat-1",
+        max_new_tokens=32,
+        generation_config=GenerationConfig(
+            repetition_stop_ngram_size=4,
+            repetition_stop_repeats=6,
+        ),
+    )
+
+    assert handle.push_tokens([7, 7, 7, 7, 7, 7]) is True
+    assert handle.finish_reason == "repetition"
+
+
+def test_batch_generation_handle_stops_repeated_ngram_loop():
+    handle = BatchGenerationHandle(
+        request_id="repeat-2",
+        max_new_tokens=32,
+        generation_config=GenerationConfig(
+            repetition_stop_ngram_size=4,
+            repetition_stop_repeats=4,
+        ),
+    )
+
+    assert handle.push_tokens([10, 11, 10, 11, 10, 11, 10, 11]) is True
+    assert handle.finish_reason == "repetition"
 
 
 def test_batch_generation_worker_does_not_admit_pending_when_active_capacity_is_full():

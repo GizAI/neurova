@@ -24,6 +24,26 @@ def test_resource_policy_from_env_derives_kv_blocks_from_context_and_concurrency
     assert policy.max_state_pool_size == 2
     assert policy.prefill_chunk_size == 64
     assert policy.decode_prefill_interleave_steps == 3
+    assert policy.allow_context_overflow is True
+
+
+def test_resource_policy_from_env_derives_kv_blocks_from_context_tiers():
+    policy = EngineResourcePolicy.from_env(
+        {
+            "LANGBURST_CONTEXT_WINDOW": "49152",
+            "LANGBURST_CONTEXT_TIERS": "4096,49152",
+            "LANGBURST_CONTEXT_TIER_SLOTS": "1,1",
+            "LANGBURST_KV_BLOCK_SIZE": "16",
+            "LANGBURST_MAX_STATE_POOL_SIZE": "1",
+        }
+    )
+
+    assert policy.context_tiers == (4096, 49152)
+    assert policy.context_tier_slots == (1, 1)
+    assert policy.kv_blocks == 3328
+    assert policy.max_active_requests == 2
+    assert policy.max_state_pool_size == 2
+    assert policy.max_prompt_tokens == 49152
 
 
 def test_resource_policy_from_env_accepts_explicit_deployment_budget():
@@ -45,6 +65,17 @@ def test_resource_policy_from_env_accepts_explicit_deployment_budget():
     assert policy.reserve_free_vram_mib == 256
     assert policy.runtime_overhead_mib == 128
     assert policy.max_state_pool_size == 1
+
+
+def test_resource_policy_from_env_can_disable_context_overflow():
+    policy = EngineResourcePolicy.from_env(
+        {
+            "LANGBURST_CONTEXT_WINDOW": "8192",
+            "LANGBURST_ALLOW_CONTEXT_OVERFLOW": "0",
+        }
+    )
+
+    assert policy.allow_context_overflow is False
 
 
 def test_resource_policy_caps_prefill_chunk_to_marlin_direct_batch(monkeypatch):

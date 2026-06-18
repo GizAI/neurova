@@ -7,7 +7,14 @@ from langburst.core.defaults import DEFAULT_SERVING_RECENT_WINDOW
 from langburst.core.chat_template import resolve_chat_template_kwargs
 from langburst.core.features import RuntimeFeatures
 from langburst.engines.native.manager import load_model_specs
-from langburst.server import ChatCompletionRequest, _native_generation_config, _request_messages, _thinking_visible_prefix, _with_visible_prefix_once
+from langburst.server import (
+    ChatCompletionRequest,
+    _native_generation_config,
+    _request_messages,
+    _requested_generation_tokens,
+    _thinking_visible_prefix,
+    _with_visible_prefix_once,
+)
 
 
 def test_load_model_specs_from_json(tmp_path: Path):
@@ -110,6 +117,37 @@ def test_native_generation_defaults_disable_thinking_and_min_output(monkeypatch)
     assert cfg.min_new_tokens == 0
     assert 248068 in cfg.suppress_tokens
     assert 248069 in cfg.suppress_tokens
+
+
+def test_requested_generation_tokens_are_capped_by_runtime_policy(monkeypatch):
+    monkeypatch.setenv("LANGBURST_DEFAULT_MAX_TOKENS", "256")
+    monkeypatch.setenv("LANGBURST_MAX_GENERATION_TOKENS", "1024")
+
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hello"}], max_tokens=2048)
+
+    assert _requested_generation_tokens(req) == 1024
+
+
+def test_native_generation_includes_repetition_guard(monkeypatch):
+    class Tokenizer:
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return {"<think>": [248068], "</think>": [248069]}[text]
+
+    class Engine:
+        tokenizer = Tokenizer()
+
+        @staticmethod
+        def eos_token_ids():
+            return (248046,)
+
+    monkeypatch.setenv("LANGBURST_REPETITION_STOP_NGRAM_SIZE", "4")
+    monkeypatch.setenv("LANGBURST_REPETITION_STOP_REPEATS", "6")
+
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hello"}], max_tokens=128)
+    cfg = _native_generation_config(Engine(), req)
+
+    assert cfg.repetition_stop_ngram_size == 4
+    assert cfg.repetition_stop_repeats == 6
 
 
 def test_native_generation_allows_think_tokens_when_explicitly_enabled(monkeypatch):

@@ -41,6 +41,28 @@ def _env_optional_float(env: Mapping[str, str], name: str, default: float | None
     return float(raw)
 
 
+def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    text = raw.strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be one of: 1/0, true/false, on/off")
+
+
+def _env_int_tuple(env: Mapping[str, str], name: str) -> tuple[int, ...]:
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return ()
+    values = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    if any(value < 1 for value in values):
+        raise ValueError(f"{name} values must be >= 1")
+    return values
+
+
 def _env_context_window(env: Mapping[str, str]) -> int:
     return _env_int(
         env,
@@ -61,8 +83,16 @@ def _env_kv_blocks(env: Mapping[str, str]) -> int:
     explicit = env.get("LANGBURST_KV_BLOCKS")
     if explicit is not None and explicit.strip() != "":
         return int(explicit)
-    context_window = _env_context_window(env)
     block_size = _env_kv_block_size(env)
+    context_tiers = _env_int_tuple(env, "LANGBURST_CONTEXT_TIERS")
+    tier_slots = _env_int_tuple(env, "LANGBURST_CONTEXT_TIER_SLOTS")
+    if context_tiers:
+        if not tier_slots:
+            tier_slots = tuple(1 for _ in context_tiers)
+        if len(context_tiers) != len(tier_slots):
+            raise ValueError("LANGBURST_CONTEXT_TIERS and LANGBURST_CONTEXT_TIER_SLOTS must have the same length")
+        return max(1, sum(((tier + block_size - 1) // block_size) * slots for tier, slots in zip(context_tiers, tier_slots)))
+    context_window = _env_context_window(env)
     max_active = _env_max_active_requests(env)
     return max(1, ((context_window + block_size - 1) // block_size) * max_active)
 
@@ -92,6 +122,9 @@ class EngineResourcePolicy:
     kv_block_size: int = DEFAULT_KV_BLOCK_SIZE
     kv_blocks: int = DEFAULT_KV_BLOCKS
     runtime_overhead_mib: int = DEFAULT_RUNTIME_OVERHEAD_MIB
+    context_tiers: tuple[int, ...] = ()
+    context_tier_slots: tuple[int, ...] = ()
+    allow_context_overflow: bool = True
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "EngineResourcePolicy":
@@ -117,6 +150,9 @@ class EngineResourcePolicy:
             kv_block_size=_env_kv_block_size(source),
             kv_blocks=_env_kv_blocks(source),
             runtime_overhead_mib=_env_int(source, "LANGBURST_RUNTIME_OVERHEAD_MIB", DEFAULT_RUNTIME_OVERHEAD_MIB),
+            context_tiers=_env_int_tuple(source, "LANGBURST_CONTEXT_TIERS"),
+            context_tier_slots=_env_int_tuple(source, "LANGBURST_CONTEXT_TIER_SLOTS"),
+            allow_context_overflow=_env_bool(source, "LANGBURST_ALLOW_CONTEXT_OVERFLOW", True),
         )
 
     def __post_init__(self) -> None:
@@ -154,6 +190,23 @@ class EngineResourcePolicy:
             raise ValueError("kv_blocks must be >= 1")
         if self.runtime_overhead_mib < 0:
             raise ValueError("runtime_overhead_mib must be >= 0")
+        if bool(self.context_tiers) != bool(self.context_tier_slots):
+            raise ValueError("context_tiers and context_tier_slots must be set together")
+        if len(self.context_tiers) != len(self.context_tier_slots):
+            raise ValueError("context_tiers and context_tier_slots must have the same length")
+        if any(tier < 1 for tier in self.context_tiers):
+            raise ValueError("context_tiers values must be >= 1")
+        if any(slots < 1 for slots in self.context_tier_slots):
+            raise ValueError("context_tier_slots values must be >= 1")
+        if self.context_tiers:
+            pairs = tuple(sorted(zip(self.context_tiers, self.context_tier_slots), key=lambda pair: pair[0]))
+            object.__setattr__(self, "context_tiers", tuple(tier for tier, _slots in pairs))
+            object.__setattr__(self, "context_tier_slots", tuple(slots for _tier, slots in pairs))
+            object.__setattr__(self, "max_active_requests", sum(self.context_tier_slots))
+            if self.max_state_pool_size < self.max_active_requests:
+                object.__setattr__(self, "max_state_pool_size", self.max_active_requests)
+            if self.max_prompt_tokens is None or self.max_prompt_tokens < self.context_tiers[-1]:
+                object.__setattr__(self, "max_prompt_tokens", self.context_tiers[-1])
 
     def summary(self) -> dict[str, object]:
         return {
@@ -173,4 +226,7 @@ class EngineResourcePolicy:
             "kv_block_size": self.kv_block_size,
             "kv_blocks": self.kv_blocks,
             "runtime_overhead_mib": self.runtime_overhead_mib,
+            "context_tiers": self.context_tiers,
+            "context_tier_slots": self.context_tier_slots,
+            "allow_context_overflow": self.allow_context_overflow,
         }

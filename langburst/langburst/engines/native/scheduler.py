@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import OrderedDict
 import threading
+import time
 from typing import Sequence
 
 from .block_table import KVBlockTable
@@ -20,6 +21,9 @@ class SchedulerStats:
     total_completed: int
     total_rejected: int
     total_timed_out: int
+    context_tiers: tuple[int, ...] = ()
+    context_tier_slots: tuple[int, ...] = ()
+    active_by_tier: tuple[int, ...] = ()
 
     def summary(self) -> dict[str, int]:
         return {
@@ -31,6 +35,9 @@ class SchedulerStats:
             "total_completed": self.total_completed,
             "total_rejected": self.total_rejected,
             "total_timed_out": self.total_timed_out,
+            "context_tiers": self.context_tiers,
+            "context_tier_slots": self.context_tier_slots,
+            "active_by_tier": self.active_by_tier,
         }
 
 
@@ -42,31 +49,50 @@ class AdmissionController:
     through server handlers.
     """
 
-    def __init__(self, *, max_active_requests: int = 1, max_queued_requests: int = 0, admission_timeout_s: float | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_active_requests: int = 1,
+        max_queued_requests: int = 0,
+        admission_timeout_s: float | None = None,
+        context_tiers: Sequence[int] = (),
+        context_tier_slots: Sequence[int] = (),
+        allow_context_overflow: bool = False,
+    ) -> None:
         if max_active_requests < 1:
             raise ValueError("max_active_requests must be >= 1")
         if max_queued_requests < 0:
             raise ValueError("max_queued_requests must be >= 0")
         if admission_timeout_s is not None and admission_timeout_s < 0:
             raise ValueError("admission_timeout_s must be >= 0")
+        if bool(context_tiers) != bool(context_tier_slots):
+            raise ValueError("context_tiers and context_tier_slots must be set together")
+        if len(context_tiers) != len(context_tier_slots):
+            raise ValueError("context_tiers and context_tier_slots must have the same length")
+        pairs = tuple(sorted((int(tier), int(slots)) for tier, slots in zip(context_tiers, context_tier_slots)))
+        if any(tier < 1 or slots < 1 for tier, slots in pairs):
+            raise ValueError("context tiers and slots must be >= 1")
         self.max_active_requests = int(max_active_requests)
         self.max_queued_requests = int(max_queued_requests)
         self.admission_timeout_s = admission_timeout_s
-        self._slots = threading.Semaphore(self.max_active_requests)
-        self._lock = threading.Lock()
+        self.context_tiers = tuple(tier for tier, _slots in pairs)
+        self.context_tier_slots = tuple(slots for _tier, slots in pairs)
+        self.allow_context_overflow = bool(allow_context_overflow)
+        self._condition = threading.Condition()
         self._active = 0
         self._queued = 0
+        self._active_by_tier = [0 for _tier in self.context_tiers]
         self._total_admitted = 0
         self._total_completed = 0
         self._total_rejected = 0
         self._total_timed_out = 0
 
-    def acquire(self, *, timeout_s: float | None = None):
+    def acquire(self, *, timeout_s: float | None = None, prompt_tokens: int | None = None):
         timeout_s = self.admission_timeout_s if timeout_s is None else timeout_s
-        return _RequestLease(self, timeout_s=timeout_s)
+        return _RequestLease(self, timeout_s=timeout_s, prompt_tokens=prompt_tokens)
 
     def stats(self) -> SchedulerStats:
-        with self._lock:
+        with self._condition:
             return SchedulerStats(
                 max_active_requests=self.max_active_requests,
                 max_queued_requests=self.max_queued_requests,
@@ -76,51 +102,97 @@ class AdmissionController:
                 total_completed=self._total_completed,
                 total_rejected=self._total_rejected,
                 total_timed_out=self._total_timed_out,
+                context_tiers=self.context_tiers,
+                context_tier_slots=self.context_tier_slots,
+                active_by_tier=tuple(self._active_by_tier),
             )
+
+    def _first_fitting_tier_index(self, prompt_tokens: int | None) -> int | None:
+        if not self.context_tiers:
+            return None
+        tokens = int(prompt_tokens or 0)
+        for idx, tier in enumerate(self.context_tiers):
+            if tokens <= tier:
+                return idx
+        if self.allow_context_overflow:
+            return len(self.context_tiers) - 1
+        raise ValueError(f"prompt too long for configured context tiers: tokens={tokens} max={self.context_tiers[-1]}")
+
+    def _select_available_tier_locked(self, prompt_tokens: int | None) -> int | None:
+        tier_index = self._first_fitting_tier_index(prompt_tokens)
+        if tier_index is None:
+            return None if self._active < self.max_active_requests else -1
+        for idx in range(tier_index, len(self.context_tiers)):
+            if self._active_by_tier[idx] < self.context_tier_slots[idx]:
+                return idx
+        return -1
+
+    def _can_admit_locked(self, tier_index: int | None) -> bool:
+        if self._active >= self.max_active_requests:
+            return False
+        if tier_index == -1:
+            return False
+        if tier_index is not None and self._active_by_tier[tier_index] >= self.context_tier_slots[tier_index]:
+            return False
+        return True
 
 
 class _RequestLease:
-    def __init__(self, scheduler: AdmissionController, *, timeout_s: float | None) -> None:
+    def __init__(self, scheduler: AdmissionController, *, timeout_s: float | None, prompt_tokens: int | None) -> None:
         self.scheduler = scheduler
         self.timeout_s = timeout_s
+        self.prompt_tokens = prompt_tokens
+        self.tier_index: int | None = None
         self.acquired = False
 
     def __enter__(self):
         scheduler = self.scheduler
-        with scheduler._lock:
-            if scheduler._active >= scheduler.max_active_requests and scheduler._queued >= scheduler.max_queued_requests:
-                scheduler._total_rejected += 1
-                raise TimeoutError("request scheduler queue is full")
-            scheduler._queued += 1
-        try:
-            if self.timeout_s is None:
-                scheduler._slots.acquire()
-                ok = True
-            else:
-                ok = scheduler._slots.acquire(timeout=max(0.0, self.timeout_s))
-            if not ok:
-                with scheduler._lock:
-                    scheduler._total_timed_out += 1
-                raise TimeoutError("request scheduler admission timed out")
-            self.acquired = True
-            with scheduler._lock:
+        deadline = None if self.timeout_s is None else time.monotonic() + max(0.0, self.timeout_s)
+        with scheduler._condition:
+            queued = False
+            try:
+                scheduler._first_fitting_tier_index(self.prompt_tokens)
+                if scheduler._active >= scheduler.max_active_requests and scheduler._queued >= scheduler.max_queued_requests:
+                    scheduler._total_rejected += 1
+                    raise TimeoutError("request scheduler queue is full")
+                scheduler._queued += 1
+                queued = True
+                while True:
+                    self.tier_index = scheduler._select_available_tier_locked(self.prompt_tokens)
+                    if scheduler._can_admit_locked(self.tier_index):
+                        break
+                    if deadline is None:
+                        scheduler._condition.wait()
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        scheduler._total_timed_out += 1
+                        raise TimeoutError("request scheduler admission timed out")
+                    scheduler._condition.wait(timeout=remaining)
+                self.acquired = True
                 scheduler._queued -= 1
+                queued = False
                 scheduler._active += 1
+                if self.tier_index is not None:
+                    scheduler._active_by_tier[self.tier_index] += 1
                 scheduler._total_admitted += 1
-            return self
-        except Exception:
-            with scheduler._lock:
-                scheduler._queued = max(0, scheduler._queued - 1)
-            raise
+                return self
+            except Exception:
+                if queued:
+                    scheduler._queued = max(0, scheduler._queued - 1)
+                scheduler._condition.notify_all()
+                raise
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if not self.acquired:
             return
         scheduler = self.scheduler
-        with scheduler._lock:
+        with scheduler._condition:
             scheduler._active = max(0, scheduler._active - 1)
+            if self.tier_index is not None:
+                scheduler._active_by_tier[self.tier_index] = max(0, scheduler._active_by_tier[self.tier_index] - 1)
             scheduler._total_completed += 1
-        scheduler._slots.release()
+            scheduler._condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -171,6 +243,7 @@ class ContinuousBatchScheduler:
         decode_prefill_interleave_steps: int = 16,
         block_table: KVBlockTable | None = None,
         cuda_graph_planner: CudaGraphBucketPlanner | None = None,
+        kv_window_tokens: int | None = None,
     ) -> None:
         if max_num_requests < 1:
             raise ValueError("max_num_requests must be >= 1")
@@ -189,6 +262,9 @@ class ContinuousBatchScheduler:
         self.decode_prefill_interleave_steps = int(decode_prefill_interleave_steps)
         self.block_table = block_table
         self.cuda_graph_planner = cuda_graph_planner
+        self.kv_window_tokens = int(kv_window_tokens) if kv_window_tokens is not None else None
+        if self.kv_window_tokens is not None and self.kv_window_tokens < 1:
+            raise ValueError("kv_window_tokens must be >= 1")
         self._waiting: OrderedDict[str, DecodeRequestState] = OrderedDict()
         self._active: OrderedDict[str, DecodeRequestState] = OrderedDict()
         self._next_state_index = 0
@@ -197,9 +273,16 @@ class ContinuousBatchScheduler:
         self._total_scheduled_batches = 0
         self._total_scheduled_tokens = 0
         self._decode_only_ticks = 0
+        self._spec_decode_only_ticks = 0
         self._buffers: DecodeInputBuffers | None = None
 
-    def add_request(self, request_id: str, token_ids: Sequence[int]) -> DecodeRequestState:
+    def add_request(
+        self,
+        request_id: str,
+        token_ids: Sequence[int],
+        *,
+        kv_window_tokens: int | None = None,
+    ) -> DecodeRequestState:
         if request_id in self._waiting or request_id in self._active:
             raise ValueError(f"duplicate request_id: {request_id}")
         if not token_ids:
@@ -208,11 +291,12 @@ class ContinuousBatchScheduler:
             request_id=request_id,
             state_index=self._next_state_index,
             token_ids=[int(t) for t in token_ids],
+            kv_window_tokens=self._resolve_kv_window_tokens(kv_window_tokens),
         )
         self._next_state_index += 1
         self._waiting[request_id] = row
         if self.block_table is not None:
-            self.block_table.ensure_tokens(request_id, len(row.token_ids))
+            self.block_table.ensure_tokens(request_id, row.kv_token_capacity)
         self._total_added += 1
         self._admit_waiting()
         return row
@@ -242,12 +326,22 @@ class ContinuousBatchScheduler:
         # prevents long prefill chunks from starving active decoders.
         active_rows = list(self._active.values())
         decode_rows = [r for r in active_rows if not r.is_prefilling]
-        if any(r.has_draft_tokens for r in decode_rows):
+        speculative_decode_rows = [r for r in decode_rows if r.has_draft_tokens]
+        plain_decode_rows = [r for r in decode_rows if not r.has_draft_tokens]
+        if speculative_decode_rows and plain_decode_rows:
+            # Speculative verification and ordinary decode cannot share one
+            # fixed-shape target pass yet. Alternate the two classes so a
+            # steady stream of speculative drafts cannot starve plain rows.
+            if self._spec_decode_only_ticks > 0:
+                decode_rows = plain_decode_rows
+            else:
+                decode_rows = speculative_decode_rows
+        elif speculative_decode_rows:
             # Speculative verification has a different fixed-shape target
             # contract from plain decode.  Keep one scheduled batch descriptor
             # uniform instead of mixing rows that require forward_verify_batch
             # with rows that should run ordinary forward_batch_logits.
-            decode_rows = [r for r in decode_rows if r.has_draft_tokens]
+            decode_rows = speculative_decode_rows
         prefill_rows = [r for r in active_rows if r.is_prefilling]
         prefill_due = bool(decode_rows and prefill_rows and self._decode_only_ticks >= self.decode_prefill_interleave_steps)
         for row in ([] if prefill_due else decode_rows):
@@ -287,9 +381,15 @@ class ContinuousBatchScheduler:
             self._decode_only_ticks += 1
         elif selected_has_prefill:
             self._decode_only_ticks = 0
+        selected_has_spec_decode = any((not row.is_prefilling) and row.has_draft_tokens for row in selected)
+        selected_has_plain_decode = any((not row.is_prefilling) and not row.has_draft_tokens for row in selected)
+        if selected_has_spec_decode and plain_decode_rows:
+            self._spec_decode_only_ticks += 1
+        elif selected_has_plain_decode or not speculative_decode_rows:
+            self._spec_decode_only_ticks = 0
         if self.block_table is not None:
             for row, n in zip(selected, scheduled_tokens):
-                self.block_table.ensure_tokens(row.request_id, row.computed_tokens + n)
+                self.block_table.ensure_tokens(row.request_id, min(row.computed_tokens + n, row.kv_token_capacity))
         graph_bucket: tuple[int, int, int] | None = None
         if self.cuda_graph_planner is not None:
             try:
@@ -371,3 +471,12 @@ class ContinuousBatchScheduler:
                 device=device,
             )
         return self._buffers
+
+    def _resolve_kv_window_tokens(self, explicit: int | None) -> int | None:
+        value = explicit if explicit is not None else self.kv_window_tokens
+        if value is None:
+            return None
+        value = int(value)
+        if value < 1:
+            raise ValueError("kv_window_tokens must be >= 1")
+        return value

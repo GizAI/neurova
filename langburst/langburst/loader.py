@@ -89,6 +89,10 @@ class LowBitMarlinTensor:
     bits: int = 4
     exec_bits: int = 4
     _out_cache: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
+    _argmax_cache: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
+    _argmax_state_cache: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
+    _argmax_sync: torch.Tensor | None = field(default=None, init=False, repr=False)
+    _argmax_epoch: int = field(default=0, init=False, repr=False)
     _workspace: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def gemv(self, x: torch.Tensor) -> torch.Tensor:
@@ -134,8 +138,110 @@ class LowBitMarlinTensor:
             )
         return out
 
+    def gemm_silu_packed(self, mixed: torch.Tensor, hidden: int, out: torch.Tensor | None = None) -> torch.Tensor:
+        if mixed.ndim == 1:
+            mixed = mixed.reshape(1, -1)
+        if mixed.ndim != 2:
+            raise ValueError("gemm_silu_packed expects mixed [batch, 2*hidden]")
+        if int(hidden) != int(self.cols):
+            raise ValueError("hidden must match this Marlin tensor's input cols")
+        if mixed.size(1) != 2 * int(hidden):
+            raise ValueError("mixed width must be 2*hidden")
+        if self.qweight.device.type != "cuda":
+            raise RuntimeError("Marlin tensors require CUDA")
+        mixed = mixed.to(device=self.qweight.device, dtype=torch.float16).contiguous()
+        batch = int(mixed.size(0))
+        rows = int(self.qweight.size(1) // 2)
+        if out is None:
+            out = self._out_cache.get(batch)
+            if out is None or out.device != self.qweight.device or out.size(1) != rows:
+                out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
+                self._out_cache[batch] = out
+        else:
+            if out.device != self.qweight.device or out.shape != (batch, rows) or out.dtype != torch.float16:
+                raise ValueError("out must be fp16 CUDA tensor with shape [batch, rows]")
+        workspace_size = max(1, rows // 128 * 16)
+        if self._workspace is None or self._workspace.device != self.qweight.device or self._workspace.numel() < workspace_size:
+            self._workspace = torch.zeros((workspace_size,), device=self.qweight.device, dtype=torch.int32)
+        else:
+            self._workspace[:workspace_size].zero_()
+        with torch.cuda.device(self.qweight.device):
+            cuda_ops().lowbit_marlin_gemm_silu_packed_out(
+                self.qweight,
+                self.scales,
+                mixed,
+                out,
+                self._workspace,
+                int(hidden),
+                self.group_size,
+            )
+        return out
+
+    def gemm_argmax(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        if x.ndim != 2:
+            raise ValueError("gemm_argmax expects x [batch, cols]")
+        if self.qweight.device.type != "cuda":
+            raise RuntimeError("Marlin tensors require CUDA")
+        x = x.to(device=self.qweight.device, dtype=torch.float16).contiguous()
+        batch = int(x.size(0))
+        rows = int(self.qweight.size(1) // 2)
+        cache_policy = _marlin_out_cache_policy()
+        cache_out = cache_policy not in {"0", "false", "off", "none", "no_cache"} and (
+            cache_policy != "decode_only" or batch == 1
+        )
+        scratch_out = self._out_cache.get(batch) if cache_out else None
+        if scratch_out is None or scratch_out.device != self.qweight.device or scratch_out.size(1) != rows:
+            scratch_out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
+            if cache_out:
+                self._out_cache[batch] = scratch_out
+        workspace_size = max(1, rows // 128 * 16)
+        if self._workspace is None or self._workspace.device != self.qweight.device or self._workspace.numel() < workspace_size:
+            self._workspace = torch.zeros((workspace_size,), device=self.qweight.device, dtype=torch.int32)
+        else:
+            self._workspace[:workspace_size].zero_()
+        if out is None:
+            out = self._argmax_cache.get(batch)
+            if out is None or out.device != self.qweight.device or out.numel() != batch:
+                out = torch.empty((batch,), device=self.qweight.device, dtype=torch.long)
+                self._argmax_cache[batch] = out
+        else:
+            if out.device != self.qweight.device or out.numel() != batch or out.dtype != torch.long:
+                raise ValueError("argmax out must be int64 CUDA tensor with shape [batch]")
+            out = out.reshape(batch)
+        state = self._argmax_state_cache.get(batch)
+        if state is None or state.device != self.qweight.device or state.numel() != batch:
+            state = torch.empty((batch,), device=self.qweight.device, dtype=torch.long)
+            self._argmax_state_cache[batch] = state
+        if self._argmax_sync is None or self._argmax_sync.device != self.qweight.device:
+            self._argmax_sync = torch.empty((2,), device=self.qweight.device, dtype=torch.int32)
+        self._argmax_epoch = 1 if self._argmax_epoch >= 2_000_000_000 else self._argmax_epoch + 1
+        with torch.cuda.device(self.qweight.device):
+            cuda_ops().lowbit_marlin_gemm_argmax_out(
+                self.qweight,
+                self.scales,
+                x,
+                scratch_out,
+                self._workspace,
+                state,
+                out,
+                self._argmax_sync,
+                self._argmax_epoch,
+                self.cols,
+                self.group_size,
+            )
+        return out
+
     def row_dequant(self, row: int | torch.Tensor) -> torch.Tensor:
         raise RuntimeError("Marlin layout does not support row_dequant; keep embeddings in rowwise layout")
+
+    def clear_runtime_cache(self) -> None:
+        self._out_cache.clear()
+        self._argmax_cache.clear()
+        self._argmax_state_cache.clear()
+        self._argmax_sync = None
+        self._workspace = None
 
 
 def dequantize_lowbit_row(
@@ -292,6 +398,12 @@ class QuantizedStore:
             "mib_by_kind": {k: round(v / (1024 * 1024), 2) for k, v in sorted(bytes_by_kind.items())},
             "mib_by_group": {k: round(v / (1024 * 1024), 2) for k, v in sorted(bytes_by_group.items())},
         }
+
+    def clear_runtime_caches(self) -> None:
+        for obj in self.cache.values():
+            clear = getattr(obj, "clear_runtime_cache", None)
+            if callable(clear):
+                clear()
 
     def has(self, name: str) -> bool:
         return name in self.index.get("tensors", {})

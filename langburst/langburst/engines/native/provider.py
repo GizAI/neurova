@@ -95,6 +95,7 @@ class NativeBackend:
             max_prefill_rows_per_batch=self._resource_policy.max_prefill_rows_per_batch,
             decode_prefill_interleave_steps=self._resource_policy.decode_prefill_interleave_steps,
             block_table=block_table,
+            kv_window_tokens=engine.recent_window,
         )
         runner = BatchedModelRunner(
             engine=engine,

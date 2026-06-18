@@ -294,6 +294,49 @@ def test_batched_model_runner_memory_gate_blocks_next_draft(tmp_path: Path):
     assert row.draft_token_ids_tensor is None
 
 
+def test_batched_model_runner_overflow_row_blocks_next_draft(tmp_path: Path):
+    engine = RuntimeEngine(
+        adapter=ToyAdapter(),
+        hf_model=tmp_path,
+        qb_model=tmp_path,
+        device="cpu",
+        recent_window=4,
+        weight_device="cpu",
+    )
+
+    class Proposer:
+        def __init__(self):
+            self.calls = 0
+
+        def propose_tensors_batch(self, requests):
+            self.calls += 1
+            return torch.tensor([[4]], dtype=torch.long)
+
+    proposer = Proposer()
+    engine.speculative_proposer = proposer
+    runner = BatchedModelRunner(
+        engine=engine,
+        scheduler=ContinuousBatchScheduler(
+            max_num_requests=1,
+            max_num_batched_tokens=4,
+            prefill_chunk_size=2,
+            kv_window_tokens=4,
+        ),
+    )
+    runner.features = runner.features.with_overrides(speculative_decoding=True)
+    row = runner.add_request("a", [1, 2, 3, 4, 5, 6], generation_config=GenerationConfig(ignore_eos=True))
+    state = runner.state_store.get(row.state_index)
+    state.last_raw_hidden = torch.ones((4,))
+    row.computed_tokens = 6
+    row.last_sampled_token = 1
+
+    runner._prepare_native_nextn_drafts([row], [state], [1], [0])
+
+    assert proposer.calls == 0
+    assert row.draft_token_ids is None
+    assert row.draft_token_ids_tensor is None
+
+
 def test_batched_model_runner_requires_committed_verify_batch(tmp_path: Path):
     class RejectVerifyModel(ToyModel):
         def __init__(self):

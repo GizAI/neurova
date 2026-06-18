@@ -25,6 +25,10 @@ from .cuda_graph import CudaGraphBucketPlanner
 from .resource_policy import EngineResourcePolicy
 
 
+class RuntimeMemoryPressure(RuntimeError):
+    """Raised when a loaded runtime is below the execution headroom watermark."""
+
+
 @dataclass(frozen=True)
 class ModelResourceSpec:
     """Declarative model entry for multi-model serving."""
@@ -120,6 +124,9 @@ class EngineManager:
             max_active_requests=self.policy.max_active_requests,
             max_queued_requests=self.policy.max_queued_requests,
             admission_timeout_s=self.policy.admission_timeout_s,
+            context_tiers=self.policy.context_tiers,
+            context_tier_slots=self.policy.context_tier_slots,
+            allow_context_overflow=self.policy.allow_context_overflow,
         )
         paged_kv_enabled = _env_enabled("LANGBURST_PAGED_KV", default=True)
         self.kv_block_table = (
@@ -139,6 +146,7 @@ class EngineManager:
             decode_prefill_interleave_steps=self.policy.decode_prefill_interleave_steps,
             block_table=self.kv_block_table,
             cuda_graph_planner=self.cuda_graph_planner,
+            kv_window_tokens=self.exact_kv_window_tokens,
         )
         self._batch_runners: dict[tuple[str, tuple[tuple[str, object], ...]], BatchedModelRunner] = {}
         self._batch_workers: dict[tuple[str, tuple[tuple[str, object], ...]], BatchGenerationWorker] = {}
@@ -346,12 +354,14 @@ class EngineManager:
         adapter = adapter_registry.get(spec.adapter_id)
         return resolve_runtime_plan(features or spec.runtime_features, adapter.descriptor.capabilities)
 
-    def acquire_request(self):
-        return self.admission.acquire()
+    def acquire_request(self, *, prompt_tokens: int | None = None, engine: RuntimeEngine | None = None):
+        if engine is None:
+            return self.admission.acquire(prompt_tokens=prompt_tokens)
+        return _RuntimeRequestLease(self, engine=engine, prompt_tokens=prompt_tokens)
 
     def create_batch_runner(self, model_name: str | None = None, features: RuntimeFeatures | None = None) -> BatchedModelRunner:
         engine = self.get(model_name)
-        resolved = engine.resolve_plan(engine.features).effective
+        resolved = engine.resolve_plan(features or engine.features).effective
         key = (engine.model_name, self._batch_resource_key(resolved))
         with self._lock:
             runner = self._batch_runners.get(key)
@@ -367,7 +377,7 @@ class EngineManager:
 
     def create_batch_worker(self, model_name: str | None = None, features: RuntimeFeatures | None = None) -> BatchGenerationWorker:
         engine = self.get(model_name)
-        resolved = engine.resolve_plan(engine.features).effective
+        resolved = engine.resolve_plan(features or engine.features).effective
         key = (engine.model_name, self._batch_resource_key(resolved))
         with self._lock:
             worker = self._batch_workers.get(key)
@@ -441,7 +451,11 @@ class EngineManager:
             raise ValueError("prompt must contain at least one token")
         if generation_tokens < 1:
             raise ValueError("max generation tokens must be >= 1")
-        if self.policy.max_prompt_tokens is not None and prompt_tokens > self.policy.max_prompt_tokens:
+        if (
+            not self.policy.allow_context_overflow
+            and self.policy.max_prompt_tokens is not None
+            and prompt_tokens > self.policy.max_prompt_tokens
+        ):
             raise ValueError(
                 f"prompt too long: tokens={prompt_tokens} max_prompt_tokens={self.policy.max_prompt_tokens}"
             )
@@ -451,9 +465,23 @@ class EngineManager:
                 f"max_generation_tokens={self.policy.max_generation_tokens}"
             )
 
-    def validate_runtime_memory(self, engine: RuntimeEngine) -> None:
+    @property
+    def exact_kv_window_tokens(self) -> int:
+        if self.policy.context_tiers:
+            return int(self.policy.context_tiers[-1])
+        if self.policy.max_prompt_tokens is not None:
+            return int(self.policy.max_prompt_tokens)
+        return int(self.policy.kv_blocks * self.policy.kv_block_size)
+
+    def effective_admission_tokens(self, *, prompt_tokens: int, generation_tokens: int = 0) -> int:
+        if self.policy.allow_context_overflow:
+            return min(int(prompt_tokens), self.exact_kv_window_tokens) + int(generation_tokens)
+        return int(prompt_tokens) + int(generation_tokens)
+
+    def validate_runtime_memory(self, engine: RuntimeEngine, *, active_requests: int = 1) -> None:
         if not str(engine.device).startswith("cuda") or not torch.cuda.is_available():
             return
+        execution_reserve_mib = self.policy.reserve_free_vram_mib * max(1, int(active_requests))
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
@@ -477,16 +505,23 @@ class EngineManager:
         loaded_weight = engine.model_name in self._engines
         arena_allocated = any(key[0] == engine.model_name for key in self._batch_runners)
         if arena_allocated:
-            # Once the model and runtime arena are already allocated, low free
-            # VRAM is expected on 16GB cards.  Do not reject a request merely
-            # because the reserve watermark is below target; the admission
-            # controller already serializes active requests and the paged/ring
-            # KV contract bounds per-request memory.  Real OOMs are handled at
-            # execution time where the runtime can clear pools and recover.
-            if self.policy.reserve_free_vram_mib > 0 and free_mib < self.policy.reserve_free_vram_mib:
+            if execution_reserve_mib > 0 and free_mib < execution_reserve_mib:
+                clear_model_caches = getattr(getattr(engine, "model", None), "clear_runtime_caches", None)
+                if callable(clear_model_caches):
+                    clear_model_caches()
                 gc.collect()
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
+                free_bytes, _ = torch.cuda.mem_get_info()
+                free_mib = free_bytes // (1024 * 1024)
+            if execution_reserve_mib > 0 and free_mib < execution_reserve_mib:
+                raise RuntimeMemoryPressure(
+                    f"insufficient free GPU memory for active runtime: free={free_mib} MiB "
+                    f"required={execution_reserve_mib} MiB "
+                    f"reserve={self.policy.reserve_free_vram_mib} MiB "
+                    f"active_requests={max(1, int(active_requests))}. "
+                    "Wait for current requests, reduce LANGBURST_CONTEXT_TIERS, or lower generation limits."
+                )
             return
         if loaded_weight:
             required_mib = state_mib + self.policy.runtime_overhead_mib + self.policy.reserve_free_vram_mib
@@ -546,6 +581,44 @@ class EngineManager:
                 status.last_error = str(exc)
                 if status.state != "loaded":
                     status.state = "unloaded"
+
+
+class _RuntimeRequestLease:
+    def __init__(self, manager: EngineManager, *, engine: RuntimeEngine, prompt_tokens: int | None) -> None:
+        self.manager = manager
+        self.engine = engine
+        self.prompt_tokens = prompt_tokens
+        self._lease = None
+
+    def __enter__(self):
+        timeout_s = self.manager.policy.admission_timeout_s
+        deadline = None if timeout_s is None else time.monotonic() + max(0.0, timeout_s)
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            active_before = self.manager.admission.stats().active_requests
+            lease = self.manager.admission.acquire(timeout_s=remaining, prompt_tokens=self.prompt_tokens)
+            lease.__enter__()
+            try:
+                active_after = self.manager.admission.stats().active_requests
+                self.manager.validate_runtime_memory(self.engine, active_requests=active_after)
+            except RuntimeMemoryPressure as exc:
+                lease.__exit__(None, None, None)
+                if active_before <= 0:
+                    raise
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(str(exc)) from exc
+                time.sleep(0.05)
+                continue
+            except Exception:
+                lease.__exit__(None, None, None)
+                raise
+            self._lease = lease
+            return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._lease is not None:
+            self._lease.__exit__(exc_type, exc, tb)
+            self._lease = None
 
 
 def load_model_specs(path: Path, default_features: RuntimeFeatures) -> list[ModelResourceSpec]:

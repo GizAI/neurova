@@ -88,6 +88,7 @@ def run_serving_case(
         prefill_chunk_size=case.prefill_chunk_size,
         max_prefill_rows_per_batch=case.max_prefill_rows_per_batch,
         block_table=block_table,
+        kv_window_tokens=recent_window,
     )
     runner = BatchedModelRunner(engine=engine, scheduler=scheduler)
     worker = BatchGenerationWorker(

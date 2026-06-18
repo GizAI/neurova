@@ -288,6 +288,7 @@ class DecodeRequestState:
     prefix_cache_enabled: bool = True
     generation_config: Any | None = None
     sample_index: int = 0
+    kv_window_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.prefill_len is None:
@@ -296,6 +297,12 @@ class DecodeRequestState:
     @property
     def total_len(self) -> int:
         return len(self.token_ids)
+
+    @property
+    def kv_token_capacity(self) -> int:
+        if self.kv_window_tokens is None:
+            return len(self.token_ids)
+        return min(len(self.token_ids), int(self.kv_window_tokens))
 
     @property
     def prefill_remaining(self) -> int:

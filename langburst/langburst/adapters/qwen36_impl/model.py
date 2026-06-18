@@ -14,7 +14,7 @@ from ...core.kv_cache import hadamard_transform, pack_int4_rows, unpack_int4_row
 from ...ops import cuda_ops
 from ...engines.native.cuda_graph import CudaGraphKey, CudaGraphReplayCache
 from .state import DecodeState
-from ...speculative_batch import DecodeBatchPlan, resolve_speculative_gpu
+from ...speculative_batch import DecodeBatchPlan, NativeSpecDecodeMetadata, resolve_speculative_gpu
 from ...tuning import (
     attention_recent_tokens,
     batch_conv_kernels_enabled,
@@ -26,8 +26,10 @@ from ...tuning import (
     paged_attention_kernels_enabled,
     paged_prefill_block_enabled,
     prefill_attention_policy,
+    verify_full_logits_enabled,
     verify_nextn_mode,
 )
+from ...profiling import decode_profile_scope
 
 TensorLike = LowBitTensor | LowBitMarlinTensor | FP16Tensor
 
@@ -79,6 +81,34 @@ class VerifyBlockResult:
     state: DecodeState
     state_already_committed: bool = False
     speculative_decision: object | None = None
+    raw_hidden: torch.Tensor | None = None
+
+
+@dataclass
+class _VerifyGraphStaticBuffers:
+    """Fixed device tensors closed over by a verifier CUDA graph.
+
+    All tensors here have stable storage for the lifetime of the captured graph.
+    Dynamic per-step data is copied into these buffers before replay; the graph
+    itself only reads/writes the static buffers and arena tensors.
+    """
+
+    key: CudaGraphKey
+    token_matrix: torch.Tensor
+    positions: torch.Tensor
+    query_start_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    logits_indices: torch.Tensor
+    cu_num_logits: torch.Tensor
+    state_indices: torch.Tensor
+    slot_mapping: torch.Tensor
+    block_tables: torch.Tensor
+    row_lengths: torch.Tensor
+    draft_token_ids: torch.Tensor
+    zero_commit: torch.Tensor
+    metadata: NativeSpecDecodeMetadata
+    static_plan: DecodeBatchPlan
+    results: list[VerifyBlockResult] | None = None
 
 
 class WeightResolver:
@@ -195,15 +225,102 @@ def lowbit_linear_pair_on_device(a: LowBitTensor, b: LowBitTensor, x: torch.Tens
     return lowbit_linear_on_device(a, x, device), lowbit_linear_on_device(b, x, device)
 
 
-def linear_any(w: TensorLike, x: torch.Tensor) -> torch.Tensor:
-    if isinstance(w, (LowBitTensor, LowBitMarlinTensor)):
-        if x.ndim == 2:
-            return w.gemm(x.to(device=x.device, dtype=torch.float16).contiguous())
-        return lowbit_linear_on_device(w, x, x.device)
-    if x.ndim == 2:
-        return torch.matmul(x.to(device=x.device, dtype=w.value.dtype), w.value.to(device=x.device).t())
-    return torch.matmul(w.value.to(device=x.device, dtype=x.dtype), x)
+def marlin_internal_argmax_enabled() -> bool:
+    # The extension path is available, but current Q4 MTP acceptance regresses
+    # when it drives proposer selection.  Keep it opt-in until parity/speed are
+    # both proven on the champion bucket.
+    return os.environ.get("LANGBURST_MARLIN_INTERNAL_ARGMAX", "0").strip().lower() in {"1", "true", "on", "yes"}
 
+
+def linear_any(w: TensorLike, x: torch.Tensor, *, profile: str | None = None) -> torch.Tensor:
+    with decode_profile_scope(profile):
+        if isinstance(w, (LowBitTensor, LowBitMarlinTensor)):
+            if x.ndim == 2:
+                return w.gemm(x.to(device=x.device, dtype=torch.float16).contiguous())
+            return lowbit_linear_on_device(w, x, x.device)
+        if x.ndim == 2:
+            return torch.matmul(x.to(device=x.device, dtype=w.value.dtype), w.value.to(device=x.device).t())
+        return torch.matmul(w.value.to(device=x.device, dtype=x.dtype), x)
+
+
+def _can_lowbit_pair(a: TensorLike, b: TensorLike, x: torch.Tensor) -> bool:
+    return (
+        isinstance(a, LowBitTensor)
+        and isinstance(b, LowBitTensor)
+        and (x.ndim == 1 or (x.ndim == 2 and int(x.size(0)) == 1))
+        and a.qweight.device.type == "cuda"
+        and b.qweight.device == a.qweight.device
+        and int(a.cols) == int(b.cols)
+        and int(a.group_size) == int(b.group_size)
+        and int(a.bits) == int(b.bits)
+    )
+
+
+def _can_fp16_concat_pair(a: TensorLike, b: TensorLike) -> bool:
+    return isinstance(a, FP16Tensor) and isinstance(b, FP16Tensor)
+
+
+def linear_pair_any(
+    a: TensorLike,
+    b: TensorLike,
+    x: torch.Tensor,
+    *,
+    profile: str | None = None,
+    profile_a: str | None = None,
+    profile_b: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project the same activation through two weights without caller-side duplication.
+
+    CUDA rowwise low-bit uses the existing dual-GEMV kernel for single-token
+    decode.  FP16 weights are concatenated into one matmul.  Marlin/other cases
+    keep the stable individual GEMM path while still centralizing profiling and
+    shape policy here.
+    """
+
+    if _can_lowbit_pair(a, b, x):
+        with decode_profile_scope(profile or f"{profile_a or 'linear_a'}+{profile_b or 'linear_b'}"):
+            xa = x.reshape(-1) if x.ndim == 2 else x
+            ya, yb = lowbit_linear_pair_on_device(a, b, xa, x.device)  # type: ignore[arg-type]
+            if x.ndim == 2:
+                return ya.reshape(1, -1).contiguous(), yb.reshape(1, -1).contiguous()
+            return ya, yb
+    if _can_fp16_concat_pair(a, b):
+        with decode_profile_scope(profile or f"{profile_a or 'linear_a'}+{profile_b or 'linear_b'}"):
+            wa = a.value.to(device=x.device)  # type: ignore[union-attr]
+            wb = b.value.to(device=x.device)  # type: ignore[union-attr]
+            weight = torch.cat([wa, wb], dim=0).contiguous()
+            rows_a = int(wa.size(0))
+            if x.ndim == 2:
+                mixed = torch.matmul(x.to(device=x.device, dtype=weight.dtype), weight.t())
+                return mixed[..., :rows_a].contiguous(), mixed[..., rows_a:].contiguous()
+            mixed = torch.matmul(weight.to(dtype=x.dtype), x)
+            return mixed[:rows_a].contiguous(), mixed[rows_a:].contiguous()
+    return (
+        linear_any(a, x, profile=profile_a),
+        linear_any(b, x, profile=profile_b),
+    )
+
+
+def linear_argmax_any(w: TensorLike, x: torch.Tensor, out: torch.Tensor | None = None, *, profile: str | None = None) -> torch.Tensor:
+    with decode_profile_scope(profile):
+        if isinstance(w, LowBitMarlinTensor) and x.device.type == "cuda" and marlin_internal_argmax_enabled():
+            return w.gemm_argmax(x, out=out)
+        logits = linear_any(w, x).contiguous()
+        if logits.device.type == "cuda":
+            if logits.ndim == 1:
+                if out is not None:
+                    cuda_ops().argmax_many_out(logits.reshape(1, -1), out.reshape(1))
+                    return out.reshape(1)
+                return cuda_ops().argmax(logits).reshape(1).to(device=logits.device, dtype=torch.long)
+            if out is not None:
+                cuda_ops().argmax_many_out(logits, out.reshape(logits.size(0)))
+                return out.reshape(logits.size(0))
+            return cuda_ops().argmax_many(logits).to(device=logits.device, dtype=torch.long)
+        ids = torch.argmax(logits, dim=-1).reshape(-1).to(dtype=torch.long)
+        if out is not None:
+            out.reshape(-1).copy_(ids.to(device=out.device))
+            return out.reshape(-1)
+        return ids
 
 def tensor_rows(w: TensorLike) -> int:
     if isinstance(w, LowBitMarlinTensor):
@@ -230,6 +347,24 @@ def qwen_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Ten
     return cuda_ops().rmsnorm_qwen(x.contiguous(), weight.to(device=x.device, dtype=x.dtype).contiguous(), eps)
 
 
+def qwen_rmsnorm_pair_cat(
+    x0: torch.Tensor,
+    weight0: torch.Tensor,
+    x1: torch.Tensor,
+    weight1: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    x0_c = x0.contiguous()
+    x1_c = x1.to(device=x0_c.device, dtype=x0_c.dtype).contiguous()
+    w0_c = weight0.to(device=x0_c.device, dtype=x0_c.dtype).contiguous()
+    w1_c = weight1.to(device=x0_c.device, dtype=x0_c.dtype).contiguous()
+    if x0_c.device.type == "cuda" and x0_c.dtype == torch.float16 and x1_c.dtype == torch.float16:
+        op = getattr(cuda_ops(), "rmsnorm_qwen_pair_cat", None)
+        if callable(op):
+            return op(x0_c, w0_c, x1_c, w1_c, eps)
+    return torch.cat([qwen_rmsnorm(x0_c, w0_c, eps), qwen_rmsnorm(x1_c, w1_c, eps)], dim=-1).contiguous()
+
+
 def qwen_rmsnorm_lastdim(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Apply Qwen RMSNorm over the last dimension using the common op path."""
     shape = x.shape
@@ -240,6 +375,26 @@ def qwen_rmsnorm_lastdim(x: torch.Tensor, weight: torch.Tensor, eps: float) -> t
         eps,
     )
     return y.reshape(shape).contiguous()
+
+
+def qwen_rmsnorm_rope_lastdim(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    pos: int,
+    rope_dim: int,
+    rope_theta: float,
+    eps: float,
+) -> torch.Tensor:
+    shape = x.shape
+    hidden = shape[-1]
+    x_c = x.reshape(-1, hidden).contiguous()
+    weight_c = weight.to(device=x.device, dtype=x.dtype).contiguous()
+    op = getattr(cuda_ops(), "rmsnorm_qwen_rope", None)
+    if x_c.device.type == "cuda" and x_c.dtype == torch.float16 and callable(op):
+        return op(x_c, weight_c, int(pos), int(rope_dim), float(rope_theta), eps).reshape(shape).contiguous()
+    y = qwen_rmsnorm_lastdim(x, weight_c, eps)
+    return apply_rope_single_tensor(y, pos=pos, rope_dim=rope_dim, rope_theta=rope_theta).contiguous()
 
 
 def qwen_gdn_norm_silu_gate(core: torch.Tensor, weight: torch.Tensor, z: torch.Tensor, eps: float) -> torch.Tensor:
@@ -299,29 +454,61 @@ def silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return (F.silu(gate.float()) * up.float()).to(gate.dtype)
 
 
-def apply_rope_single_token(q: torch.Tensor, k: torch.Tensor, *, pos: int, rope_dim: int, rope_theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+def silu_mul_packed(mixed: torch.Tensor, hidden: int) -> torch.Tensor:
+    if mixed.device.type == "cuda" and mixed.dtype == torch.float16 and mixed.is_contiguous():
+        op = getattr(cuda_ops(), "silu_mul_packed", None)
+        if callable(op):
+            return op(mixed, int(hidden))
+    gate, up = torch.split(mixed, [int(hidden), int(hidden)], dim=-1)
+    return silu_mul(gate, up)
+
+
+def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    x_c = x.contiguous()
+    gate_c = gate.to(device=x_c.device, dtype=x_c.dtype).contiguous()
+    if x_c.device.type == "cuda" and x_c.dtype == torch.float16:
+        op = getattr(cuda_ops(), "sigmoid_mul", None)
+        if callable(op):
+            return op(x_c, gate_c)
+    return (x_c.float() * torch.sigmoid(gate_c.float())).to(x_c.dtype).contiguous()
+
+
+def sigmoid_mul_repeat_kv(v: torch.Tensor, gate: torch.Tensor, ratio: int) -> torch.Tensor:
+    v_c = v.contiguous()
+    gate_c = gate.to(device=v_c.device, dtype=v_c.dtype).contiguous()
+    if v_c.device.type == "cuda" and v_c.dtype == torch.float16:
+        op = getattr(cuda_ops(), "sigmoid_mul_repeat_kv", None)
+        if callable(op):
+            return op(v_c, gate_c, int(ratio))
+    return (v_c.repeat_interleave(int(ratio), dim=1).reshape(gate_c.size(0), -1).float() * torch.sigmoid(gate_c.reshape(gate_c.size(0), -1).float())).to(v_c.dtype).contiguous()
+
+
+def apply_rope_single_tensor(x: torch.Tensor, *, pos: int, rope_dim: int, rope_theta: float) -> torch.Tensor:
     if rope_dim <= 0:
-        return q, k
+        return x
     if rope_dim % 2 != 0:
         raise ValueError("rope_dim must be even")
-    if rope_dim > q.size(-1) or rope_dim > k.size(-1):
-        raise ValueError("rope_dim cannot exceed q/k head_dim")
-    device = q.device
+    if rope_dim > x.size(-1):
+        raise ValueError("rope_dim cannot exceed head_dim")
+    device = x.device
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rope_dim, 2, device=device, dtype=torch.float32) / rope_dim))
     freqs = float(pos) * inv_freq
     emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos().to(q.dtype)
-    sin = emb.sin().to(q.dtype)
+    cos = emb.cos().to(x.dtype)
+    sin = emb.sin().to(x.dtype)
+    x_rope = x[..., :rope_dim]
+    x_pass = x[..., rope_dim:]
+    half = rope_dim // 2
+    rotated = torch.cat((-x_rope[..., half:], x_rope[..., :half]), dim=-1)
+    y = x_rope * cos + rotated * sin
+    return torch.cat([y, x_pass], dim=-1) if x_pass.numel() else y
 
-    def rotate(x: torch.Tensor) -> torch.Tensor:
-        x_rope = x[..., :rope_dim]
-        x_pass = x[..., rope_dim:]
-        half = rope_dim // 2
-        rotated = torch.cat((-x_rope[..., half:], x_rope[..., :half]), dim=-1)
-        y = x_rope * cos + rotated * sin
-        return torch.cat([y, x_pass], dim=-1) if x_pass.numel() else y
 
-    return rotate(q), rotate(k)
+def apply_rope_single_token(q: torch.Tensor, k: torch.Tensor, *, pos: int, rope_dim: int, rope_theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        apply_rope_single_tensor(q, pos=pos, rope_dim=rope_dim, rope_theta=rope_theta),
+        apply_rope_single_tensor(k, pos=pos, rope_dim=rope_dim, rope_theta=rope_theta),
+    )
 
 
 def apply_rope_block(
@@ -387,6 +574,28 @@ def apply_rope_decode_batch(
         return torch.cat([y, x_pass], dim=-1) if x_pass.numel() else y
 
     return rotate(q).contiguous(), rotate(k).contiguous()
+
+
+def attention_decode_gated_any(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    gate: torch.Tensor,
+    length: int,
+    scale: float,
+) -> torch.Tensor:
+    if (
+        q.device.type == "cuda"
+        and q.dtype == torch.float16
+        and gate.dtype == torch.float16
+        and k_cache.dtype == torch.float16
+        and v_cache.dtype == torch.float16
+        and q.size(-1) == 256
+    ):
+        op = getattr(cuda_ops(), "attention_decode_fp16_gated", None)
+        if callable(op):
+            return op(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), gate.contiguous(), int(length), scale)
+    return sigmoid_mul(attention_decode_any(q, k_cache, v_cache, length, scale).reshape(-1), gate.reshape(-1))
 
 
 def attention_decode_any(
@@ -1008,6 +1217,30 @@ def _arena_batch(states: Sequence[DecodeState]) -> tuple[object, torch.Tensor] |
     return arena, torch.tensor(slots, device=device, dtype=torch.long)
 
 
+def _arena_batch_for_plan(states: Sequence[DecodeState], plan: Any | None) -> tuple[object, torch.Tensor] | None:
+    """Return arena and state slots, preferring graph/static plan buffers.
+
+    CUDA graph replay must not close over a freshly allocated state-index tensor
+    derived from Python DecodeState objects.  When a plan carries state_indices,
+    use that tensor so callers can point it at a static buffer and update it via
+    copy_ before replay.
+    """
+
+    if not states:
+        return None
+    arena = getattr(states[0], "arena", None)
+    if arena is None:
+        return None
+    for state in states:
+        if getattr(state, "arena", None) is not arena:
+            return None
+    plan_indices = getattr(plan, "state_indices", None) if plan is not None else None
+    if torch.is_tensor(plan_indices):
+        device = next(iter(states[0].gdn_states.values())).device
+        return arena, plan_indices.to(device=device, dtype=torch.long).reshape(-1).contiguous()
+    return _arena_batch(states)
+
+
 def _arena_positions(arena: object, state_indices: torch.Tensor, *, device: torch.device) -> torch.Tensor:
     pos = getattr(arena, "pos", None)
     if not torch.is_tensor(pos):
@@ -1111,31 +1344,109 @@ class Qwen36MLP:
                 raise ValueError("either layer or prefix is required")
             prefix = f"model.layers.{layer}"
         p = f"{prefix}.mlp"
+        self.profile_prefix = "mtp_" if str(prefix).startswith("mtp.") else ""
         self.gate_up = w.optional(f"{p}.gate_up_proj.weight")
         self.gate = None if self.gate_up is not None else w.any_linear(f"{p}.gate_proj.weight")
         self.up = None if self.gate_up is not None else w.any_linear(f"{p}.up_proj.weight")
         self.down = w.any_linear(f"{p}.down_proj.weight")
         self.intermediate_size = tensor_rows(self.gate_up) // 2 if self.gate_up is not None else tensor_rows(self.gate)  # type: ignore[arg-type]
+        self._stream_out_cache: dict[int, torch.Tensor] = {}
+        self._stream_accum_cache: dict[int, torch.Tensor] = {}
+        self._stream_sync_cache: dict[int, torch.Tensor] = {}
+        self._stream_epoch = 0
+
+    @property
+    def _gate_up_label(self) -> str:
+        return f"{self.profile_prefix}mlp_gate_up"
+
+    @property
+    def _down_label(self) -> str:
+        return f"{self.profile_prefix}mlp_down"
+
+    def _activation(self, x: torch.Tensor) -> torch.Tensor:
+        if self.gate_up is not None:
+            mixed = linear_any(self.gate_up, x, profile=self._gate_up_label)
+            return silu_mul_packed(mixed, self.intermediate_size)
+        gate, up = linear_pair_any(
+            self.gate,  # type: ignore[arg-type]
+            self.up,  # type: ignore[arg-type]
+            x,
+            profile=self._gate_up_label,
+            profile_a=f"{self.profile_prefix}mlp_gate",
+            profile_b=f"{self.profile_prefix}mlp_up",
+        )
+        return silu_mul(gate, up)
+
+
+    def _streaming_mlp_scalar_reference(self, x: torch.Tensor) -> torch.Tensor | None:
+        if not (isinstance(self.gate_up, LowBitMarlinTensor) and isinstance(self.down, LowBitMarlinTensor)):
+            return None
+        if x.device.type != "cuda":
+            return None
+        if os.environ.get("LANGBURST_MLP_SCALAR_STREAMING_DEBUG", "0").strip().lower() not in {"1", "true", "on", "yes"}:
+            return None
+        x2 = x.reshape(1, -1) if x.ndim == 1 else x
+        if x2.ndim != 2:
+            return None
+        hidden = int(x2.size(1))
+        intermediate = int(self.intermediate_size)
+        if hidden != int(self.gate_up.cols) or intermediate != int(self.down.cols):
+            return None
+        batch = int(x2.size(0))
+        out = self._stream_out_cache.get(batch)
+        if out is None or out.device != x2.device or out.shape != (batch, hidden):
+            out = torch.empty((batch, hidden), device=x2.device, dtype=torch.float16)
+            self._stream_out_cache[batch] = out
+        accum = self._stream_accum_cache.get(batch)
+        if accum is None or accum.device != x2.device or accum.shape != (batch, hidden):
+            accum = torch.empty((batch, hidden), device=x2.device, dtype=torch.float32)
+            self._stream_accum_cache[batch] = accum
+        sync = self._stream_sync_cache.get(batch)
+        if sync is None or sync.device != x2.device or sync.numel() < 2 * batch:
+            sync = torch.empty((2 * batch,), device=x2.device, dtype=torch.int32)
+            self._stream_sync_cache[batch] = sync
+        self._stream_epoch = 1 if self._stream_epoch >= 2_000_000_000 else self._stream_epoch + 1
+        with decode_profile_scope(f"{self.profile_prefix}streaming_mlp_scalar_reference"):
+            cuda_ops().lowbit_marlin_mlp_streaming_out(
+                self.gate_up.qweight,
+                self.gate_up.scales,
+                self.down.qweight,
+                self.down.scales,
+                x2.to(device=x2.device, dtype=torch.float16).contiguous(),
+                out,
+                accum,
+                sync,
+                self._stream_epoch,
+                hidden,
+                intermediate,
+                self.gate_up.group_size,
+                self.down.group_size,
+            )
+        return out.reshape(-1) if x.ndim == 1 else out
+
+    def _fused_marlin_down(self, x: torch.Tensor) -> torch.Tensor | None:
+        if (
+            os.environ.get("LANGBURST_MLP_TENSORCORE_DOWN_SILU_A", "0").strip().lower() in {"1", "true", "on", "yes"}
+            and isinstance(self.gate_up, LowBitMarlinTensor)
+            and isinstance(self.down, LowBitMarlinTensor)
+            and x.device.type == "cuda"
+        ):
+            with decode_profile_scope(f"{self.profile_prefix}mlp_gate_up+down_silu_a"):
+                mixed = linear_any(self.gate_up, x)
+                return self.down.gemm_silu_packed(mixed, self.intermediate_size)
+        return None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if self.gate_up is not None:
-            mixed = linear_any(self.gate_up, x)
-            gate, up = torch.split(mixed, [self.intermediate_size, self.intermediate_size], dim=-1)
-        elif isinstance(self.gate, LowBitTensor) and isinstance(self.up, LowBitTensor):
-            gate, up = lowbit_linear_pair_on_device(self.gate, self.up, x, x.device)
-        else:
-            gate = linear_any(self.gate, x)
-            up = linear_any(self.up, x)
-        return linear_any(self.down, silu_mul(gate, up))
+        fused = self._fused_marlin_down(x)
+        if fused is not None:
+            return fused.reshape(-1) if x.ndim == 1 else fused
+        return linear_any(self.down, self._activation(x), profile=self._down_label)
 
     def forward_block(self, x: torch.Tensor) -> torch.Tensor:
-        if self.gate_up is not None:
-            mixed = linear_any(self.gate_up, x)
-            gate, up = torch.split(mixed, [self.intermediate_size, self.intermediate_size], dim=-1)
-        else:
-            gate = linear_any(self.gate, x)
-            up = linear_any(self.up, x)
-        return linear_any(self.down, silu_mul(gate, up))
+        fused = self._fused_marlin_down(x)
+        if fused is not None:
+            return fused.reshape(-1) if x.ndim == 1 else fused
+        return linear_any(self.down, self._activation(x), profile=self._down_label)
 
 
 class Qwen36GDNLayer:
@@ -1171,26 +1482,50 @@ class Qwen36GDNLayer:
         self.dt_bias = weights.fp16(*(f"{la}.dt_bias" for la in la_candidates)).to(device=device, dtype=torch.float32).contiguous()
         self.mlp = Qwen36MLP(cfg, weights, layer)
 
+    def _project_ba_pair(self, x: torch.Tensor, *, batched: bool) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Q4 fused checkpoints may contain both fp16 in_proj_ba and the split
+        # low-bit in_proj_b/in_proj_a tensors.  The fp16 fused tensor is a
+        # compatibility path; for decode throughput the split low-bit pair is
+        # usually better and matches the original all-low-bit Q4 profile.
+        prefer_split_pair = (
+            os.environ.get("LANGBURST_GDN_BA_LOWBIT_PAIR", "0").strip().lower() in {"1", "true", "on", "yes"}
+            and self.in_b is not None
+            and self.in_a is not None
+        )
+        if self.in_ba is not None and not prefer_split_pair:
+            return linear_any(self.in_ba, x, profile="gdn_ba")
+        if self.in_b is None or self.in_a is None:
+            if self.in_ba is not None:
+                return linear_any(self.in_ba, x, profile="gdn_ba")
+            raise RuntimeError("GDN BA projection weights are missing")
+        b, a = linear_pair_any(
+            self.in_b,
+            self.in_a,
+            x,
+            profile="gdn_ba",
+            profile_a="gdn_b",
+            profile_b="gdn_a",
+        )
+        if batched:
+            return torch.cat([b.reshape(x.size(0), -1), a.reshape(x.size(0), -1)], dim=-1)
+        return b, a
+
     def project(self, x: torch.Tensor):
         if self.in_qkvz is not None:
-            mixed_qkvz = linear_any(self.in_qkvz, x)
-            if self.in_ba is not None:
-                mixed_ba = linear_any(self.in_ba, x)
-            elif isinstance(self.in_a, LowBitTensor) and isinstance(self.in_b, LowBitTensor):
-                a, b = lowbit_linear_pair_on_device(self.in_a, self.in_b, x, x.device)
-                mixed_ba = torch.cat([b.reshape(-1), a.reshape(-1)], dim=0)
-            else:
-                b = linear_any(self.in_b, x)  # type: ignore[arg-type]
-                a = linear_any(self.in_a, x)  # type: ignore[arg-type]
-                mixed_ba = torch.cat([b.reshape(-1), a.reshape(-1)], dim=0)
+            mixed_qkvz = linear_any(self.in_qkvz, x, profile="gdn_qkvz")
+            ba = self._project_ba_pair(x, batched=False)
+            if torch.is_tensor(ba):
+                return split_gdn_fused_qkvz(self.cfg, mixed_qkvz, ba)
+            b, a = ba
+            mixed_ba = torch.cat([b.reshape(-1), a.reshape(-1)], dim=0).contiguous()
             return split_gdn_fused_qkvz(self.cfg, mixed_qkvz, mixed_ba)
-        q, k, v = split_gdn_qkv(self.cfg, linear_any(self.in_qkv, x))  # type: ignore[arg-type]
-        z = linear_any(self.in_z, x).view(self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim)  # type: ignore[arg-type]
-        if isinstance(self.in_a, LowBitTensor) and isinstance(self.in_b, LowBitTensor):
-            a, b = lowbit_linear_pair_on_device(self.in_a, self.in_b, x, x.device)
+        q, k, v = split_gdn_qkv(self.cfg, linear_any(self.in_qkv, x, profile="gdn_qkvz"))  # type: ignore[arg-type]
+        z = linear_any(self.in_z, x, profile="gdn_z").view(self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim)  # type: ignore[arg-type]
+        ba = self._project_ba_pair(x, batched=False)
+        if torch.is_tensor(ba):
+            b, a = torch.split(ba, [self.cfg.linear_num_value_heads, self.cfg.linear_num_value_heads], dim=-1)
         else:
-            a = linear_any(self.in_a, x)  # type: ignore[arg-type]
-            b = linear_any(self.in_b, x)  # type: ignore[arg-type]
+            b, a = ba
         a = a.reshape(self.cfg.linear_num_value_heads)
         b = b.reshape(self.cfg.linear_num_value_heads)
         return q.contiguous(), k.contiguous(), v.contiguous(), z.contiguous(), b.contiguous(), a.contiguous()
@@ -1200,29 +1535,22 @@ class Qwen36GDNLayer:
         key_dim = self.cfg.linear_key_head_dim * self.cfg.linear_num_key_heads
         value_dim = self.cfg.linear_value_head_dim * self.cfg.linear_num_value_heads
         if self.in_qkvz is not None:
-            mixed_qkvz = linear_any(self.in_qkvz, x)
-            if self.in_ba is not None:
-                mixed_ba = linear_any(self.in_ba, x)
-            elif x.size(0) == 1 and isinstance(self.in_a, LowBitTensor) and isinstance(self.in_b, LowBitTensor):
-                a1, b1 = lowbit_linear_pair_on_device(self.in_a, self.in_b, x.reshape(-1), x.device)
-                mixed_ba = torch.cat([b1.reshape(1, -1), a1.reshape(1, -1)], dim=-1)
-            else:
-                b = linear_any(self.in_b, x)  # type: ignore[arg-type]
-                a = linear_any(self.in_a, x)  # type: ignore[arg-type]
+            mixed_qkvz = linear_any(self.in_qkvz, x, profile="gdn_qkvz")
+            mixed_ba = self._project_ba_pair(x, batched=True)
+            if not torch.is_tensor(mixed_ba):
+                b, a = mixed_ba
                 mixed_ba = torch.cat([b.reshape(x.size(0), -1), a.reshape(x.size(0), -1)], dim=-1)
             q, k, v, z = torch.split(mixed_qkvz, [key_dim, key_dim, value_dim, value_dim], dim=-1)
             b, a = torch.split(mixed_ba, [self.cfg.linear_num_value_heads, self.cfg.linear_num_value_heads], dim=-1)
         else:
-            qkv = linear_any(self.in_qkv, x)  # type: ignore[arg-type]
+            qkv = linear_any(self.in_qkv, x, profile="gdn_qkvz")  # type: ignore[arg-type]
             q, k, v = torch.split(qkv, [key_dim, key_dim, value_dim], dim=-1)
-            z = linear_any(self.in_z, x)  # type: ignore[arg-type]
-            if x.size(0) == 1 and isinstance(self.in_a, LowBitTensor) and isinstance(self.in_b, LowBitTensor):
-                a1, b1 = lowbit_linear_pair_on_device(self.in_a, self.in_b, x.reshape(-1), x.device)
-                a = a1.reshape(1, -1)
-                b = b1.reshape(1, -1)
+            z = linear_any(self.in_z, x, profile="gdn_z")  # type: ignore[arg-type]
+            ba = self._project_ba_pair(x, batched=True)
+            if torch.is_tensor(ba):
+                b, a = torch.split(ba, [self.cfg.linear_num_value_heads, self.cfg.linear_num_value_heads], dim=-1)
             else:
-                a = linear_any(self.in_a, x)  # type: ignore[arg-type]
-                b = linear_any(self.in_b, x)  # type: ignore[arg-type]
+                b, a = ba
         return (
             q.view(t, self.cfg.linear_num_key_heads, self.cfg.linear_key_head_dim).contiguous(),
             k.view(t, self.cfg.linear_num_key_heads, self.cfg.linear_key_head_dim).contiguous(),
@@ -1268,7 +1596,7 @@ class Qwen36GDNLayer:
             z.reshape(1, -1),
             self.cfg.rms_norm_eps,
         ).reshape(-1)
-        x = residual + linear_any(self.out_proj, core_norm)
+        x = residual + linear_any(self.out_proj, core_norm, profile="gdn_out")
 
         residual = x
         x = qwen_rmsnorm(x.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
@@ -1315,7 +1643,7 @@ class Qwen36GDNLayer:
             z.reshape(x.size(0), -1),
             self.cfg.rms_norm_eps,
         )
-        h = residual + linear_any(self.out_proj, core_norm)
+        h = residual + linear_any(self.out_proj, core_norm, profile="gdn_out")
         residual = h
         h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
         return residual + self.mlp.forward_block(h)
@@ -1361,19 +1689,47 @@ class Qwen36GDNLayer:
         v = v2.view(x.size(0), self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim).contiguous()
         a_h = a.to(device=x.device, dtype=torch.float16).contiguous()
         b_h = b.to(device=x.device, dtype=torch.float16).contiguous()
+        core_norm_fused: torch.Tensor | None = None
         if use_batch_gdn_kernel:
             arena, state_indices = arena_ctx
-            core = ops.gdn_recurrent_ab_batch(
-                q,
-                k,
-                v,
-                a_h,
-                b_h,
-                self.A_log,
-                self.dt_bias,
-                getattr(arena, "gdn_states")[self.layer],
-                state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+            fused_enabled = (
+                os.environ.get("LANGBURST_GDN_RECURRENT_NORM_GATE_FUSED", "0").strip().lower()
+                in {"1", "true", "on", "yes"}
             )
+            fused_shape_ok = (
+                z.ndim == 3
+                and int(self.gdn_norm_w.numel()) == int(v.size(1) * v.size(2))
+                and int(z.size(1) * z.size(2)) == int(self.gdn_norm_w.numel())
+            )
+            fused_gdn = getattr(ops, "gdn_recurrent_ab_batch_norm_gate", None) if fused_enabled and fused_shape_ok else None
+            if callable(fused_gdn):
+                core_norm_fused = fused_gdn(
+                    q,
+                    k,
+                    v,
+                    a_h,
+                    b_h,
+                    self.A_log,
+                    self.dt_bias,
+                    getattr(arena, "gdn_states")[self.layer],
+                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                    self.gdn_norm_w.to(device=x.device, dtype=torch.float16).contiguous(),
+                    z.to(device=x.device, dtype=torch.float16).contiguous(),
+                    self.cfg.rms_norm_eps,
+                ).reshape(x.size(0), -1).contiguous()
+                core = None
+            else:
+                core = ops.gdn_recurrent_ab_batch(
+                    q,
+                    k,
+                    v,
+                    a_h,
+                    b_h,
+                    self.A_log,
+                    self.dt_bias,
+                    getattr(arena, "gdn_states")[self.layer],
+                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                )
         else:
             core_rows = []
             for row, state in enumerate(states):
@@ -1390,13 +1746,13 @@ class Qwen36GDNLayer:
                     )
                 )
             core = torch.stack(core_rows, dim=0).contiguous()
-        core_norm = gdn_norm_silu_gate_2d(
+        core_norm = core_norm_fused if core_norm_fused is not None else gdn_norm_silu_gate_2d(
             core.reshape(x.size(0), -1),
             self.gdn_norm_w,
             z.reshape(x.size(0), -1),
             self.cfg.rms_norm_eps,
         )
-        h = residual + linear_any(self.out_proj, core_norm)
+        h = residual + linear_any(self.out_proj, core_norm, profile="gdn_out")
         residual = h
         h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
         return residual + self.mlp.forward_block(h)
@@ -1413,7 +1769,7 @@ class Qwen36GDNLayer:
 
         if x.ndim != 3 or x.size(0) != len(states):
             raise ValueError("speculative GDN input must be [batch,tokens,hidden] and match states")
-        arena_ctx = _arena_batch(states)
+        arena_ctx = _arena_batch_for_plan(states, plan)
         if arena_ctx is None:
             raise RuntimeError("speculative GDN batch requires arena-backed states")
         arena, state_indices = arena_ctx
@@ -1515,7 +1871,7 @@ class Qwen36GDNLayer:
             z.reshape(batch * tokens, -1),
             self.cfg.rms_norm_eps,
         )
-        h = residual + linear_any(self.out_proj, core_norm)
+        h = residual + linear_any(self.out_proj, core_norm, profile="gdn_out")
         residual = h
         h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
         return (residual + self.mlp.forward_block(h)).reshape(batch, tokens, hidden).contiguous()
@@ -1575,7 +1931,7 @@ class Qwen36AttentionLayer:
         att = attention_decode_any(q.contiguous(), k_cache, v_cache, length, self.cfg.attention_head_dim ** -0.5)
         att_flat = att.reshape(-1).contiguous()
         if gate_flat is not None:
-            att_flat = att_flat * torch.sigmoid(gate_flat.to(att_flat.dtype))
+            att_flat = sigmoid_mul(att_flat, gate_flat)
         x = residual + linear_any(self.o_proj, att_flat)
 
         residual = x
@@ -1647,7 +2003,7 @@ class Qwen36AttentionLayer:
             )
             att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
             if gate_flat is not None:
-                att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                att_block = sigmoid_mul(att_block, gate_flat)
             h = residual + linear_any(self.o_proj, att_block)
             residual = h
             h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
@@ -1697,7 +2053,7 @@ class Qwen36AttentionLayer:
                 )
                 att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
                 if gate_flat is not None:
-                    att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                    att_block = sigmoid_mul(att_block, gate_flat)
                 h = residual + linear_any(self.o_proj, att_block)
                 residual = h
                 h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
@@ -1736,7 +2092,7 @@ class Qwen36AttentionLayer:
                 )
                 att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
                 if gate_flat is not None:
-                    att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                    att_block = sigmoid_mul(att_block, gate_flat)
                 h = residual + linear_any(self.o_proj, att_block)
                 residual = h
                 h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
@@ -1758,7 +2114,7 @@ class Qwen36AttentionLayer:
             att = attention_decode_any(q_row.contiguous(), k_cache, v_cache, length, self.cfg.attention_head_dim ** -0.5)
             att_flat = att.reshape(-1).contiguous()
             if gate_flat is not None:
-                att_flat = att_flat * torch.sigmoid(gate_flat[offset].to(att_flat.dtype))
+                att_flat = sigmoid_mul(att_flat, gate_flat[offset])
             att_rows.append(att_flat)
         att_block = torch.stack(att_rows, dim=0).contiguous()
         h = residual + linear_any(self.o_proj, att_block)
@@ -1857,7 +2213,7 @@ class Qwen36AttentionLayer:
                 append_paged_int4_block(arena, self.layer, k_rope, v, block_slots)
                 att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
                 if gate_flat is not None:
-                    att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                    att_block = sigmoid_mul(att_block, gate_flat)
                 h = residual + linear_any(self.o_proj, att_block)
                 residual = h
                 h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
@@ -1892,7 +2248,7 @@ class Qwen36AttentionLayer:
                 )
                 att_block = att.squeeze(0).permute(1, 0, 2).reshape(x.size(0), -1).contiguous()
                 if gate_flat is not None:
-                    att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                    att_block = sigmoid_mul(att_block, gate_flat)
                 h = residual + linear_any(self.o_proj, att_block)
                 residual = h
                 h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
@@ -1927,7 +2283,7 @@ class Qwen36AttentionLayer:
             self.cfg.attention_head_dim ** -0.5,
         ).reshape(block_size, -1).contiguous()
         if gate_flat is not None:
-            att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+            att_block = sigmoid_mul(att_block, gate_flat)
         h = residual + linear_any(self.o_proj, att_block)
         residual = h
         h = qwen_rmsnorm(h.contiguous(), self.post_norm, self.cfg.rms_norm_eps)
@@ -1995,7 +2351,7 @@ class Qwen36AttentionLayer:
                 self.cfg.attention_head_dim ** -0.5,
             ).reshape(x.size(0), -1).contiguous()
             if gate_flat is not None:
-                att_block = att_block * torch.sigmoid(gate_flat.to(att_block.dtype))
+                att_block = sigmoid_mul(att_block, gate_flat)
         else:
             att_rows = []
             for row, state in enumerate(states):
@@ -2011,7 +2367,7 @@ class Qwen36AttentionLayer:
                 att = attention_decode_any(q_row.contiguous(), k_cache, v_cache, length, self.cfg.attention_head_dim ** -0.5)
                 att_flat = att.reshape(-1).contiguous()
                 if gate_flat is not None:
-                    att_flat = att_flat * torch.sigmoid(gate_flat[row].to(att_flat.dtype))
+                    att_flat = sigmoid_mul(att_flat, gate_flat[row])
                 att_rows.append(att_flat)
                 arena_ctx_row = _arena_batch(states)
                 if arena_ctx_row is not None:
@@ -2035,7 +2391,7 @@ class Qwen36AttentionLayer:
 
         if x.ndim != 3 or x.size(0) != len(states):
             raise ValueError("speculative attention input must be [batch,tokens,hidden] and match states")
-        arena_ctx = _arena_batch(states)
+        arena_ctx = _arena_batch_for_plan(states, plan)
         if arena_ctx is None or plan is None:
             raise RuntimeError("speculative attention batch requires arena-backed states and a decode plan")
         arena, state_indices = arena_ctx
@@ -2109,7 +2465,7 @@ class Qwen36AttentionLayer:
             _paged_int4_tiled_layout(arena),
         ).reshape(batch * tokens, -1).contiguous()
         if gate_flat is not None:
-            att = att * torch.sigmoid(gate_flat.to(att.dtype))
+            att = sigmoid_mul(att, gate_flat)
 
         slot_mapping = plan.slot_mapping.to(device=x.device, dtype=torch.long)
         if slot_mapping.ndim == 1:
@@ -2166,6 +2522,7 @@ class Qwen36Model:
             warmup_steps=0,
         )
         self._verify_graph_outputs: dict[CudaGraphKey, list[VerifyBlockResult]] = {}
+        self._verify_graph_static_buffers: dict[CudaGraphKey, _VerifyGraphStaticBuffers] = {}
         self._spec_workspace_cache: dict[tuple[str, int, int, torch.dtype, int], dict[int, dict[str, torch.Tensor]]] = {}
         self._spec_index_cache: dict[tuple[str, int, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
         self.layers = []
@@ -2180,8 +2537,12 @@ class Qwen36Model:
 
     def clear_runtime_caches(self) -> None:
         self._verify_graph_outputs.clear()
+        self._verify_graph_static_buffers.clear()
         self._spec_workspace_cache.clear()
         self._spec_index_cache.clear()
+        clear_store_caches = getattr(self.store, "clear_runtime_caches", None)
+        if callable(clear_store_caches):
+            clear_store_caches()
 
     @torch.no_grad()
     def forward_one(
@@ -2855,68 +3216,284 @@ class Qwen36Model:
             return self._forward_verify_batch_uniform_hot_graph(plan, states)
         return self._forward_verify_batch_uniform_hot_eager(plan, states)
 
-    def _verify_graph_key(self, plan: object, token_matrix: torch.Tensor) -> CudaGraphKey:
-        block_tables = getattr(plan, "block_tables", None)
-        slot_mapping = getattr(plan, "slot_mapping", None)
-        state_indices = getattr(plan, "state_indices", None)
-        seq_lens = getattr(plan, "seq_lens", None)
-        context_bucket = 0
-        if torch.is_tensor(block_tables):
-            context_bucket = int(block_tables.size(1))
-        ptrs = tuple(
-            int(t.data_ptr())
-            for t in (getattr(plan, "input_ids", None), block_tables, slot_mapping, state_indices, seq_lens)
-            if torch.is_tensor(t)
+    def _snapshot_verify_mutable_state(
+        self,
+        *,
+        arena: object,
+        state_indices: torch.Tensor,
+        slot_matrix: torch.Tensor,
+    ) -> dict[str, object]:
+        slots = state_indices.to(device=getattr(arena, "pos").device, dtype=torch.long).reshape(-1).contiguous()
+        block_size = int(getattr(arena, "kv_block_size", 0))
+        if block_size <= 0:
+            raise RuntimeError("CUDA graph verifier snapshot requires paged KV block size")
+        flat_slots = slot_matrix.reshape(-1).to(device=slots.device, dtype=torch.long)
+        flat_slots = flat_slots[flat_slots >= 0]
+        if int(flat_slots.numel()) == 0:
+            raise RuntimeError("CUDA graph verifier snapshot requires at least one concrete KV slot")
+        block_ids = torch.unique(torch.div(flat_slots, block_size, rounding_mode="floor")).contiguous()
+        snapshot: dict[str, object] = {
+            "slots": slots,
+            "block_ids": block_ids,
+            "pos": getattr(arena, "pos").index_select(0, slots).clone(),
+            "kv_len": getattr(arena, "kv_len").index_select(0, slots).clone(),
+            "gdn": {layer: tensor.index_select(0, slots).clone() for layer, tensor in getattr(arena, "gdn_states").items()},
+            "conv": {layer: tensor.index_select(0, slots).clone() for layer, tensor in getattr(arena, "gdn_conv_states").items()},
+        }
+        paged_attrs = (
+            "paged_attn_k",
+            "paged_attn_v",
+            "paged_attn_k_scale",
+            "paged_attn_v_scale",
+            "paged_attn_k_zero",
+            "paged_attn_v_zero",
+        )
+        for attr in paged_attrs:
+            value = getattr(arena, attr, None)
+            if value is not None:
+                snapshot[attr] = {layer: tensor.index_select(0, block_ids).clone() for layer, tensor in value.items()}
+        return snapshot
+
+    def _restore_verify_mutable_state(self, *, arena: object, snapshot: dict[str, object]) -> None:
+        slots = snapshot["slots"]  # type: ignore[assignment]
+        block_ids = snapshot["block_ids"]  # type: ignore[assignment]
+        getattr(arena, "pos").index_copy_(0, slots, snapshot["pos"])  # type: ignore[arg-type]
+        getattr(arena, "kv_len").index_copy_(0, slots, snapshot["kv_len"])  # type: ignore[arg-type]
+        for layer, saved in snapshot["gdn"].items():  # type: ignore[union-attr]
+            getattr(arena, "gdn_states")[layer].index_copy_(0, slots, saved)
+        for layer, saved in snapshot["conv"].items():  # type: ignore[union-attr]
+            getattr(arena, "gdn_conv_states")[layer].index_copy_(0, slots, saved)
+        for attr in (
+            "paged_attn_k",
+            "paged_attn_v",
+            "paged_attn_k_scale",
+            "paged_attn_v_scale",
+            "paged_attn_k_zero",
+            "paged_attn_v_zero",
+        ):
+            saved_by_layer = snapshot.get(attr)
+            if saved_by_layer is None:
+                continue
+            target = getattr(arena, attr)
+            for layer, saved in saved_by_layer.items():  # type: ignore[union-attr]
+                target[layer].index_copy_(0, block_ids, saved)
+
+    @staticmethod
+    def _materialize_verify_results(
+        template: Sequence[VerifyBlockResult],
+        states: Sequence[DecodeState],
+    ) -> list[VerifyBlockResult]:
+        results: list[VerifyBlockResult] = []
+        for row, result in enumerate(template):
+            state = states[row]
+            if result.raw_hidden is not None and result.raw_hidden.numel():
+                state.last_raw_hidden = result.raw_hidden.contiguous().clone()
+            results.append(
+                VerifyBlockResult(
+                    target_ids=result.target_ids,
+                    logits=result.logits,
+                    hidden=result.hidden,
+                    state=state,
+                    state_already_committed=result.state_already_committed,
+                    speculative_decision=result.speculative_decision,
+                    raw_hidden=result.raw_hidden,
+                )
+            )
+        return results
+
+    def _verify_graph_key(self, uniform_plan: DecodeBatchPlan, token_matrix: torch.Tensor, states: Sequence[DecodeState]) -> CudaGraphKey:
+        block_tables = getattr(uniform_plan, "block_tables", None)
+        context_bucket = int(block_tables.size(1)) if torch.is_tensor(block_tables) else 0
+        arena = getattr(states[0], "arena", None) if states else None
+        draft_counts = tuple(int(v) for v in getattr(uniform_plan, "num_draft_tokens_per_request"))
+        signature = (
+            int(id(arena)),
+            int(context_bucket),
+            int(verify_full_logits_enabled()),
+            int(marlin_internal_argmax_enabled()),
+            *draft_counts,
         )
         return CudaGraphKey(
             batch_size=int(token_matrix.size(0)),
             query_len=int(token_matrix.size(1)),
             speculative_tokens=max(0, int(token_matrix.size(1)) - 1),
             context_bucket=context_bucket,
-            buffer_signature=ptrs,
+            buffer_signature=signature,
         )
+
+    def _new_verify_graph_buffers(
+        self,
+        key: CudaGraphKey,
+        uniform_plan: DecodeBatchPlan,
+        token_matrix: torch.Tensor,
+        states: Sequence[DecodeState],
+    ) -> _VerifyGraphStaticBuffers:
+        device = token_matrix.device
+        batch, tokens = int(token_matrix.size(0)), int(token_matrix.size(1))
+        block_tables_src = getattr(uniform_plan, "block_tables", None)
+        if block_tables_src is None:
+            raise RuntimeError("CUDA graph verifier requires block_tables")
+        block_tables_src = block_tables_src.to(device=device, dtype=torch.int32).contiguous()
+        draft_counts = [int(v) for v in getattr(uniform_plan, "num_draft_tokens_per_request")]
+        draft_total = int(sum(draft_counts))
+        token_static = torch.empty((batch, tokens), device=device, dtype=torch.long)
+        positions = torch.empty((batch * tokens,), device=device, dtype=torch.long)
+        query_start_loc = torch.arange(0, (batch + 1) * tokens, tokens, dtype=torch.int32, device=device).contiguous()
+        seq_lens = torch.empty((batch,), device=device, dtype=torch.int32)
+        logits_indices = torch.arange(0, batch * tokens, dtype=torch.long, device=device).contiguous()
+        cu_num_logits = torch.arange(0, (batch + 1) * tokens, tokens, dtype=torch.int32, device=device).contiguous()
+        state_indices = torch.empty((batch,), device=device, dtype=torch.int32)
+        slot_mapping = torch.empty((batch, tokens), device=device, dtype=torch.long)
+        block_tables = torch.empty_like(block_tables_src)
+        row_lengths = torch.empty((batch,), device=device, dtype=torch.int32)
+        draft_token_ids = torch.empty((draft_total,), device=device, dtype=torch.long)
+        zero_commit = torch.zeros((batch,), device=device, dtype=torch.int32)
+        metadata = NativeSpecDecodeMetadata.from_flat_drafts(draft_token_ids, draft_counts, device=device)
+        row_spans = tuple((row * tokens, (row + 1) * tokens) for row in range(batch))
+        static_plan = DecodeBatchPlan(
+            request_ids=[f"graph:{row}" for row in range(batch)],
+            state_indices=state_indices,
+            input_ids=token_static.reshape(-1),
+            positions=positions,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            logits_indices=logits_indices,
+            cu_num_logits=cu_num_logits,
+            row_spans=row_spans,
+            num_scheduled_tokens=[tokens] * batch,
+            num_draft_tokens_per_request=draft_counts,
+            is_prefill=[False] * batch,
+            cuda_graph_bucket=getattr(uniform_plan, "cuda_graph_bucket", None),
+            block_tables=block_tables,
+            slot_mapping=slot_mapping,
+            spec_decode_metadata=metadata,
+        )
+        buffers = _VerifyGraphStaticBuffers(
+            key=key,
+            token_matrix=token_static,
+            positions=positions,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            logits_indices=logits_indices,
+            cu_num_logits=cu_num_logits,
+            state_indices=state_indices,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            row_lengths=row_lengths,
+            draft_token_ids=draft_token_ids,
+            zero_commit=zero_commit,
+            metadata=metadata,
+            static_plan=static_plan,
+        )
+        self._verify_graph_static_buffers[key] = buffers
+        return buffers
+
+    def _copy_verify_graph_inputs(
+        self,
+        buffers: _VerifyGraphStaticBuffers,
+        uniform_plan: DecodeBatchPlan,
+        token_matrix: torch.Tensor,
+        row_lengths: torch.Tensor,
+    ) -> None:
+        buffers.token_matrix.copy_(token_matrix.to(device=buffers.token_matrix.device, dtype=torch.long))
+        buffers.positions.copy_(uniform_plan.positions.to(device=buffers.positions.device, dtype=torch.long).reshape(-1))
+        buffers.seq_lens.copy_(uniform_plan.seq_lens.to(device=buffers.seq_lens.device, dtype=torch.int32).reshape(-1))
+        buffers.state_indices.copy_(uniform_plan.state_indices.to(device=buffers.state_indices.device, dtype=torch.int32).reshape(-1))
+        buffers.row_lengths.copy_(row_lengths.to(device=buffers.row_lengths.device, dtype=torch.int32).reshape(-1))
+        slot_mapping = uniform_plan.slot_mapping
+        if slot_mapping is None:
+            raise RuntimeError("CUDA graph verifier requires slot_mapping")
+        slot_mapping = slot_mapping.to(device=buffers.slot_mapping.device, dtype=torch.long)
+        if slot_mapping.ndim != 2:
+            slot_mapping = slot_mapping.reshape(buffers.slot_mapping.shape).contiguous()
+        buffers.slot_mapping.copy_(slot_mapping[:, : buffers.slot_mapping.size(1)].contiguous())
+        block_tables = uniform_plan.block_tables
+        if block_tables is None:
+            raise RuntimeError("CUDA graph verifier requires block_tables")
+        buffers.block_tables.copy_(block_tables.to(device=buffers.block_tables.device, dtype=torch.int32).contiguous())
+        metadata = uniform_plan.spec_decode_metadata
+        if metadata is None:
+            raise RuntimeError("CUDA graph verifier requires speculative metadata")
+        draft_ids = metadata.draft_token_ids.to(device=buffers.draft_token_ids.device, dtype=torch.long).reshape(-1)
+        if int(draft_ids.numel()) != int(buffers.draft_token_ids.numel()):
+            raise RuntimeError("CUDA graph verifier draft-count key mismatch")
+        buffers.draft_token_ids.copy_(draft_ids)
 
     def _forward_verify_batch_uniform_hot_graph(
         self,
         plan: object,
         states: Sequence[DecodeState],
     ) -> list[VerifyBlockResult]:
-        _uniform_plan, token_matrix, _row_lengths = self._build_uniform_spec_plan(plan, states)
-        key = self._verify_graph_key(plan, token_matrix)
-        holder: dict[str, list[VerifyBlockResult]] = {}
-
-        def run() -> None:
-            holder["results"] = self._forward_verify_batch_uniform_hot_eager(plan, states)
-
+        uniform_plan, token_matrix, row_lengths = self._build_uniform_spec_plan(plan, states)
+        key = self._verify_graph_key(uniform_plan, token_matrix, states)
+        buffers = self._verify_graph_static_buffers.get(key)
+        if buffers is None:
+            buffers = self._new_verify_graph_buffers(key, uniform_plan, token_matrix, states)
+        self._copy_verify_graph_inputs(buffers, uniform_plan, token_matrix, row_lengths)
         executable = self._verify_graph_cache.get(key)
         if executable is None:
+            arena = getattr(states[0], "arena", None) if states else None
+            if arena is None:
+                return self._forward_verify_batch_uniform_hot_eager(plan, states)
+            snapshot = self._snapshot_verify_mutable_state(
+                arena=arena,
+                state_indices=buffers.state_indices,
+                slot_matrix=buffers.slot_mapping,
+            )
+
+            def run() -> None:
+                buffers.results = self._forward_verify_batch_uniform_hot_core(
+                    buffers.static_plan,
+                    states,
+                    buffers.static_plan,
+                    buffers.token_matrix,
+                    buffers.row_lengths,
+                    zero_commit=buffers.zero_commit,
+                )
+
             try:
                 executable = self._verify_graph_cache.capture(key, run)
             except Exception:
                 self._verify_graph_cache.disable()
                 self._verify_graph_outputs.clear()
+                self._verify_graph_static_buffers.clear()
+                self._restore_verify_mutable_state(arena=arena, snapshot=snapshot)
                 return self._forward_verify_batch_uniform_hot_eager(plan, states)
-            self._verify_graph_outputs[key] = holder["results"]
-            return self._verify_graph_outputs[key]
+            self._restore_verify_mutable_state(arena=arena, snapshot=snapshot)
         executable.replay()
-        return self._verify_graph_outputs[key]
+        if buffers.results is None:
+            raise RuntimeError("CUDA graph verifier replay produced no result template")
+        return self._materialize_verify_results(buffers.results, states)
 
     def _forward_verify_batch_uniform_hot_eager(
         self,
         plan: object,
         states: Sequence[DecodeState],
     ) -> list[VerifyBlockResult]:
-        metadata = getattr(plan, "spec_decode_metadata", None)
+        uniform_plan, token_matrix, row_lengths = self._build_uniform_spec_plan(plan, states)
+        return self._forward_verify_batch_uniform_hot_core(plan, states, uniform_plan, token_matrix, row_lengths)
+
+    def _forward_verify_batch_uniform_hot_core(
+        self,
+        plan: object,
+        states: Sequence[DecodeState],
+        uniform_plan: DecodeBatchPlan,
+        token_matrix: torch.Tensor,
+        row_lengths: torch.Tensor,
+        *,
+        zero_commit: torch.Tensor | None = None,
+    ) -> list[VerifyBlockResult]:
+        metadata = getattr(uniform_plan, "spec_decode_metadata", None)
         if metadata is None:
             raise RuntimeError("uniform speculative verifier requires spec_decode_metadata")
-        draft_counts = [int(v) for v in getattr(plan, "num_draft_tokens_per_request")]
-        uniform_plan, token_matrix, row_lengths = self._build_uniform_spec_plan(plan, states)
+        draft_counts = [int(v) for v in getattr(uniform_plan, "num_draft_tokens_per_request")]
         batch, tokens = token_matrix.shape
         arena = getattr(states[0], "arena", None) if states else None
-        state_indices = getattr(plan, "state_indices", None)
+        state_indices = getattr(uniform_plan, "state_indices", None)
         if arena is None or state_indices is None or not hasattr(arena, "advance_slots"):
             raise RuntimeError("uniform speculative verifier requires arena device-side state counters")
-        zero_commit = torch.zeros((batch,), dtype=torch.int32, device=token_matrix.device)
+        if zero_commit is None:
+            zero_commit = torch.zeros((batch,), dtype=torch.int32, device=token_matrix.device)
         trajectory: dict[str, object] = {
             "conv": [],
             "gdn": [],
@@ -2930,58 +3507,71 @@ class Qwen36Model:
             ),
         }
 
-        # Single target pass: compute verifier logits and save per-token state
-        # trajectory.  The live arena is untouched until reducer-selected
-        # commit_tokens are known below.
-        probe_hidden = self._forward_speculative_uniform_layers(
-            token_matrix,
-            states,
-            uniform_plan,
-            zero_commit,
-            trajectory=trajectory,
-        )
+        with decode_profile_scope("verify_layers"):
+            probe_hidden = self._forward_speculative_uniform_layers(
+                token_matrix,
+                states,
+                uniform_plan,
+                zero_commit,
+                trajectory=trajectory,
+            )
         probe_norm = qwen_rmsnorm(probe_hidden.reshape(batch * tokens, -1).contiguous(), self.final_norm, self.cfg.rms_norm_eps)
-        flat_probe_logits = linear_any(self.lm_head, probe_norm).contiguous()
-        probe_logits = flat_probe_logits.reshape(batch, tokens, -1)
 
         target_position_tensor, bonus_position_tensor = self._spec_logit_positions(
             draft_counts=draft_counts,
             tokens=tokens,
             device=token_matrix.device,
         )
-        if int(target_position_tensor.numel()) > 0:
-            target_logits_tensor = flat_probe_logits.index_select(0, target_position_tensor).contiguous()
-            if target_logits_tensor.device.type == "cuda":
-                target_ids_flat = cuda_ops().argmax_many(target_logits_tensor).to(device=token_matrix.device, dtype=torch.long)
+        selected_logits: torch.Tensor | None = None
+        if verify_full_logits_enabled():
+            flat_probe_logits = linear_any(self.lm_head, probe_norm, profile="verify_lm_head_full").contiguous()
+            probe_logits = flat_probe_logits.reshape(batch, tokens, -1)
+            if int(target_position_tensor.numel()) > 0:
+                target_logits_tensor = flat_probe_logits.index_select(0, target_position_tensor).contiguous()
+                if target_logits_tensor.device.type == "cuda":
+                    target_ids_flat = cuda_ops().argmax_many(target_logits_tensor).to(device=token_matrix.device, dtype=torch.long)
+                else:
+                    target_ids_flat = torch.argmax(target_logits_tensor, dim=-1).to(device=token_matrix.device, dtype=torch.long)
             else:
-                target_ids_flat = torch.argmax(target_logits_tensor, dim=-1).to(device=token_matrix.device, dtype=torch.long)
+                target_ids_flat = torch.empty((0,), device=token_matrix.device, dtype=torch.long)
+            bonus_logits_tensor = flat_probe_logits.index_select(0, bonus_position_tensor).contiguous()
+            if bonus_logits_tensor.device.type == "cuda":
+                bonus_ids = cuda_ops().argmax_many(bonus_logits_tensor).to(device=token_matrix.device, dtype=torch.long)
+            else:
+                bonus_ids = torch.argmax(bonus_logits_tensor, dim=-1).to(device=token_matrix.device, dtype=torch.long)
         else:
-            target_ids_flat = torch.empty((0,), device=token_matrix.device, dtype=torch.long)
-        bonus_logits_tensor = flat_probe_logits.index_select(0, bonus_position_tensor).contiguous()
-        if bonus_logits_tensor.device.type == "cuda":
-            bonus_ids = cuda_ops().argmax_many(bonus_logits_tensor).to(device=token_matrix.device, dtype=torch.long)
-        else:
-            bonus_ids = torch.argmax(bonus_logits_tensor, dim=-1).to(device=token_matrix.device, dtype=torch.long)
-        resolved = resolve_speculative_gpu(
-            metadata,
-            target_token_ids=target_ids_flat,
-            bonus_token_ids=bonus_ids,
-            scheduled_token_counts=row_lengths,
-        )
+            flat_probe_ids = linear_argmax_any(self.lm_head, probe_norm, profile="verify_lm_head_argmax").to(
+                device=token_matrix.device, dtype=torch.long
+            )
+            target_ids_flat = (
+                flat_probe_ids.index_select(0, target_position_tensor).contiguous()
+                if int(target_position_tensor.numel()) > 0
+                else torch.empty((0,), device=token_matrix.device, dtype=torch.long)
+            )
+            bonus_ids = flat_probe_ids.index_select(0, bonus_position_tensor).contiguous()
+        with decode_profile_scope("spec_resolve"):
+            resolved = resolve_speculative_gpu(
+                metadata,
+                target_token_ids=target_ids_flat,
+                bonus_token_ids=bonus_ids,
+                scheduled_token_counts=row_lengths,
+            )
         commit_tokens = resolved.commit_tokens.to(device=token_matrix.device, dtype=torch.int32).contiguous()
 
         state_indices_tensor = state_indices.to(device=token_matrix.device, dtype=torch.long).reshape(-1).contiguous()
-        self._commit_speculative_trajectory(
-            trajectory=trajectory,
-            arena=arena,
-            state_indices=state_indices_tensor,
-            commit_tokens=commit_tokens,
-        )
-        arena.advance_slots(state_indices_tensor, commit_tokens)
+        with decode_profile_scope("cache_update"):
+            self._commit_speculative_trajectory(
+                trajectory=trajectory,
+                arena=arena,
+                state_indices=state_indices_tensor,
+                commit_tokens=commit_tokens,
+            )
+            arena.advance_slots(state_indices_tensor, commit_tokens)
         row_index = torch.arange(batch, device=token_matrix.device, dtype=torch.long)
         last_indices = torch.clamp(commit_tokens.to(device=token_matrix.device, dtype=torch.long) - 1, min=0)
         selected_hidden = probe_norm.reshape(batch, tokens, -1).contiguous()[row_index, last_indices].contiguous()
-        selected_logits = probe_logits[row_index, last_indices].contiguous()
+        if verify_full_logits_enabled():
+            selected_logits = probe_logits[row_index, last_indices].contiguous()  # type: ignore[name-defined]
         selected_raw_hidden = probe_hidden[row_index, last_indices].contiguous()
         results: list[VerifyBlockResult] = []
         target_offset = 0
@@ -2993,11 +3583,16 @@ class Qwen36Model:
             results.append(
                 VerifyBlockResult(
                     target_ids=row_target_ids,
-                    logits=selected_logits[row].contiguous(),
+                    logits=(
+                        selected_logits[row].contiguous()
+                        if selected_logits is not None
+                        else torch.empty((0,), device=token_matrix.device, dtype=probe_norm.dtype)
+                    ),
                     hidden=selected_hidden[row].contiguous(),
                     state=state,
                     state_already_committed=True,
                     speculative_decision=resolved,
+                    raw_hidden=selected_raw_hidden[row].contiguous(),
                 )
             )
         return results

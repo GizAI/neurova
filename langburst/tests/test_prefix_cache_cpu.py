@@ -55,3 +55,27 @@ def test_radix_prefix_cache_duplicate_insert_releases_redundant_pin():
     assert hit.state == "b"
     assert hit.block_ids == (3,)
     assert released == [(3,)]
+
+
+def test_radix_prefix_cache_enforces_token_budget_and_releases_blocks():
+    released: list[tuple[int, ...]] = []
+    cache = RadixPrefixCache(
+        min_prefix_tokens=1,
+        max_entries=10,
+        max_cached_tokens=4,
+        release_blocks=lambda blocks: released.append(tuple(int(b) for b in blocks)),
+    )
+
+    assert cache.insert([1, 2, 3], "a", block_ids=(1, 2, 3))
+    assert cache.stats().cached_tokens == 3
+    assert cache.insert([4, 5], "b", block_ids=(4, 5))
+
+    stats = cache.stats()
+    assert stats.cached_tokens <= 4
+    assert stats.entries == 1
+    assert stats.evictions == 1
+    assert released == [(1, 2, 3)]
+
+    assert not cache.insert([6, 7, 8, 9, 10], "too-long", block_ids=(6, 7, 8, 9, 10))
+    assert cache.stats().cached_tokens <= 4
+    assert released[-1] == (6, 7, 8, 9, 10)

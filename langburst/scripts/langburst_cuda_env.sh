@@ -6,12 +6,13 @@
 # toolchain shipped inside the conda environment.
 set -euo pipefail
 
-PY_PREFIX="$(python - <<'PY'
-import sys
-print(sys.prefix)
+PY_SITE="$(python - <<'PY'
+import site
+print(site.getsitepackages()[0])
 PY
 )"
-CONDA_CUDA_ROOT="${PY_PREFIX}/lib/python3.11/site-packages/nvidia/cu13"
+CONDA_CUDA_ROOT="${PY_SITE}/nvidia/cu13"
+TORCH_LIB_ROOT="${PY_SITE}/torch/lib"
 
 if [[ ! -x "${CONDA_CUDA_ROOT}/bin/nvcc" ]]; then
   echo "LangBurst CUDA 13 nvcc not found under ${CONDA_CUDA_ROOT}" >&2
@@ -21,5 +22,5 @@ fi
 export CUDA_HOME="${CONDA_CUDA_ROOT}"
 export CUDACXX="${CONDA_CUDA_ROOT}/bin/nvcc"
 export PATH="${CONDA_CUDA_ROOT}/bin:${PATH}"
-export LD_LIBRARY_PATH="${CONDA_CUDA_ROOT}/lib:${CONDA_CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${TORCH_LIB_ROOT}:${CONDA_CUDA_ROOT}/lib:${CONDA_CUDA_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
 export LANGBURST_REQUIRE_CUDA_EXT="${LANGBURST_REQUIRE_CUDA_EXT:-1}"

@@ -84,6 +84,7 @@ class RadixPrefixCache:
         self._release_blocks = release_blocks
         self._roots: dict[str, _TrieNode] = {}
         self._entries: dict[tuple[str, tuple[int, ...]], PrefixCacheEntry] = {}
+        self._cached_tokens = 0
         self._hits = 0
         self._misses = 0
         self._evictions = 0
@@ -118,6 +119,12 @@ class RadixPrefixCache:
         tokens = tuple(int(t) for t in token_ids)
         if len(tokens) < self.min_prefix_tokens:
             return False
+        if len(tokens) > self.max_cached_tokens:
+            if self._release_blocks is not None:
+                new_block_ids = tuple(int(b) for b in block_ids)
+                if new_block_ids:
+                    self._release_blocks(new_block_ids)
+            return False
         ns = str(namespace or "")
         key = (ns, tokens)
         new_block_ids = tuple(int(b) for b in block_ids)
@@ -140,6 +147,7 @@ class RadixPrefixCache:
         entry = PrefixCacheEntry(namespace=ns, tokens=tokens, state=state, block_ids=new_block_ids)
         node.entry = entry
         self._entries[key] = entry
+        self._cached_tokens += len(tokens)
         self._evict_if_needed()
         return True
 
@@ -150,18 +158,19 @@ class RadixPrefixCache:
                     self._release_blocks(entry.block_ids)
         self._roots.clear()
         self._entries.clear()
+        self._cached_tokens = 0
 
     def stats(self) -> PrefixCacheStats:
         return PrefixCacheStats(
             entries=len(self._entries),
-            cached_tokens=sum(len(tokens) for _ns, tokens in self._entries),
+            cached_tokens=self._cached_tokens,
             hits=self._hits,
             misses=self._misses,
             evictions=self._evictions,
         )
 
     def _evict_if_needed(self) -> None:
-        while len(self._entries) > self.max_entries or sum(len(tokens) for tokens in self._entries) > self.max_cached_tokens:
+        while len(self._entries) > self.max_entries or self._cached_tokens > self.max_cached_tokens:
             victim_key, victim = min(self._entries.items(), key=lambda item: (item[1].last_used_monotonic, item[1].created_monotonic))
             self._delete(victim_key, victim)
 
@@ -180,7 +189,9 @@ class RadixPrefixCache:
             node = child
         if node.entry is entry:
             node.entry = None
-        self._entries.pop(key, None)
+        removed = self._entries.pop(key, None)
+        if removed is not None:
+            self._cached_tokens = max(0, self._cached_tokens - len(tokens))
         if self._release_blocks is not None and entry.block_ids:
             self._release_blocks(entry.block_ids)
         for parent, token in reversed(stack):

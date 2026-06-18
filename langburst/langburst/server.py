@@ -111,7 +111,11 @@ def _sse_payload(payload: dict[str, Any]) -> str:
 
 def _requested_generation_tokens(req: ChatCompletionRequest) -> int:
     fallback = int(os.environ.get("LANGBURST_DEFAULT_MAX_TOKENS", "8192"))
-    return req.max_new_tokens or req.max_completion_tokens or req.max_tokens or fallback
+    requested = int(req.max_new_tokens or req.max_completion_tokens or req.max_tokens or fallback)
+    cap = int(os.environ.get("LANGBURST_MAX_GENERATION_TOKENS", str(fallback)))
+    if cap > 0:
+        return min(requested, cap)
+    return requested
 
 
 def _default_min_generation_tokens(max_tokens: int) -> int:
@@ -127,6 +131,14 @@ def _requested_min_generation_tokens(req: ChatCompletionRequest) -> int:
     if req.min_tokens is not None:
         return int(req.min_tokens)
     return _default_min_generation_tokens(_requested_generation_tokens(req))
+
+
+def _repetition_stop_ngram_size() -> int:
+    return max(0, int(os.environ.get("LANGBURST_REPETITION_STOP_NGRAM_SIZE", "2")))
+
+
+def _repetition_stop_repeats() -> int:
+    return max(0, int(os.environ.get("LANGBURST_REPETITION_STOP_REPEATS", "8")))
 
 
 def _default_suppress_tokens(engine) -> tuple[int, ...]:
@@ -267,6 +279,8 @@ def _native_generation_config(engine, req: ChatCompletionRequest) -> GenerationC
         eos_token_ids=engine.eos_token_ids(),
         stop_token_ids=tuple(int(t) for t in (req.stop_token_ids or [])),
         ignore_eos=bool(req.ignore_eos),
+        repetition_stop_ngram_size=_repetition_stop_ngram_size(),
+        repetition_stop_repeats=_repetition_stop_repeats(),
     )
 
 
@@ -319,7 +333,10 @@ def create_app(manager: EngineManager):
             prompt_ids = engine.encode_messages(_request_messages(req), chat_template_kwargs=_chat_template_kwargs(req))
             generation_tokens = _requested_generation_tokens(req)
             manager.validate_generation_request(prompt_tokens=len(prompt_ids), generation_tokens=generation_tokens)
-            manager.validate_runtime_memory(engine)
+            admission_tokens = manager.effective_admission_tokens(
+                prompt_tokens=len(prompt_ids),
+                generation_tokens=generation_tokens,
+            )
             if req.session_id or req.stateful_session or req.previous_response_id:
                 raise ValueError(
                     "Native LangBurst sessions were removed from the GPU hot path; "
@@ -339,7 +356,7 @@ def create_app(manager: EngineManager):
 
         if req.stream:
             async def events():
-                lease = manager.acquire_request()
+                lease = manager.acquire_request(prompt_tokens=admission_tokens, engine=engine)
                 acquired = False
                 handle = None
                 visible_prefix = _thinking_visible_prefix(req, engine.model_name)
@@ -456,7 +473,7 @@ def create_app(manager: EngineManager):
             )
 
         try:
-            with manager.acquire_request():
+            with manager.acquire_request(prompt_tokens=admission_tokens, engine=engine):
                 handle = worker.submit(
                     prompt_ids,
                     max_new_tokens=generation_tokens,
@@ -712,6 +729,12 @@ def main() -> None:
     ap.add_argument("--kv-block-size", type=int, default=resource_defaults.kv_block_size)
     ap.add_argument("--kv-blocks", type=int, default=resource_defaults.kv_blocks)
     ap.add_argument("--runtime-overhead-mib", type=int, default=resource_defaults.runtime_overhead_mib)
+    ap.add_argument("--context-tiers", default=",".join(str(v) for v in resource_defaults.context_tiers))
+    ap.add_argument("--context-tier-slots", default=",".join(str(v) for v in resource_defaults.context_tier_slots))
+    overflow_group = ap.add_mutually_exclusive_group()
+    overflow_group.add_argument("--allow-context-overflow", dest="allow_context_overflow", action="store_true")
+    overflow_group.add_argument("--no-allow-context-overflow", dest="allow_context_overflow", action="store_false")
+    ap.set_defaults(allow_context_overflow=resource_defaults.allow_context_overflow)
     ap.add_argument("--models-json", type=Path, default=None)
     add_runtime_feature_args(ap)
     args = ap.parse_args()
@@ -745,6 +768,9 @@ def main() -> None:
                     kv_block_size=args.kv_block_size,
                     kv_blocks=args.kv_blocks,
                     runtime_overhead_mib=args.runtime_overhead_mib,
+                    context_tiers=tuple(int(v) for v in str(args.context_tiers).split(",") if v.strip()),
+                    context_tier_slots=tuple(int(v) for v in str(args.context_tier_slots).split(",") if v.strip()),
+                    allow_context_overflow=args.allow_context_overflow,
                 ),
             )
             app = create_app(manager)

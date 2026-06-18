@@ -56,6 +56,15 @@ class CudaMemoryPolicy:
         )
 
     def release_idle_cache(self, *, active_requests: int = 0) -> bool:
+        if not self.should_release(active_requests=active_requests):
+            return False
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        return True
+
+    def should_release(self, *, active_requests: int = 0) -> bool:
         if active_requests > 0 or not self.trim_after_request:
             return False
         if not torch.cuda.is_available():
@@ -64,10 +73,6 @@ class CudaMemoryPolicy:
             free_bytes, _total_bytes = torch.cuda.mem_get_info()
             if free_bytes >= self.trim_free_below_mib * 1024 * 1024:
                 return False
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
         return True
 
     def summary(self) -> dict[str, int | bool]:

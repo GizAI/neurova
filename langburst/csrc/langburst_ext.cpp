@@ -24,6 +24,46 @@ int marlin_cuda(
   int max_par = 16
 );
 
+int marlin_cuda_argmax(
+  const void* A,
+  const void* B,
+        void* C,
+        void* s,
+  int prob_m,
+  int prob_n,
+  int prob_k,
+  void* workspace,
+  void* argmax_state,
+  void* argmax_out,
+  void* argmax_sync,
+  int argmax_epoch,
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 16
+);
+
+int marlin_cuda_silu_packed(
+  const void* A,
+  const void* B,
+        void* C,
+        void* s,
+  int prob_m,
+  int prob_n,
+  int prob_k,
+  void* workspace,
+  int groupsize = -1,
+  int dev = 0,
+  cudaStream_t stream = 0,
+  int thread_k = -1,
+  int thread_n = -1,
+  int sms = -1,
+  int max_par = 16
+);
+
 static void run_lowbit_marlin_gemm(torch::Tensor qweight, torch::Tensor scales, torch::Tensor x, torch::Tensor out, torch::Tensor workspace, int64_t cols, int64_t group_size) {
   QB_CHECK_CUDA(qweight); QB_CHECK_CUDA(scales); QB_CHECK_CUDA(x);
   QB_CHECK_CUDA(out); QB_CHECK_CUDA(workspace);
@@ -87,6 +127,135 @@ void lowbit_marlin_gemm_out(torch::Tensor qweight, torch::Tensor scales, torch::
   run_lowbit_marlin_gemm(qweight, scales, x, out, workspace, cols, group_size);
 }
 
+
+void lowbit_marlin_gemm_silu_packed_out(
+    torch::Tensor qweight,
+    torch::Tensor scales,
+    torch::Tensor mixed,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    int64_t cols,
+    int64_t group_size) {
+  QB_CHECK_CUDA(qweight); QB_CHECK_CUDA(scales); QB_CHECK_CUDA(mixed);
+  QB_CHECK_CUDA(out); QB_CHECK_CUDA(workspace);
+  QB_CHECK_CONTIGUOUS(qweight); QB_CHECK_CONTIGUOUS(scales); QB_CHECK_CONTIGUOUS(mixed); QB_CHECK_CONTIGUOUS(out); QB_CHECK_CONTIGUOUS(workspace);
+  TORCH_CHECK(qweight.scalar_type() == at::kInt, "marlin qweight must be int32");
+  QB_CHECK_HALF(scales); QB_CHECK_HALF(mixed); QB_CHECK_HALF(out);
+  TORCH_CHECK(workspace.scalar_type() == at::kInt, "marlin workspace must be int32");
+  TORCH_CHECK(mixed.dim() == 2, "mixed must be [batch, 2*cols]");
+  TORCH_CHECK(mixed.size(1) == 2 * cols, "mixed width must be 2*cols");
+  TORCH_CHECK(cols % 128 == 0, "Marlin requires K divisible by 128");
+  const int prob_m = static_cast<int>(mixed.size(0));
+  const int prob_k = static_cast<int>(cols);
+  TORCH_CHECK(qweight.dim() == 2 && qweight.size(0) == prob_k / 16, "marlin qweight must be [K/16, N*2]");
+  TORCH_CHECK(qweight.size(1) % 2 == 0, "marlin qweight second dim must be N*2");
+  const int prob_n = static_cast<int>(qweight.size(1) / 2);
+  TORCH_CHECK(prob_n % 256 == 0, "Marlin requires N divisible by 256");
+  TORCH_CHECK(scales.dim() == 2 && scales.size(1) == prob_n, "marlin scales must be [K/group, N]");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == prob_m && out.size(1) == prob_n, "marlin out shape mismatch");
+  int groupsize = static_cast<int>(group_size);
+  if (groupsize <= 0 || groupsize == prob_k) groupsize = -1;
+  TORCH_CHECK(groupsize == -1 || (groupsize == 128 && scales.size(0) == prob_k / groupsize), "Marlin supports group_size -1 or 128");
+  int max_par = 16;
+  if (const char* env = std::getenv("LANGBURST_MARLIN_MAX_PAR")) {
+    max_par = std::atoi(env);
+  }
+  TORCH_CHECK(max_par >= 1 && max_par <= 16, "LANGBURST_MARLIN_MAX_PAR must be in [1, 16]");
+  TORCH_CHECK(workspace.numel() >= prob_n / 128 * max_par, "marlin workspace too small");
+  const int dev = mixed.get_device();
+  int err = marlin_cuda_silu_packed(
+    mixed.data_ptr(),
+    qweight.data_ptr(),
+    out.data_ptr(),
+    scales.data_ptr(),
+    prob_m,
+    prob_n,
+    prob_k,
+    workspace.data_ptr(),
+    groupsize,
+    dev,
+    at::cuda::getCurrentCUDAStream(dev),
+    -1,
+    -1,
+    -1,
+    max_par
+  );
+  TORCH_CHECK(err == 0, "Marlin silu-packed kernel failed with code ", err);
+  QB_CUDA_CHECK(cudaGetLastError());
+}
+
+void lowbit_marlin_gemm_argmax_out(
+    torch::Tensor qweight,
+    torch::Tensor scales,
+    torch::Tensor x,
+    torch::Tensor scratch_out,
+    torch::Tensor workspace,
+    torch::Tensor argmax_state,
+    torch::Tensor argmax_out,
+    torch::Tensor argmax_sync,
+    int64_t argmax_epoch,
+    int64_t cols,
+    int64_t group_size) {
+  QB_CHECK_CUDA(qweight); QB_CHECK_CUDA(scales); QB_CHECK_CUDA(x);
+  QB_CHECK_CUDA(scratch_out); QB_CHECK_CUDA(workspace); QB_CHECK_CUDA(argmax_state); QB_CHECK_CUDA(argmax_out); QB_CHECK_CUDA(argmax_sync);
+  QB_CHECK_CONTIGUOUS(qweight); QB_CHECK_CONTIGUOUS(scales); QB_CHECK_CONTIGUOUS(x);
+  QB_CHECK_CONTIGUOUS(scratch_out); QB_CHECK_CONTIGUOUS(workspace); QB_CHECK_CONTIGUOUS(argmax_state); QB_CHECK_CONTIGUOUS(argmax_out); QB_CHECK_CONTIGUOUS(argmax_sync);
+  TORCH_CHECK(qweight.scalar_type() == at::kInt, "marlin qweight must be int32");
+  QB_CHECK_HALF(scales); QB_CHECK_HALF(x); QB_CHECK_HALF(scratch_out);
+  TORCH_CHECK(workspace.scalar_type() == at::kInt, "marlin workspace must be int32");
+  QB_CHECK_INT64(argmax_state); QB_CHECK_INT64(argmax_out);
+  TORCH_CHECK(argmax_sync.scalar_type() == at::kInt, "argmax_sync must be int32");
+  TORCH_CHECK(x.dim() == 2, "x must be [batch, cols]");
+  TORCH_CHECK(x.size(1) == cols, "x cols mismatch");
+  TORCH_CHECK(cols % 128 == 0, "Marlin requires K divisible by 128");
+  const int prob_m = static_cast<int>(x.size(0));
+  const int prob_k = static_cast<int>(cols);
+  TORCH_CHECK(qweight.dim() == 2 && qweight.size(0) == prob_k / 16, "marlin qweight must be [K/16, N*2]");
+  TORCH_CHECK(qweight.size(1) % 2 == 0, "marlin qweight second dim must be N*2");
+  const int prob_n = static_cast<int>(qweight.size(1) / 2);
+  TORCH_CHECK(prob_n % 256 == 0, "Marlin requires N divisible by 256");
+  TORCH_CHECK(scales.dim() == 2 && scales.size(1) == prob_n, "marlin scales must be [K/group, N]");
+  TORCH_CHECK(scratch_out.dim() == 2 && scratch_out.size(0) == prob_m && scratch_out.size(1) == prob_n, "marlin scratch_out shape mismatch");
+  TORCH_CHECK(argmax_state.dim() == 1 && argmax_state.numel() >= prob_m, "argmax_state must be [batch]");
+  TORCH_CHECK(argmax_out.dim() == 1 && argmax_out.numel() >= prob_m, "argmax_out must be [batch]");
+  TORCH_CHECK(argmax_sync.dim() == 1 && argmax_sync.numel() >= 2, "argmax_sync must be [2]");
+  TORCH_CHECK(argmax_epoch > 0, "argmax_epoch must be positive");
+  int groupsize = static_cast<int>(group_size);
+  if (groupsize <= 0 || groupsize == prob_k) groupsize = -1;
+  TORCH_CHECK(groupsize == -1 || (groupsize == 128 && scales.size(0) == prob_k / groupsize), "Marlin supports group_size -1 or 128");
+  int max_par = 16;
+  if (const char* env = std::getenv("LANGBURST_MARLIN_MAX_PAR")) {
+    max_par = std::atoi(env);
+  }
+  TORCH_CHECK(max_par >= 1 && max_par <= 16, "LANGBURST_MARLIN_MAX_PAR must be in [1, 16]");
+  TORCH_CHECK(workspace.numel() >= prob_n / 128 * max_par, "marlin workspace too small");
+  const int dev = x.get_device();
+  auto stream = at::cuda::getCurrentCUDAStream(dev);
+  int err = marlin_cuda_argmax(
+    x.data_ptr(),
+    qweight.data_ptr(),
+    scratch_out.data_ptr(),
+    scales.data_ptr(),
+    prob_m,
+    prob_n,
+    prob_k,
+    workspace.data_ptr(),
+    argmax_state.data_ptr<int64_t>(),
+    argmax_out.data_ptr<int64_t>(),
+    argmax_sync.data_ptr<int>(),
+    static_cast<int>(argmax_epoch),
+    groupsize,
+    dev,
+    stream,
+    -1,
+    -1,
+    -1,
+    max_par
+  );
+  TORCH_CHECK(err == 0, "Marlin argmax kernel failed with code ", err);
+  QB_CUDA_CHECK(cudaGetLastError());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "LangBurst CUDA kernels";
   m.def("lowbit_gemv", &lowbit_gemv,
@@ -136,11 +305,53 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("workspace"),
         py::arg("cols"),
         py::arg("group_size"));
+  m.def("lowbit_marlin_mlp_streaming_out", &lowbit_marlin_mlp_streaming_out,
+        "Single-kernel streaming Marlin-layout MLP: gate/up projection, SiLU gate, and down projection without materialized activation",
+        py::arg("gate_up_qweight"),
+        py::arg("gate_up_scales"),
+        py::arg("down_qweight"),
+        py::arg("down_scales"),
+        py::arg("x"),
+        py::arg("out"),
+        py::arg("accum"),
+        py::arg("sync"),
+        py::arg("epoch"),
+        py::arg("hidden"),
+        py::arg("intermediate"),
+        py::arg("gate_group_size"),
+        py::arg("down_group_size"));
+  m.def("lowbit_marlin_gemm_silu_packed_out", &lowbit_marlin_gemm_silu_packed_out,
+        "Marlin W4A16 GEMM whose A operand is SiLU(mixed[:K]) * mixed[K:] computed inside the down-projection kernel",
+        py::arg("qweight"),
+        py::arg("scales"),
+        py::arg("mixed"),
+        py::arg("out"),
+        py::arg("workspace"),
+        py::arg("cols"),
+        py::arg("group_size"));
+  m.def("lowbit_marlin_gemm_argmax_out", &lowbit_marlin_gemm_argmax_out,
+        "Marlin W4A16 GEMM followed by graph-capturable argmax into preallocated output",
+        py::arg("qweight"),
+        py::arg("scales"),
+        py::arg("x"),
+        py::arg("scratch_out"),
+        py::arg("workspace"),
+        py::arg("argmax_state"),
+        py::arg("argmax_out"),
+        py::arg("argmax_sync"),
+        py::arg("argmax_epoch"),
+        py::arg("cols"),
+        py::arg("group_size"));
   m.def("rmsnorm", &rmsnorm, "RMSNorm fp16");
   m.def("rmsnorm_qwen", &rmsnorm_qwen, "Qwen RMSNorm fp16 using 1+weight");
   m.def("rmsnorm_silu_gate", &rmsnorm_silu_gate, "RMSNorm followed by SiLU gate fp16");
   m.def("rmsnorm_qwen_silu_gate", &rmsnorm_qwen_silu_gate, "Qwen RMSNorm followed by SiLU gate fp16");
   m.def("silu_mul", &silu_mul, "Fused SiLU(gate) * up fp16");
+  m.def("silu_mul_packed", &silu_mul_packed, "Fused SiLU(mixed[:H]) * mixed[H:] fp16 without split copies");
+  m.def("sigmoid_mul", &sigmoid_mul, "Fused x * sigmoid(gate) fp16");
+  m.def("sigmoid_mul_repeat_kv", &sigmoid_mul_repeat_kv, "Repeat KV heads and apply sigmoid gate fp16");
+  m.def("rmsnorm_qwen_pair_cat", &rmsnorm_qwen_pair_cat, "Two Qwen RMSNorms concatenated into one fp16 output");
+  m.def("rmsnorm_qwen_rope", &rmsnorm_qwen_rope, "Qwen RMSNorm plus single-position rotary embedding fp16");
   m.def("gdn_recurrent", &gdn_recurrent,
         "Single-token Qwen-style recurrent gated delta rule, state updated in-place");
   m.def("gdn_recurrent_ab", &gdn_recurrent_ab,
@@ -160,6 +371,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("dt_bias"),
         py::arg("state_arena"),
         py::arg("state_indices"));
+  m.def("gdn_recurrent_ab_batch_norm_gate", &gdn_recurrent_ab_batch_norm_gate,
+        "Batched Qwen-style gated delta update fused with output RMSNorm and SiLU gate",
+        py::arg("q"),
+        py::arg("k"),
+        py::arg("v"),
+        py::arg("a"),
+        py::arg("b"),
+        py::arg("A_log"),
+        py::arg("dt_bias"),
+        py::arg("state_arena"),
+        py::arg("state_indices"),
+        py::arg("norm_w"),
+        py::arg("z"),
+        py::arg("eps"));
   m.def("gdn_recurrent_ab_spec", &gdn_recurrent_ab_spec,
         "Speculative Qwen-style gated delta scan over [B,T] with commit-token state update",
         py::arg("q"),
@@ -233,6 +458,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("trajectory"));
   m.def("attention_decode_fp16", &attention_decode_fp16,
         "Small/medium context fp16 decode attention baseline");
+  m.def("attention_decode_fp16_gated", &attention_decode_fp16_gated,
+        "Small fp16 decode attention fused with sigmoid gate");
+  m.def("attention_decode_fp16_gated_tkh", &attention_decode_fp16_gated_tkh,
+        "Small fp16 decode attention fused with sigmoid gate over time-major local KV cache");
   m.def("attention_decode_batch_fp16", &attention_decode_batch_fp16,
         "Batched fp16 decode attention over slot-indexed KV arena",
         py::arg("q"),

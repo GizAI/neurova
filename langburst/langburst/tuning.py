@@ -215,3 +215,10 @@ def verify_nextn_mode(value: str | None = None) -> str:
         choices = ", ".join(VERIFY_NEXTN_MODE_CHOICES)
         raise ValueError(f"LANGBURST_VERIFY_NEXTN_MODE must be one of: {choices}")
     return mode
+
+
+def verify_full_logits_enabled(value: str | int | bool | None = None) -> bool:
+    raw = value if value is not None else os.environ.get("LANGBURST_VERIFY_FULL_LOGITS")
+    if raw is None or raw == "":
+        return False
+    return _parse_env_bool(raw, "LANGBURST_VERIFY_FULL_LOGITS")

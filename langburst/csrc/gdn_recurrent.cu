@@ -885,6 +885,182 @@ torch::Tensor gdn_recurrent_ab_batch(
   return out;
 }
 
+__global__ void gdn_recurrent_ab_batch_norm_gate_128_kernel(
+    const half* __restrict__ q,
+    const half* __restrict__ k,
+    const half* __restrict__ v,
+    const half* __restrict__ a,
+    const half* __restrict__ b,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    half* __restrict__ state_arena,
+    const int64_t* __restrict__ state_indices,
+    const half* __restrict__ norm_w,
+    const half* __restrict__ z,
+    half* __restrict__ out,
+    int batch,
+    int slots,
+    int kv_heads,
+    int v_heads,
+    float eps) {
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  if (row >= batch || tid >= QB_GDN_D) return;
+
+  int64_t slot64 = state_indices[row];
+  if (slot64 < 0 || slot64 >= slots) return;
+  int slot = static_cast<int>(slot64);
+  int ratio = v_heads / kv_heads;
+
+  __shared__ float q_s[QB_GDN_D];
+  __shared__ float k_s[QB_GDN_D];
+  __shared__ float red[QB_GDN_BLOCK];
+  float sumsq = 0.0f;
+
+  for (int vh = 0; vh < v_heads; ++vh) {
+    int kh = vh / ratio;
+    const int64_t q_off = (static_cast<int64_t>(row) * kv_heads + kh) * QB_GDN_D;
+    const int64_t v_off = (static_cast<int64_t>(row) * v_heads + vh) * QB_GDN_D;
+
+    float qv = __half2float(q[q_off + tid]);
+    float kv = __half2float(k[q_off + tid]);
+    q_s[tid] = qv;
+    k_s[tid] = kv;
+
+    red[tid] = qv * qv;
+    __syncthreads();
+    for (int stride = QB_GDN_BLOCK / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) red[tid] += red[tid + stride];
+      __syncthreads();
+    }
+    float q_inv = rsqrtf(red[0] + 1e-6f);
+
+    red[tid] = kv * kv;
+    __syncthreads();
+    for (int stride = QB_GDN_BLOCK / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) red[tid] += red[tid + stride];
+      __syncthreads();
+    }
+    float k_inv = rsqrtf(red[0] + 1e-6f);
+
+    q_s[tid] *= q_inv * rsqrtf(static_cast<float>(QB_GDN_D));
+    k_s[tid] *= k_inv;
+    __syncthreads();
+
+    int j = tid;
+    half* S = state_arena + ((static_cast<int64_t>(slot) * v_heads + vh) * QB_GDN_D * QB_GDN_D);
+    float old_j = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < QB_GDN_D; ++d) {
+      old_j += k_s[d] * __half2float(S[d * QB_GDN_D + j]);
+    }
+
+    float vj = __half2float(v[v_off + j]);
+    float delta = vj - old_j;
+    float ax = __half2float(a[static_cast<int64_t>(row) * v_heads + vh]) + dt_bias[vh];
+    float softplus = ax > 20.0f ? ax : log1pf(__expf(ax));
+    float g = -__expf(A_log[vh]) * softplus;
+    float decay = __expf(g);
+    float beta = qb_sigmoid(__half2float(b[static_cast<int64_t>(row) * v_heads + vh]));
+
+    #pragma unroll
+    for (int d = 0; d < QB_GDN_D; ++d) {
+      float s_old = __half2float(S[d * QB_GDN_D + j]);
+      float s_new = decay * s_old + beta * k_s[d] * delta;
+      S[d * QB_GDN_D + j] = __float2half_rn(s_new);
+    }
+    __syncthreads();
+
+    // Keep this output path identical to gdn_recurrent_ab_batch_128_kernel.
+    // Reusing the shared q_s fragment here caused head-dependent drift on the
+    // real Qwen3.6 shape after the state update path was fused with norm/gate.
+    float q_norm_sum = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < QB_GDN_D; ++d) {
+      float qd = __half2float(q[q_off + d]);
+      q_norm_sum += qd * qd;
+    }
+    float q_scale = rsqrtf(q_norm_sum + 1e-6f) * rsqrtf(static_cast<float>(QB_GDN_D));
+    float yj = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < QB_GDN_D; ++d) {
+      yj += (__half2float(q[q_off + d]) * q_scale) * __half2float(S[d * QB_GDN_D + j]);
+    }
+    out[v_off + j] = __float2half_rn(yj);
+    sumsq += yj * yj;
+    __syncthreads();
+  }
+
+  red[tid] = sumsq;
+  __syncthreads();
+  for (int stride = QB_GDN_BLOCK / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) red[tid] += red[tid + stride];
+    __syncthreads();
+  }
+  float inv_rms = rsqrtf(red[0] / static_cast<float>(v_heads * QB_GDN_D) + eps);
+
+  int hidden = v_heads * QB_GDN_D;
+  for (int idx = tid; idx < hidden; idx += QB_GDN_BLOCK) {
+    float yv = __half2float(out[static_cast<int64_t>(row) * hidden + idx]);
+    float ww = __half2float(norm_w[idx]);
+    float zv = __half2float(z[static_cast<int64_t>(row) * hidden + idx]);
+    out[static_cast<int64_t>(row) * hidden + idx] = __float2half_rn(yv * inv_rms * ww * qb_silu(zv));
+  }
+}
+
+torch::Tensor gdn_recurrent_ab_batch_norm_gate(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor A_log,
+    torch::Tensor dt_bias,
+    torch::Tensor state_arena,
+    torch::Tensor state_indices,
+    torch::Tensor norm_w,
+    torch::Tensor z,
+    double eps) {
+  QB_CHECK_CUDA(q); QB_CHECK_CUDA(k); QB_CHECK_CUDA(v); QB_CHECK_CUDA(a); QB_CHECK_CUDA(b); QB_CHECK_CUDA(A_log); QB_CHECK_CUDA(dt_bias); QB_CHECK_CUDA(state_arena); QB_CHECK_CUDA(state_indices); QB_CHECK_CUDA(norm_w); QB_CHECK_CUDA(z);
+  QB_CHECK_CONTIGUOUS(q); QB_CHECK_CONTIGUOUS(k); QB_CHECK_CONTIGUOUS(v); QB_CHECK_CONTIGUOUS(a); QB_CHECK_CONTIGUOUS(b); QB_CHECK_CONTIGUOUS(A_log); QB_CHECK_CONTIGUOUS(dt_bias); QB_CHECK_CONTIGUOUS(state_arena); QB_CHECK_CONTIGUOUS(state_indices); QB_CHECK_CONTIGUOUS(norm_w); QB_CHECK_CONTIGUOUS(z);
+  QB_CHECK_HALF(q); QB_CHECK_HALF(k); QB_CHECK_HALF(v); QB_CHECK_HALF(a); QB_CHECK_HALF(b); QB_CHECK_HALF(state_arena); QB_CHECK_HALF(norm_w); QB_CHECK_HALF(z);
+  QB_CHECK_INT64(state_indices);
+  TORCH_CHECK(A_log.scalar_type() == at::kFloat && dt_bias.scalar_type() == at::kFloat, "A_log/dt_bias must be fp32");
+  TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "q/k/v must be [batch, heads, 128]");
+  int batch = static_cast<int>(q.size(0));
+  int kv_heads = static_cast<int>(q.size(1));
+  int v_heads = static_cast<int>(v.size(1));
+  TORCH_CHECK(q.size(2) == QB_GDN_D && k.size(2) == QB_GDN_D && v.size(2) == QB_GDN_D, "head dim must be 128");
+  TORCH_CHECK(k.size(0) == batch && k.size(1) == kv_heads, "k shape mismatch");
+  TORCH_CHECK(v.size(0) == batch && v_heads % kv_heads == 0, "v shape mismatch");
+  TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && a.size(0) == batch && b.size(0) == batch && a.size(1) == v_heads && b.size(1) == v_heads, "a/b must be [batch, v_heads]");
+  TORCH_CHECK(z.dim() == 3 && z.size(0) == batch && z.size(1) == v_heads && z.size(2) == QB_GDN_D, "z must be [batch, v_heads, 128]");
+  TORCH_CHECK(norm_w.numel() == v_heads * QB_GDN_D, "norm_w hidden mismatch");
+  TORCH_CHECK(state_arena.dim() == 4 && state_arena.size(1) == v_heads && state_arena.size(2) == QB_GDN_D && state_arena.size(3) == QB_GDN_D, "state_arena must be [slots, v_heads, 128, 128]");
+  TORCH_CHECK(state_indices.dim() == 1 && state_indices.size(0) == batch, "state_indices must be [batch]");
+  int slots = static_cast<int>(state_arena.size(0));
+
+  auto out = torch::empty({batch, v_heads, QB_GDN_D}, q.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 grid(batch);
+  gdn_recurrent_ab_batch_norm_gate_128_kernel<<<grid, QB_GDN_BLOCK, 0, stream>>>(
+      reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(k.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(v.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(a.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(b.data_ptr<at::Half>()),
+      A_log.data_ptr<float>(),
+      dt_bias.data_ptr<float>(),
+      reinterpret_cast<half*>(state_arena.data_ptr<at::Half>()),
+      state_indices.data_ptr<int64_t>(),
+      reinterpret_cast<const half*>(norm_w.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(z.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      batch, slots, kv_heads, v_heads, static_cast<float>(eps));
+  QB_CUDA_CHECK(cudaGetLastError());
+  return out;
+}
+
 __global__ void gdn_recurrent_scan_128_kernel(
     const half* __restrict__ q,
     const half* __restrict__ k,

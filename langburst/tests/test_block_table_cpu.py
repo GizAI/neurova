@@ -17,6 +17,15 @@ def test_kv_block_table_allocates_logical_positions():
     assert ref.offset == 0
 
 
+def test_request_block_table_wraps_logical_positions_inside_ring_capacity():
+    table = KVBlockTable(num_blocks=2, block_size=4)
+    req = table.ensure_tokens("r1", 8)
+
+    assert req.logical_to_physical(8, block_size=4).block_id == 0
+    assert req.logical_to_physical(9, block_size=4).offset == 1
+    assert req.logical_to_physical(15, block_size=4).block_id == 1
+
+
 def test_kv_block_table_releases_blocks():
     table = KVBlockTable(num_blocks=2, block_size=4)
     table.ensure_tokens("r1", 8)

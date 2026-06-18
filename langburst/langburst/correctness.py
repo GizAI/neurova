@@ -219,6 +219,7 @@ def _batch_generate_ids_once(
             max_num_requests=1,
             max_num_batched_tokens=max(2, int(features.prefill_chunk_size), len(prompt_ids)),
             prefill_chunk_size=max(1, int(features.prefill_chunk_size)),
+            kv_window_tokens=engine.recent_window,
         )
         local_runner = BatchedModelRunner(engine=engine, scheduler=scheduler, features=features, max_state_pool_size=0)
     row = local_runner.add_request(request_id, prompt_ids, generation_config=gen_cfg)
@@ -266,6 +267,7 @@ def run_batch_path_parity(
         max_num_requests=1,
         max_num_batched_tokens=max(2, int(prefix_features.prefill_chunk_size), len(prompt_ids)),
         prefill_chunk_size=max(1, int(prefix_features.prefill_chunk_size)),
+        kv_window_tokens=engine.recent_window,
     )
     runner = BatchedModelRunner(engine=engine, scheduler=scheduler, features=prefix_features, max_state_pool_size=0)
     _batch_generate_ids_once(engine, prompt_ids, gen_cfg, prefix_features, runner=runner, request_id="prefix-warm")

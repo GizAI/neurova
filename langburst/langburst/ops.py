@@ -79,6 +79,61 @@ class CPUFallbackOps:
         raise RuntimeError("lowbit_marlin_gemm_out requires langburst_cuda")
 
     @staticmethod
+    def lowbit_marlin_mlp_streaming_out(
+        gate_up_qweight: torch.Tensor,
+        gate_up_scales: torch.Tensor,
+        down_qweight: torch.Tensor,
+        down_scales: torch.Tensor,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        accum: torch.Tensor,
+        sync: torch.Tensor,
+        epoch: int,
+        hidden: int,
+        intermediate: int,
+        gate_group_size: int,
+        down_group_size: int,
+    ) -> None:
+        gate_up_scratch = torch.empty((x.size(0), int(intermediate) * 2), device=x.device, dtype=x.dtype)
+        down_workspace = torch.empty((max(1, int(hidden) // 128 * 16),), device=x.device, dtype=torch.int32)
+        CPUFallbackOps.lowbit_marlin_gemm_out(gate_up_qweight, gate_up_scales, x, gate_up_scratch, down_workspace, int(hidden), int(gate_group_size))
+        act = CPUFallbackOps.silu_mul_packed(gate_up_scratch, int(intermediate)).contiguous()
+        CPUFallbackOps.lowbit_marlin_gemm_out(down_qweight, down_scales, act, out, down_workspace, int(intermediate), int(down_group_size))
+
+    @staticmethod
+    def lowbit_marlin_gemm_silu_packed_out(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        mixed: torch.Tensor,
+        out: torch.Tensor,
+        workspace: torch.Tensor,
+        cols: int,
+        group_size: int,
+    ) -> None:
+        act = CPUFallbackOps.silu_mul_packed(mixed, int(cols)).contiguous()
+        CPUFallbackOps.lowbit_marlin_gemm_out(qweight, scales, act, out, workspace, cols, group_size)
+
+    @staticmethod
+    def lowbit_marlin_gemm_argmax_out(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        x: torch.Tensor,
+        scratch_out: torch.Tensor,
+        workspace: torch.Tensor,
+        argmax_state: torch.Tensor,
+        argmax_out: torch.Tensor,
+        argmax_sync: torch.Tensor,
+        argmax_epoch: int,
+        cols: int,
+        group_size: int,
+    ) -> None:
+        # CPU fallback preserves the public contract.  The CUDA implementation
+        # performs the argmax inside the Marlin kernel and writes argmax_out
+        # directly; scratch_out is only needed by this fallback path.
+        CPUFallbackOps.lowbit_marlin_gemm_out(qweight, scales, x, scratch_out, workspace, cols, group_size)
+        CPUFallbackOps.argmax_many_out(scratch_out, argmax_out)
+
+    @staticmethod
     def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         x32 = x.to(torch.float32)
         inv = torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps)
@@ -104,6 +159,31 @@ class CPUFallbackOps:
     @staticmethod
     def silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         return (torch.nn.functional.silu(gate.float()) * up.float()).to(gate.dtype)
+
+    @staticmethod
+    def silu_mul_packed(mixed: torch.Tensor, hidden: int) -> torch.Tensor:
+        gate, up = torch.split(mixed, [int(hidden), int(hidden)], dim=-1)
+        return (torch.nn.functional.silu(gate.float()) * up.float()).to(mixed.dtype).contiguous()
+
+    @staticmethod
+    def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        return (x.float() * torch.sigmoid(gate.float())).to(x.dtype).contiguous()
+
+    @staticmethod
+    def sigmoid_mul_repeat_kv(v: torch.Tensor, gate: torch.Tensor, ratio: int) -> torch.Tensor:
+        return (v.repeat_interleave(int(ratio), dim=1).reshape(gate.size(0), -1).float() * torch.sigmoid(gate.reshape(gate.size(0), -1).float())).to(v.dtype).contiguous()
+
+    @staticmethod
+    def rmsnorm_qwen_pair_cat(x0: torch.Tensor, w0: torch.Tensor, x1: torch.Tensor, w1: torch.Tensor, eps: float) -> torch.Tensor:
+        y0 = CPUFallbackOps.rmsnorm_qwen(x0, w0, eps)
+        y1 = CPUFallbackOps.rmsnorm_qwen(x1, w1, eps)
+        return torch.cat([y0, y1], dim=-1).contiguous()
+
+    @staticmethod
+    def rmsnorm_qwen_rope(x: torch.Tensor, weight: torch.Tensor, pos: int, rope_dim: int, rope_theta: float, eps: float) -> torch.Tensor:
+        from langburst.adapters.qwen36_impl.model import apply_rope_single_tensor
+        y = CPUFallbackOps.rmsnorm_qwen(x.reshape(-1, x.shape[-1]), weight, eps).reshape_as(x)
+        return apply_rope_single_tensor(y, pos=int(pos), rope_dim=int(rope_dim), rope_theta=float(rope_theta)).contiguous()
 
     @staticmethod
     def gdn_recurrent(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
@@ -199,6 +279,29 @@ class CPUFallbackOps:
                 )
             )
         return torch.stack(outs, dim=0).contiguous()
+
+    @staticmethod
+    def gdn_recurrent_ab_batch_norm_gate(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_arena: torch.Tensor,
+        state_indices: torch.Tensor,
+        norm_w: torch.Tensor,
+        z: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        core = CPUFallbackOps.gdn_recurrent_ab_batch(q, k, v, a, b, A_log, dt_bias, state_arena, state_indices)
+        return CPUFallbackOps.rmsnorm_silu_gate(
+            core.reshape(core.size(0), -1).contiguous(),
+            norm_w.reshape(-1).to(device=core.device, dtype=core.dtype).contiguous(),
+            z.reshape(core.size(0), -1).to(device=core.device, dtype=core.dtype).contiguous(),
+            eps,
+        ).reshape_as(core)
 
     @staticmethod
     def gdn_recurrent_ab_spec(
@@ -423,6 +526,14 @@ class CPUFallbackOps:
             probs = torch.softmax(scores, dim=0)
             out[h] = torch.matmul(probs, vf[kh])
         return out.to(q.dtype)
+
+
+    @staticmethod
+    def attention_decode_fp16_gated_tkh(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, gate: torch.Tensor, length: int, scale: float) -> torch.Tensor:
+        k_live = k_cache[: int(length)].permute(1, 0, 2).contiguous()
+        v_live = v_cache[: int(length)].permute(1, 0, 2).contiguous()
+        att = CPUFallbackOps.attention_decode_fp16(q, k_live, v_live, int(length), float(scale))
+        return CPUFallbackOps.sigmoid_mul(att.reshape(-1), gate.reshape(-1))
 
     @staticmethod
     def attention_decode_batch_fp16(

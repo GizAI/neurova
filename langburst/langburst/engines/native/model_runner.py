@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import logging
+import os
 import time
 from typing import Sequence
 
@@ -94,7 +95,11 @@ class BatchedModelRunner:
         prompt_cache_key: str | None = None,
         prefix_cache_enabled: bool = True,
     ) -> DecodeRequestState:
-        row = self.scheduler.add_request(request_id, token_ids)
+        row = self.scheduler.add_request(
+            request_id,
+            token_ids,
+            kv_window_tokens=getattr(self.engine, "recent_window", None),
+        )
         row.generation_config = generation_config or GenerationConfig()
         row.prompt_cache_key = prompt_cache_key
         row.prefix_cache_enabled = bool(prefix_cache_enabled)
@@ -332,9 +337,46 @@ class BatchedModelRunner:
         self._speculative_prepare_skips.clear()
 
     def release_idle_runtime_caches(self) -> None:
+        self._clear_prefix_cache_under_pressure()
+        if not self.cuda_memory_policy.should_release(active_requests=0):
+            return
         clear_model_caches = getattr(self.engine.model, "clear_runtime_caches", None)
         if callable(clear_model_caches):
             clear_model_caches()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        self._clear_prefix_cache_under_pressure()
+
+    def _cuda_free_mib(self) -> int | None:
+        if not torch.cuda.is_available():
+            return None
+        free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        return int(free_bytes // (1024 * 1024))
+
+    def _prefix_cache_under_pressure(self) -> bool:
+        if not self.features.prefix_cache:
+            return False
+        if not str(self.engine.device).startswith("cuda") or not torch.cuda.is_available():
+            return False
+        policy = self.kv_cache_policy
+        if policy.min_free_blocks > 0 and self.scheduler.block_table is not None:
+            if self.scheduler.block_table.free_block_count < policy.min_free_blocks:
+                return True
+        if policy.min_free_mib > 0:
+            free_mib = self._cuda_free_mib()
+            if free_mib is not None and free_mib < policy.min_free_mib:
+                return True
+        return False
+
+    def _clear_prefix_cache_under_pressure(self) -> bool:
+        if not self._prefix_cache_under_pressure():
+            return False
+        self.prefix_cache.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        return True
 
     def _record_speculative_prepare_skip(self, reason: str) -> None:
         self._speculative_prepare_skips[reason] = self._speculative_prepare_skips.get(reason, 0) + 1
@@ -352,6 +394,7 @@ class BatchedModelRunner:
         if not bool(getattr(row, "prefix_cache_enabled", True)):
             return
         max_prefix_len = self._max_reusable_prefix_len(len(row.token_ids))
+        max_prefix_len = min(max_prefix_len, int(row.kv_token_capacity))
         if max_prefix_len <= 0:
             return
         hit = self.prefix_cache.lookup(row.token_ids, max_prefix_len=max_prefix_len, namespace=row.prompt_cache_key)
@@ -385,6 +428,8 @@ class BatchedModelRunner:
             if not bool(getattr(row, "prefix_cache_enabled", True)):
                 continue
             prefix_len = int(row.computed_tokens)
+            if prefix_len > int(row.kv_token_capacity):
+                continue
             if int(row.prefix_cache_hit_tokens) >= prefix_len:
                 continue
             if block_size > 0 and prefix_len % block_size != 0:
@@ -409,6 +454,7 @@ class BatchedModelRunner:
                 block_ids=block_ids,
                 namespace=row.prompt_cache_key,
             )
+            self._clear_prefix_cache_under_pressure()
 
     def _apply_speculative_gpu_decision(
         self,
@@ -517,11 +563,18 @@ class BatchedModelRunner:
             if int(sampled_n) <= 0:
                 self._record_speculative_prepare_skip("no_sampled_token")
                 continue
-            if int(rejected_n) != 0:
+            if (
+                int(rejected_n) != 0
+                and os.environ.get("LANGBURST_MTP_SKIP_AFTER_REJECT", "0").strip().lower()
+                in {"1", "true", "on", "yes"}
+            ):
                 self._record_speculative_prepare_skip("rejected_previous_step")
                 continue
             if row.last_sampled_token is None:
                 self._record_speculative_prepare_skip("missing_last_sampled_token")
+                continue
+            if int(row.computed_tokens) > int(row.kv_token_capacity):
+                self._record_speculative_prepare_skip("overflow_kv_window")
                 continue
             cfg = _generation_config_from_row(row)
             sampling_reason = _configured_sampling_reason(cfg)
@@ -540,11 +593,9 @@ class BatchedModelRunner:
                         max_draft=max_draft,
                         signals={
                             "raw_hidden": raw_hidden,
-                            "first_token": torch.tensor(
-                                int(row.last_sampled_token),
-                                device=raw_hidden.device,
-                                dtype=torch.long,
-                            ),
+                            # Keep the signal tensor-shaped for proposer tests/contracts,
+                            # but allocate it on CPU to avoid a per-step CUDA scalar allocation.
+                            "first_token": torch.tensor(int(row.last_sampled_token), dtype=torch.long),
                             "pos": int(row.computed_tokens),
                         },
                     ),
@@ -557,7 +608,8 @@ class BatchedModelRunner:
         requests = [request for _idx, request in pending]
         try:
             propose_batch = getattr(proposer, "propose_tensors_batch", None)
-            if callable(propose_batch):
+            use_batch_proposer = os.environ.get("LANGBURST_MTP_BATCH_PROPOSER", "1").strip().lower() in {"1", "true", "on", "yes"}
+            if use_batch_proposer and callable(propose_batch):
                 drafts = propose_batch(requests)
             else:
                 propose_tensors = getattr(proposer, "propose_tensors", None)
