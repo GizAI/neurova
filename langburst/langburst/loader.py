@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import weakref
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import torch
@@ -17,6 +19,9 @@ from .tuning import DEFAULT_MARLIN_DIRECT_MAX_BATCH, lowbit_rows_per_cta, marlin
 
 
 MARLIN_DIRECT_MAX_BATCH = DEFAULT_MARLIN_DIRECT_MAX_BATCH
+_MIB = 1024 * 1024
+_MARLIN_RUNTIME_CACHE_REFS: list[weakref.ReferenceType["LowBitMarlinTensor"]] = []
+_MARLIN_RUNTIME_CACHE_BYTES = 0
 
 
 def _marlin_out_cache_policy() -> str:
@@ -30,6 +35,24 @@ def _marlin_out_cache_max_batch() -> int:
     return max(1, int(raw))
 
 
+def _env_mib(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return int(default)
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return value
+
+
+def _marlin_cache_max_bytes() -> int:
+    return _env_mib("LANGBURST_MARLIN_CACHE_MAX_MIB", 384) * _MIB
+
+
+def _marlin_cache_min_free_bytes() -> int:
+    return _env_mib("LANGBURST_MARLIN_CACHE_MIN_FREE_MIB", 384) * _MIB
+
+
 def marlin_should_cache_out(batch: int) -> bool:
     policy = _marlin_out_cache_policy()
     if policy in {"0", "false", "off", "none", "no_cache"}:
@@ -39,6 +62,87 @@ def marlin_should_cache_out(batch: int) -> bool:
     if policy in {"decode_small", "small", "bounded"}:
         return int(batch) <= _marlin_out_cache_max_batch()
     return True
+
+
+def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    if dtype in {torch.float16, torch.bfloat16, torch.int16, torch.uint16}:
+        return 2
+    if dtype in {torch.float32, torch.int32, torch.uint32}:
+        return 4
+    if dtype in {torch.float64, torch.int64, torch.long}:
+        return 8
+    if dtype in {torch.int8, torch.uint8, torch.bool}:
+        return 1
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _add_marlin_runtime_cache_bytes(delta: int) -> None:
+    global _MARLIN_RUNTIME_CACHE_BYTES
+    _MARLIN_RUNTIME_CACHE_BYTES = max(0, _MARLIN_RUNTIME_CACHE_BYTES + int(delta))
+
+
+def _register_marlin_runtime_cache(tensor: "LowBitMarlinTensor") -> None:
+    _MARLIN_RUNTIME_CACHE_REFS.append(weakref.ref(tensor))
+
+
+def _iter_marlin_runtime_tensors() -> Iterator["LowBitMarlinTensor"]:
+    live_refs: list[weakref.ReferenceType["LowBitMarlinTensor"]] = []
+    for ref in _MARLIN_RUNTIME_CACHE_REFS:
+        obj = ref()
+        if obj is None:
+            continue
+        live_refs.append(ref)
+        yield obj
+    if len(live_refs) != len(_MARLIN_RUNTIME_CACHE_REFS):
+        _MARLIN_RUNTIME_CACHE_REFS[:] = live_refs
+
+
+def marlin_runtime_cache_bytes() -> int:
+    return int(_MARLIN_RUNTIME_CACHE_BYTES)
+
+
+def clear_marlin_runtime_caches() -> None:
+    for obj in _iter_marlin_runtime_tensors():
+        obj.clear_runtime_cache()
+
+
+def marlin_runtime_cache_summary() -> dict[str, int]:
+    return {
+        "tensors": sum(1 for _ in _iter_marlin_runtime_tensors()),
+        "bytes": marlin_runtime_cache_bytes(),
+        "mib": round(marlin_runtime_cache_bytes() / _MIB),
+        "max_mib": _marlin_cache_max_bytes() // _MIB,
+        "min_free_mib": _marlin_cache_min_free_bytes() // _MIB,
+    }
+
+
+def marlin_cache_admitted(batch: int, *, device: torch.device, new_bytes: int = 0) -> bool:
+    if not marlin_should_cache_out(batch):
+        return False
+    max_bytes = _marlin_cache_max_bytes()
+    if max_bytes > 0 and marlin_runtime_cache_bytes() + int(new_bytes) > max_bytes:
+        return False
+    min_free = _marlin_cache_min_free_bytes()
+    if min_free <= 0 or device.type != "cuda" or not torch.cuda.is_available():
+        return True
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    return int(free_bytes) - int(new_bytes) >= min_free
+
+
+def _empty_cuda_tensor(shape: tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    try:
+        return torch.empty(shape, device=device, dtype=dtype)
+    except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
+        clear_marlin_runtime_caches()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        return torch.empty(shape, device=device, dtype=dtype)
 
 
 @dataclass
@@ -113,6 +217,91 @@ class LowBitMarlinTensor:
     _argmax_epoch: int = field(default=0, init=False, repr=False)
     _workspace: torch.Tensor | None = field(default=None, init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        _register_marlin_runtime_cache(self)
+
+    def runtime_cache_bytes(self) -> int:
+        total = _tensor_nbytes(self._workspace)
+        total += _tensor_nbytes(self._argmax_sync)
+        total += sum(_tensor_nbytes(tensor) for tensor in self._out_cache.values())
+        total += sum(_tensor_nbytes(tensor) for tensor in self._argmax_cache.values())
+        total += sum(_tensor_nbytes(tensor) for tensor in self._argmax_state_cache.values())
+        return total
+
+    def _put_out_cache(self, batch: int, tensor: torch.Tensor) -> None:
+        old = self._out_cache.get(batch)
+        _add_marlin_runtime_cache_bytes(_tensor_nbytes(tensor) - _tensor_nbytes(old))
+        self._out_cache[batch] = tensor
+
+    def _put_argmax_cache(self, batch: int, tensor: torch.Tensor) -> None:
+        old = self._argmax_cache.get(batch)
+        _add_marlin_runtime_cache_bytes(_tensor_nbytes(tensor) - _tensor_nbytes(old))
+        self._argmax_cache[batch] = tensor
+
+    def _put_argmax_state_cache(self, batch: int, tensor: torch.Tensor) -> None:
+        old = self._argmax_state_cache.get(batch)
+        _add_marlin_runtime_cache_bytes(_tensor_nbytes(tensor) - _tensor_nbytes(old))
+        self._argmax_state_cache[batch] = tensor
+
+    def _put_workspace(self, tensor: torch.Tensor | None) -> None:
+        _add_marlin_runtime_cache_bytes(_tensor_nbytes(tensor) - _tensor_nbytes(self._workspace))
+        self._workspace = tensor
+
+    def _put_argmax_sync(self, tensor: torch.Tensor | None) -> None:
+        _add_marlin_runtime_cache_bytes(_tensor_nbytes(tensor) - _tensor_nbytes(self._argmax_sync))
+        self._argmax_sync = tensor
+
+    def _cached_output(self, batch: int, rows: int, *, dtype: torch.dtype = torch.float16) -> torch.Tensor:
+        device = self.qweight.device
+        cached = self._out_cache.get(batch)
+        if cached is not None and cached.device == device and cached.shape == (batch, rows) and cached.dtype == dtype:
+            return cached
+        nbytes = batch * rows * _dtype_nbytes(dtype)
+        if marlin_cache_admitted(batch, device=device, new_bytes=nbytes):
+            out = _empty_cuda_tensor((batch, rows), device=device, dtype=dtype)
+            self._put_out_cache(batch, out)
+            return out
+        return _empty_cuda_tensor((batch, rows), device=device, dtype=dtype)
+
+    def _cached_argmax(self, batch: int) -> torch.Tensor:
+        device = self.qweight.device
+        cached = self._argmax_cache.get(batch)
+        if cached is not None and cached.device == device and cached.numel() == batch:
+            return cached
+        nbytes = batch * _dtype_nbytes(torch.long)
+        if marlin_cache_admitted(batch, device=device, new_bytes=nbytes):
+            out = _empty_cuda_tensor((batch,), device=device, dtype=torch.long)
+            self._put_argmax_cache(batch, out)
+            return out
+        return _empty_cuda_tensor((batch,), device=device, dtype=torch.long)
+
+    def _cached_argmax_state(self, batch: int) -> torch.Tensor:
+        device = self.qweight.device
+        cached = self._argmax_state_cache.get(batch)
+        if cached is not None and cached.device == device and cached.numel() == batch:
+            return cached
+        nbytes = batch * _dtype_nbytes(torch.long)
+        if marlin_cache_admitted(batch, device=device, new_bytes=nbytes):
+            state = _empty_cuda_tensor((batch,), device=device, dtype=torch.long)
+            self._put_argmax_state_cache(batch, state)
+            return state
+        return _empty_cuda_tensor((batch,), device=device, dtype=torch.long)
+
+    def _cached_workspace(self, workspace_size: int) -> torch.Tensor:
+        device = self.qweight.device
+        nbytes = int(workspace_size) * _dtype_nbytes(torch.int32)
+        if (
+            self._workspace is None
+            or self._workspace.device != device
+            or self._workspace.numel() < workspace_size
+        ):
+            if marlin_cache_admitted(1, device=device, new_bytes=nbytes):
+                self._put_workspace(torch.zeros((workspace_size,), device=device, dtype=torch.int32))
+                return self._workspace
+            return torch.zeros((workspace_size,), device=device, dtype=torch.int32)
+        self._workspace[:workspace_size].zero_()
+        return self._workspace
+
     def gemv(self, x: torch.Tensor) -> torch.Tensor:
         return self.gemm(x.reshape(1, -1).contiguous()).reshape(-1)
 
@@ -130,24 +319,16 @@ class LowBitMarlinTensor:
             rows = [self.gemm(row.reshape(1, -1)).reshape(-1).clone() for row in x]
             return torch.stack(rows, dim=0).contiguous()
         rows = int(self.qweight.size(1) // 2)
-        cache_out = marlin_should_cache_out(batch)
-        out = self._out_cache.get(batch) if cache_out else None
-        if out is None or out.device != self.qweight.device or out.size(1) != rows:
-            out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
-            if cache_out:
-                self._out_cache[batch] = out
+        out = self._cached_output(batch, rows)
         workspace_size = max(1, rows // 128 * 16)
-        if self._workspace is None or self._workspace.device != self.qweight.device or self._workspace.numel() < workspace_size:
-            self._workspace = torch.zeros((workspace_size,), device=self.qweight.device, dtype=torch.int32)
-        else:
-            self._workspace[:workspace_size].zero_()
+        workspace = self._cached_workspace(workspace_size)
         with torch.cuda.device(self.qweight.device):
             cuda_ops().lowbit_marlin_gemm_out(
                 self.qweight,
                 self.scales,
                 x,
                 out,
-                self._workspace,
+                workspace,
                 self.cols,
                 self.group_size,
             )
@@ -167,28 +348,20 @@ class LowBitMarlinTensor:
         mixed = mixed.to(device=self.qweight.device, dtype=torch.float16).contiguous()
         batch = int(mixed.size(0))
         rows = int(self.qweight.size(1) // 2)
-        cache_out = marlin_should_cache_out(batch)
         if out is None:
-            out = self._out_cache.get(batch) if cache_out else None
-            if out is None or out.device != self.qweight.device or out.size(1) != rows:
-                out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
-                if cache_out:
-                    self._out_cache[batch] = out
+            out = self._cached_output(batch, rows)
         else:
             if out.device != self.qweight.device or out.shape != (batch, rows) or out.dtype != torch.float16:
                 raise ValueError("out must be fp16 CUDA tensor with shape [batch, rows]")
         workspace_size = max(1, rows // 128 * 16)
-        if self._workspace is None or self._workspace.device != self.qweight.device or self._workspace.numel() < workspace_size:
-            self._workspace = torch.zeros((workspace_size,), device=self.qweight.device, dtype=torch.int32)
-        else:
-            self._workspace[:workspace_size].zero_()
+        workspace = self._cached_workspace(workspace_size)
         with torch.cuda.device(self.qweight.device):
             cuda_ops().lowbit_marlin_gemm_silu_packed_out(
                 self.qweight,
                 self.scales,
                 mixed,
                 out,
-                self._workspace,
+                workspace,
                 int(hidden),
                 self.group_size,
             )
@@ -204,32 +377,24 @@ class LowBitMarlinTensor:
         x = x.to(device=self.qweight.device, dtype=torch.float16).contiguous()
         batch = int(x.size(0))
         rows = int(self.qweight.size(1) // 2)
-        cache_out = marlin_should_cache_out(batch)
-        scratch_out = self._out_cache.get(batch) if cache_out else None
-        if scratch_out is None or scratch_out.device != self.qweight.device or scratch_out.size(1) != rows:
-            scratch_out = torch.empty((batch, rows), device=self.qweight.device, dtype=torch.float16)
-            if cache_out:
-                self._out_cache[batch] = scratch_out
+        scratch_out = self._cached_output(batch, rows)
         workspace_size = max(1, rows // 128 * 16)
-        if self._workspace is None or self._workspace.device != self.qweight.device or self._workspace.numel() < workspace_size:
-            self._workspace = torch.zeros((workspace_size,), device=self.qweight.device, dtype=torch.int32)
-        else:
-            self._workspace[:workspace_size].zero_()
+        workspace = self._cached_workspace(workspace_size)
         if out is None:
-            out = self._argmax_cache.get(batch)
-            if out is None or out.device != self.qweight.device or out.numel() != batch:
-                out = torch.empty((batch,), device=self.qweight.device, dtype=torch.long)
-                self._argmax_cache[batch] = out
+            out = self._cached_argmax(batch)
         else:
             if out.device != self.qweight.device or out.numel() != batch or out.dtype != torch.long:
                 raise ValueError("argmax out must be int64 CUDA tensor with shape [batch]")
             out = out.reshape(batch)
-        state = self._argmax_state_cache.get(batch)
-        if state is None or state.device != self.qweight.device or state.numel() != batch:
-            state = torch.empty((batch,), device=self.qweight.device, dtype=torch.long)
-            self._argmax_state_cache[batch] = state
+        state = self._cached_argmax_state(batch)
         if self._argmax_sync is None or self._argmax_sync.device != self.qweight.device:
-            self._argmax_sync = torch.empty((2,), device=self.qweight.device, dtype=torch.int32)
+            if marlin_cache_admitted(batch, device=self.qweight.device, new_bytes=2 * 4):
+                self._put_argmax_sync(_empty_cuda_tensor((2,), device=self.qweight.device, dtype=torch.int32))
+            else:
+                self._put_argmax_sync(None)
+        sync = self._argmax_sync
+        if sync is None:
+            sync = _empty_cuda_tensor((2,), device=self.qweight.device, dtype=torch.int32)
         self._argmax_epoch = 1 if self._argmax_epoch >= 2_000_000_000 else self._argmax_epoch + 1
         with torch.cuda.device(self.qweight.device):
             cuda_ops().lowbit_marlin_gemm_argmax_out(
@@ -237,10 +402,10 @@ class LowBitMarlinTensor:
                 self.scales,
                 x,
                 scratch_out,
-                self._workspace,
+                workspace,
                 state,
                 out,
-                self._argmax_sync,
+                sync,
                 self._argmax_epoch,
                 self.cols,
                 self.group_size,
@@ -251,6 +416,7 @@ class LowBitMarlinTensor:
         raise RuntimeError("Marlin layout does not support row_dequant; keep embeddings in rowwise layout")
 
     def clear_runtime_cache(self) -> None:
+        _add_marlin_runtime_cache_bytes(-self.runtime_cache_bytes())
         self._out_cache.clear()
         self._argmax_cache.clear()
         self._argmax_state_cache.clear()
@@ -400,8 +566,13 @@ class QuantizedStore:
                 add(kind, group, obj.qweight)
                 add(kind, group, obj.scales)
                 add("marlin_workspace", group, obj._workspace)
+                add("marlin_argmax_sync", group, obj._argmax_sync)
                 for out in obj._out_cache.values():
                     add("marlin_output_cache", group, out)
+                for out in obj._argmax_cache.values():
+                    add("marlin_argmax_cache", group, out)
+                for out in obj._argmax_state_cache.values():
+                    add("marlin_argmax_state_cache", group, out)
             elif isinstance(obj, FP16Tensor):
                 kind = "fp16_raw"
                 counts[kind] += 1
@@ -411,6 +582,7 @@ class QuantizedStore:
             "counts_by_kind": dict(counts),
             "mib_by_kind": {k: round(v / (1024 * 1024), 2) for k, v in sorted(bytes_by_kind.items())},
             "mib_by_group": {k: round(v / (1024 * 1024), 2) for k, v in sorted(bytes_by_group.items())},
+            "marlin_runtime_cache": marlin_runtime_cache_summary(),
         }
 
     def clear_runtime_caches(self) -> None:

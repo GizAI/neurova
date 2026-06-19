@@ -4,6 +4,7 @@ import os
 from typing import Sequence
 
 import torch
+import torch.nn.functional as F
 
 from ..ops import cuda_ops
 from ..profiling import decode_profile_scope
@@ -96,6 +97,15 @@ class QwenNativeMTP1:
         self.fc = wr.get("mtp.fc.weight")
         if not isinstance(self.fc, FP16Tensor):
             raise TypeError("mtp.fc.weight must be fp16_raw for native MTP")
+        self._fc_split_enabled = _env_enabled("LANGBURST_MTP_FC_SPLIT", "0")
+        if self._fc_split_enabled:
+            fc_w = self.fc.value.to(device=self.device, dtype=torch.float16).contiguous()
+            hidden = int(self.cfg.hidden_size)
+            self._fc_emb_weight = fc_w[:, :hidden].contiguous()
+            self._fc_hidden_weight = fc_w[:, hidden:].contiguous()
+        else:
+            self._fc_emb_weight = None
+            self._fc_hidden_weight = None
         self.input_norm = wr.fp16("mtp.layers.0.input_layernorm.weight").to(self.device, dtype=torch.float16).contiguous()
         self.post_norm = wr.fp16("mtp.layers.0.post_attention_layernorm.weight").to(self.device, dtype=torch.float16).contiguous()
         self.qkv_proj = wr.any_linear("mtp.layers.0.self_attn.qkv_proj.weight")
@@ -107,6 +117,19 @@ class QwenNativeMTP1:
         kv_rows = self.cfg.num_key_value_heads * self.cfg.attention_head_dim
         self.qkv_q_rows = self.cfg.num_attention_heads * self.cfg.attention_head_dim * 2
         self.qkv_split = (self.qkv_q_rows, kv_rows, kv_rows)
+
+    def _fc_project(self, emb_norm: torch.Tensor, hidden_norm: torch.Tensor) -> torch.Tensor:
+        if self._fc_split_enabled and self._fc_emb_weight is not None and self._fc_hidden_weight is not None:
+            with decode_profile_scope("mtp_fc"):
+                emb_2d = emb_norm.reshape(1, -1) if emb_norm.ndim == 1 else emb_norm
+                hid_2d = hidden_norm.reshape(1, -1) if hidden_norm.ndim == 1 else hidden_norm
+                out = F.linear(emb_2d, self._fc_emb_weight) + F.linear(hid_2d, self._fc_hidden_weight)
+                return out.reshape(-1).contiguous() if emb_norm.ndim == 1 else out.contiguous()
+        if emb_norm.ndim == 1:
+            x = torch.cat([emb_norm, hidden_norm], dim=0).contiguous()
+        else:
+            x = torch.cat([emb_norm, hidden_norm], dim=-1).contiguous()
+        return linear_any(self.fc, x, profile="mtp_fc")
 
     def _single_token_decoder_layer(
         self,
@@ -224,14 +247,9 @@ class QwenNativeMTP1:
     ) -> torch.Tensor:
         emb = embed_lookup(self.model.embed, input_token).to(self.device, dtype=torch.float16).reshape(-1).contiguous()
         hidden = hidden_state.to(self.device, dtype=torch.float16).contiguous()
-        x = qwen_rmsnorm_pair_cat(
-            emb,
-            self.pre_fc_norm_embedding,
-            hidden,
-            self.pre_fc_norm_hidden,
-            self.cfg.rms_norm_eps,
-        )
-        x = linear_any(self.fc, x, profile="mtp_fc").to(self.device, dtype=torch.float16).contiguous()
+        h_norm = qwen_rmsnorm(hidden, self.pre_fc_norm_hidden, self.cfg.rms_norm_eps)
+        e_norm = qwen_rmsnorm(emb, self.pre_fc_norm_embedding, self.cfg.rms_norm_eps)
+        x = self._fc_project(e_norm, h_norm).to(self.device, dtype=torch.float16).contiguous()
         x = self._single_token_decoder_layer(x, pos=pos, local_cache=local_cache)
         return qwen_rmsnorm(x.contiguous(), self.norm, self.cfg.rms_norm_eps)
 
@@ -245,14 +263,10 @@ class QwenNativeMTP1:
         v_cache: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         emb = embed_lookup(self.model.embed, input_token).to(self.device, dtype=torch.float16).reshape(-1).contiguous()
-        h_norm = qwen_rmsnorm(
-            hidden_state.to(self.device, dtype=torch.float16).contiguous(),
-            self.pre_fc_norm_hidden,
-            self.cfg.rms_norm_eps,
-        )
+        hidden = hidden_state.to(self.device, dtype=torch.float16).contiguous()
+        h_norm = qwen_rmsnorm(hidden, self.pre_fc_norm_hidden, self.cfg.rms_norm_eps)
         e_norm = qwen_rmsnorm(emb, self.pre_fc_norm_embedding, self.cfg.rms_norm_eps)
-        x = torch.cat([e_norm, h_norm], dim=0)
-        x = linear_any(self.fc, x, profile="mtp_fc").to(self.device, dtype=torch.float16).contiguous()
+        x = self._fc_project(e_norm, h_norm).to(self.device, dtype=torch.float16).contiguous()
         x = self._single_token_decoder_layer_legacy(x, pos=pos, k_cache=k_cache, v_cache=v_cache)
         return qwen_rmsnorm(x.contiguous(), self.norm, self.cfg.rms_norm_eps)
 
@@ -274,14 +288,9 @@ class QwenNativeMTP1:
         if int(pos.numel()) != int(hidden.size(0)):
             raise ValueError("batched MTP positions must match hidden batch")
         emb = embed_lookup_batch(self.model.embed, tokens, self.device).to(dtype=torch.float16)
-        x = qwen_rmsnorm_pair_cat(
-            emb,
-            self.pre_fc_norm_embedding,
-            hidden,
-            self.pre_fc_norm_hidden,
-            self.cfg.rms_norm_eps,
-        )
-        x = linear_any(self.fc, x, profile="mtp_fc").to(dtype=torch.float16).contiguous()
+        h_norm = qwen_rmsnorm(hidden, self.pre_fc_norm_hidden, self.cfg.rms_norm_eps)
+        e_norm = qwen_rmsnorm(emb, self.pre_fc_norm_embedding, self.cfg.rms_norm_eps)
+        x = self._fc_project(e_norm, h_norm).to(dtype=torch.float16).contiguous()
 
         residual = x
         h = qwen_rmsnorm(x, self.input_norm, self.cfg.rms_norm_eps)
@@ -484,8 +493,19 @@ class QwenNativeMTP1Proposer:
             raise ValueError("batched native_mtp1 requires a uniform max_draft")
         if max_draft <= 0:
             return torch.empty((len(requests), 0), device=self.mtp.device, dtype=torch.long)
+        # Single-row batch calls used the batched proposer kernel and changed
+        # the draft trajectory versus the scalar proposer.  Preserve exact
+        # single-request semantics; the batched path is only useful when there
+        # is actual row parallelism to amortize its different kernels.
+        if len(requests) == 1:
+            return self.propose_tensors(requests[0]).reshape(1, -1).to(device=self.mtp.device, dtype=torch.long).contiguous()
+        if _env_enabled("LANGBURST_MTP_LEGACY_LIST_CACHE", "1"):
+            return torch.stack(
+                [self.propose_tensors(request).reshape(-1) for request in requests],
+                dim=0,
+            ).to(device=self.mtp.device, dtype=torch.long).contiguous()
         raw_hiddens: list[torch.Tensor] = []
-        first_token_values: list[int] = []
+        first_token_tensors: list[torch.Tensor] = []
         positions: list[int] = []
         for req in requests:
             signals = req.signals or {}
@@ -495,13 +515,10 @@ class QwenNativeMTP1Proposer:
             if raw_hidden is None or first_token is None or pos is None:
                 raise ValueError("native_mtp1 batch proposer requires raw_hidden, first_token, and pos signals")
             raw_hiddens.append(raw_hidden.reshape(-1).to(device=self.mtp.device, dtype=torch.float16))
-            if torch.is_tensor(first_token):
-                first_token_values.append(int(first_token.reshape(()).detach().cpu().item()))
-            else:
-                first_token_values.append(int(first_token))
+            first_token_tensors.append(torch.as_tensor(first_token, device=self.mtp.device, dtype=torch.long).reshape(()))
             positions.append(int(pos))
         hidden = raw_hiddens[0].reshape(1, -1).contiguous() if len(raw_hiddens) == 1 else torch.stack(raw_hiddens, dim=0).contiguous()
-        token_tensor = torch.tensor(first_token_values, device=self.mtp.device, dtype=torch.long)
+        token_tensor = torch.stack(first_token_tensors, dim=0).to(device=self.mtp.device, dtype=torch.long).reshape(-1).contiguous()
         position_tensor = torch.tensor(positions, device=self.mtp.device, dtype=torch.long)
         if max_draft == 1:
             tokens = self.mtp.argmax_first_batch(hidden, token_tensor, positions=position_tensor)

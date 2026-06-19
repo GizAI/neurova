@@ -28,6 +28,63 @@ from ...speculative_batch import (
 log = logging.getLogger(__name__)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return int(default)
+    return int(raw)
+
+
+def _draft_caps_by_active_rows() -> tuple[tuple[int, int], ...]:
+    raw = os.environ.get("LANGBURST_MTP_MAX_DRAFT_BY_ACTIVE", "2:1")
+    caps: list[tuple[int, int]] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if not item or ":" not in item:
+            continue
+        threshold_raw, cap_raw = item.split(":", 1)
+        try:
+            threshold = int(threshold_raw.strip())
+            row_cap = int(cap_raw.strip())
+        except ValueError:
+            continue
+        if threshold > 0:
+            caps.append((threshold, max(1, row_cap)))
+    return tuple(caps)
+
+
+def _draft_cap_for_active_rows(base_max_draft: int, active_rows: int) -> int:
+    """Cap speculative draft length for memory-heavy concurrent batches.
+
+    Uniform speculative verification keeps GDN trajectory buffers whose
+    footprint grows with ``active_rows * (1 + draft_tokens)``.  Single-request
+    K=4 is the current decode champion, while three concurrent K>=2 requests
+    exceed 16GB on ml-dmc8.  Keep the policy centralized instead of scattering
+    request-count conditionals through proposer/model code.
+    """
+
+    cap = max(1, int(base_max_draft))
+    for threshold, row_cap in _draft_caps_by_active_rows():
+        if int(active_rows) >= threshold:
+            cap = min(cap, row_cap)
+    return cap
+
+
+def _draft_pressure_cap_for_active_rows(active_rows: int) -> int | None:
+    cap: int | None = None
+    for threshold, row_cap in _draft_caps_by_active_rows():
+        if threshold > 0 and int(active_rows) >= threshold:
+            cap = row_cap if cap is None else min(cap, row_cap)
+    return cap
+
+
 @dataclass(frozen=True)
 class BatchedStepOutput:
     batch: DecodeBatchPlan
@@ -85,6 +142,16 @@ class BatchedModelRunner:
         self.speculative_policy = engine.resolve_policy(self.features).speculative
         self.speculative_tracker = SpeculativeAcceptanceTracker(self.speculative_policy)
         self._speculative_prepare_skips: dict[str, int] = {}
+        self._trim_model_cache_before_prefill = _env_bool("LANGBURST_TRIM_MODEL_CACHE_BEFORE_PREFILL", True)
+        self._trim_model_cache_prefill_free_below_mib = _env_int(
+            "LANGBURST_TRIM_MODEL_CACHE_PREFILL_FREE_BELOW_MIB",
+            1024,
+        )
+        self._draft_pressure_signature: tuple[int, int] | None = None
+        self._serving_pressure_request_count = 0
+
+    def set_serving_pressure_request_count(self, count: int) -> None:
+        self._serving_pressure_request_count = max(0, int(count))
 
     def add_request(
         self,
@@ -120,11 +187,13 @@ class BatchedModelRunner:
 
     @torch.no_grad()
     def execute_step(self, *, device: str | None = None) -> BatchedStepOutput | None:
+        self._cap_existing_drafts_for_pressure()
         batch = self.scheduler.schedule(device=device or self.engine.device)
         if batch is None:
             return None
         rows = [self._row(req_id) for req_id in batch.request_ids]
         was_prefilling = [row.is_prefilling for row in rows]
+        self._trim_model_runtime_cache_before_prefill(rows)
         for row in rows:
             if int(row.state_index) not in self.state_store.states:
                 self.state_store.allocate(row.state_index)
@@ -208,6 +277,28 @@ class BatchedModelRunner:
             accepted_draft_counts=accepted_draft_counts,
         )
 
+    def _cap_existing_drafts_for_pressure(self) -> None:
+        try:
+            active_rows = int(self.scheduler.stats().active_requests)
+        except Exception:
+            active_rows = 0
+        active_rows = max(active_rows, int(self._serving_pressure_request_count))
+        max_draft = _draft_pressure_cap_for_active_rows(active_rows)
+        if max_draft is None:
+            self._draft_pressure_signature = None
+            return
+        signature = (active_rows, max_draft)
+        if self._draft_pressure_signature != signature:
+            clear_model_caches = getattr(self.engine.model, "clear_runtime_caches", None)
+            if callable(clear_model_caches):
+                clear_model_caches()
+            if torch.cuda.is_available() and str(self.engine.device).startswith("cuda"):
+                torch.cuda.empty_cache()
+            self._draft_pressure_signature = signature
+        cap = getattr(self.scheduler, "cap_active_draft_tokens", None)
+        if callable(cap):
+            cap(max_draft)
+
     def _execute_verify_batch_if_possible(
         self,
         batch: DecodeBatchPlan,
@@ -275,6 +366,24 @@ class BatchedModelRunner:
         active_requests = self.scheduler.stats().active_requests
         self.cuda_memory_policy.release_idle_cache(active_requests=active_requests)
 
+    def _trim_model_runtime_cache_before_prefill(self, rows: Sequence[DecodeRequestState]) -> None:
+        if not self._trim_model_cache_before_prefill:
+            return
+        if not any(row.is_prefilling for row in rows):
+            return
+        if str(self.engine.device).startswith("cuda") and torch.cuda.is_available():
+            min_free = int(self._trim_model_cache_prefill_free_below_mib)
+            if min_free > 0:
+                free_bytes, _total_bytes = torch.cuda.mem_get_info(torch.device(self.engine.device))
+                if free_bytes >= min_free * 1024 * 1024:
+                    return
+        clear_model_caches = getattr(self.engine.model, "clear_runtime_caches", None)
+        if callable(clear_model_caches):
+            clear_model_caches()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
     def _truncate_speculative_kv_blocks(self, rows: Sequence[DecodeRequestState]) -> None:
         block_table = getattr(self.scheduler, "block_table", None)
         if block_table is None:
@@ -313,6 +422,9 @@ class BatchedModelRunner:
         self.scheduler.clear()
         self.state_store.clear()
         self.prefix_cache.clear()
+        clear_model_caches = getattr(self.engine.model, "clear_runtime_caches", None)
+        if callable(clear_model_caches):
+            clear_model_caches()
 
     def prefix_cache_summary(self) -> dict[str, object]:
         summary: dict[str, object] = self.prefix_cache.stats().summary()
@@ -561,7 +673,16 @@ class BatchedModelRunner:
                 row.clear_draft_tokens()
             self._record_speculative_prepare_skip("low_free_vram")
             return
-        max_draft = int(self.speculative_tracker.current_max_draft())
+        active_rows = len(rows)
+        try:
+            active_rows = max(active_rows, int(self.scheduler.stats().active_requests))
+        except Exception:
+            pass
+        active_rows = max(active_rows, int(self._serving_pressure_request_count))
+        max_draft = _draft_cap_for_active_rows(
+            int(self.speculative_tracker.current_max_draft()),
+            active_rows,
+        )
         pending: list[tuple[int, DraftRequest]] = []
         for row_idx, (row, state, sampled_n, rejected_n) in enumerate(zip(rows, states, sampled_counts, rejected_counts, strict=True)):
             if int(sampled_n) <= 0:

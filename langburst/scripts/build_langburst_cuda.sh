@@ -32,6 +32,7 @@ from langburst.ops import cuda_ops
 ops = cuda_ops()
 required = [
     "attention_decode_fp16_gated",
+    "copy_selected_trajectory_out",
     "gdn_recurrent_ab_batch_norm_gate",
     "lowbit_marlin_gemm_silu_packed_out",
     "lowbit_marlin_gemm_argmax_out",

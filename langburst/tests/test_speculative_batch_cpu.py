@@ -11,6 +11,7 @@ from langburst.speculative_batch import (
     resolve_speculative_gpu,
     sampled_and_rejected_counts,
 )
+from langburst.ops import CPUFallbackOps
 from langburst.research.speculative_oracle import (
     make_speculative_batch_plan,
     resolve_greedy_speculative_metadata,
@@ -177,6 +178,19 @@ def test_resolve_speculative_gpu_exposes_commit_and_output_contract():
     assert resolved.accepted_draft_count_list() == [1, 0, 2]
     assert resolved.commit_tokens.tolist() == [2, 1, 3]
     assert resolved.next_input_ids.tolist() == [99, 30, 22]
+
+
+def test_copy_selected_trajectory_contract_updates_state_slots():
+    trajectory = torch.arange(2 * 3 * 2 * 2, dtype=torch.float16).reshape(2, 3, 2, 2)
+    dest = torch.full((4, 2, 2), -1.0, dtype=torch.float16)
+    state_indices = torch.tensor([3, 1], dtype=torch.long)
+    commit_tokens = torch.tensor([2, 3], dtype=torch.int32)
+
+    CPUFallbackOps.copy_selected_trajectory_out(trajectory, dest, state_indices, commit_tokens)
+
+    assert torch.equal(dest[3], trajectory[0, 1])
+    assert torch.equal(dest[1], trajectory[1, 2])
+    assert torch.equal(dest[0], torch.full((2, 2), -1.0, dtype=torch.float16))
 
 
 def test_apply_decode_post_update_uses_query_len_minus_rejected_delta():

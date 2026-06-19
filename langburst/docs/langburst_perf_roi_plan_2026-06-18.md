@@ -1,427 +1,348 @@
-# LangBurst Qwen3.6 Q4/MTP 성능 개선 ROI 계획
+# LangBurst Qwen3.6 Q4 성능/VRAM 최종 연구 기록
 
-작성일: 2026-06-18  
-대상: `langburst` native runtime, Qwen3.6-27B Q4 Marlin fused, MTP/NEXTN speculative decode  
-전제: 현재 최고 운영 조합은 **기능을 많이 켜는 조합이 아니라 champion trajectory를 유지하는 최소 조합**이다.
+작성일: 2026-06-19
 
----
+대상:
 
-## 1. 현재 기준선
+- 호스트: `ml-dmc8`
+- GPU: RTX 4080 16GB
+- 모델: `/home/user/models/Qwen3.6-27B-qb4-marlin-fused`
+- 서버 모델명: `langburst-qwen3.6-27b-q4`
+- 기본 KV: `int4_bdr`
+- 기본 serving 목표: 4K 소형 슬롯 2개 + 64K 대형 슬롯 1개, 최대 active 3
 
-최종 A/B 기준 운영 default:
+이 문서는 이번 세션의 최종 판단만 남긴다. 중간에 실패한 값이나 예전 champion 값은
+같은 조건에서 재현된 경우만 기록한다.
+
+## 최종 결론
+
+현재 트리에서 검증된 최적 운영 방향은 다음이다.
+
+```text
+single request:
+  MTP K=4 유지
+  decode 약 66.2 tok/s
+
+2+ active requests:
+  MTP draft를 K=1로 자동 cap
+  batch=3 aggregate decode 약 80.2 tok/s
+
+long context serving:
+  context tiers 4096,65536 / slots 2,1
+  Marlin runtime cache cap 32 MiB
+  prefill 전 model runtime cache pressure trim
+```
+
+중요한 점은 `K=4`를 모든 상황에 고정하면 16GB에서 동시 요청 중 verifier/GDN
+trajectory workspace가 OOM을 만든다는 것이다. 단일 요청 속도와 3동시 안정성을 동시에
+얻으려면 active pressure 기반 draft cap이 필요하다.
+
+## 운영 기본값
+
+`scripts/start_langburst.sh`의 핵심 기본값:
 
 ```bash
-LANGBURST_CUDA_GRAPH="${LANGBURST_CUDA_GRAPH:-0}"
-LANGBURST_MTP_BATCH_PROPOSER="${LANGBURST_MTP_BATCH_PROPOSER:-0}"
-LANGBURST_MLP_TENSORCORE_DOWN_SILU_A="${LANGBURST_MLP_TENSORCORE_DOWN_SILU_A:-1}"
-LANGBURST_MARLIN_INTERNAL_ARGMAX="${LANGBURST_MARLIN_INTERNAL_ARGMAX:-0}"
-LANGBURST_GDN_BA_LOWBIT_PAIR="${LANGBURST_GDN_BA_LOWBIT_PAIR:-0}"
-LANGBURST_GDN_RECURRENT_NORM_GATE_FUSED="${LANGBURST_GDN_RECURRENT_NORM_GATE_FUSED:-0}"
+MODEL_NAME=langburst-qwen3.6-27b-q4
+KV_CACHE_DTYPE=int4_bdr
+
+CONTEXT_TIERS=4096,65536
+CONTEXT_TIER_SLOTS=2,1
+CONTEXT_WINDOW=65536
+MAX_ACTIVE_REQUESTS=3
+
+MARLIN_OUT_CACHE_POLICY=all
+LANGBURST_MARLIN_CACHE_MAX_MIB=32
+LANGBURST_MARLIN_CACHE_MIN_FREE_MIB=256
+LANGBURST_TRIM_MODEL_CACHE_BEFORE_PREFILL=1
+LANGBURST_TRIM_MODEL_CACHE_PREFILL_FREE_BELOW_MIB=1024
+
+LANGBURST_MTP_MAX_DRAFT=4
+LANGBURST_MTP_DRAFT_CANDIDATES=4
+LANGBURST_MTP_MAX_DRAFT_BY_ACTIVE=2:1
+LANGBURST_MTP_BATCH_PROPOSER=1
+LANGBURST_MTP_LEGACY_LIST_CACHE=0
+LANGBURST_MTP_LOCAL_TKH_ATTENTION=1
+LANGBURST_MTP_FC_SPLIT=0
+
+LANGBURST_MARLIN_INTERNAL_ARGMAX=1
+LANGBURST_GDN_BA_LOWBIT_PAIR=1
+LANGBURST_MLP_TENSORCORE_DOWN_SILU_A=1
+LANGBURST_SPEC_TRAJECTORY_COPY_CUDA=1
+LANGBURST_CUDA_GRAPH=0
+LANGBURST_VERIFY_FULL_LOGITS=0
 ```
 
-최근 champion bucket:
+`LANGBURST_MTP_MAX_DRAFT_BY_ACTIVE=2:1`은 단일 요청에서는 K=4를 유지하고,
+서버 pressure가 2개 이상이면 기존 draft와 새 draft를 K=1로 제한한다. 이 값은
+속도 옵션이 아니라 OOM 방지와 aggregate throughput을 동시에 맞추는 serving 정책이다.
+
+## 실측 결과
+
+### 단일 요청 decode
+
+조건:
 
 ```text
-Q4 fused
-recent_window=2048
-prompt_tokens=1
-max_new_tokens=512
-MTP K=5
-Marlin cache=decode_only
-MTP legacy/list path
-TKH attention OFF
+recent_window: 2048
+prompt_tokens: 1
+max_new_tokens: 512
+requests: 1
+MTP: K=4
+cache: benchmark-only cache cap 0
 ```
 
-측정 요약:
+결과:
 
 ```text
-baseline:
-  CUDA_GRAPH=0
-  MTP_BATCH_PROPOSER=0
-  MLP_TENSORCORE_DOWN_SILU_A=0
-  MARLIN_INTERNAL_ARGMAX=0
-  aggregate_decode_tok_s: 62.76
-
-MLP_TENSORCORE_DOWN_SILU_A=1:
-  aggregate_decode_tok_s: 64.53, repeat 65.11
-  accepted/rejected: 324 / 616
-  scheduled_batches: 189
-  결론: speed-positive, champion trajectory 유지, 기본 ON
-
-CUDA_GRAPH=1:
-  aggregate_decode_tok_s: 61.69
-  결론: static-buffer graph 구현은 보존, 운영 기본 OFF
-
-MTP_BATCH_PROPOSER=1:
-  aggregate_decode_tok_s: 58.99
-  accepted/rejected: 312 / 683
-  scheduled_batches: 200
-  결론: trajectory 회귀, 운영 기본 OFF
-
-GDN_BA_LOWBIT_PAIR=1:
-  aggregate_decode_tok_s: 55.15
-  accepted/rejected: 315 / 670
-  결론: 운영 기본 OFF
-
-MARLIN_INTERNAL_ARGMAX=1:
-  aggregate_decode_tok_s: 62.26~63.52
-  MLP=1과 같이 켜도 64.14로 MLP 단독보다 낮음
-  결론: 운영 기본 OFF
-
-MLP_TENSORCORE_DOWN_SILU_A=1 + CUDA_GRAPH=1:
-  aggregate_decode_tok_s: 64.21
-  결론: MLP 단독보다 낮아 graph 기본 OFF
+aggregate_decode_tok_s: 66.21
+aggregate_output_tok_s: 63.75
+accepted/rejected: 312 / 484
+scheduled_batches: 200
 ```
 
----
-
-## 2. ROI 우선순위
-
-| ROI | 과제 | 현재 상태 | 기대 이득 | 기본 정책 |
-|---:|---|---|---|---|
-| 1 | MTP batch proposer parity repair | ON 시 trajectory 회귀 | legacy trajectory 유지 + proposer overhead 감소 | OFF 유지, parity 후 재평가 |
-| 2 | Marlin internal argmax v2 | op 존재, speed-positive 아님 | lm_head argmax scratch/materialization 감소 | OFF 유지 |
-| 3 | speculative resolve/cache_update fused kernel | post-verify commit 경로 파편화 | launch/dispatch 감소 | 신규 구현 후보 |
-| 4 | CUDA Graph micrograph화 | full verifier graph는 느림 | resolve/cache_update 일부 graph화 | full graph OFF |
-| 5 | GDN recurrent+norm+gate shape 대응 | 실제 Q4 shape mismatch | GDN post recurrent launch/materialization 감소 | OFF 유지 |
-| 6 | MLP fused path hot 분기 정리 | 이미 ON, speed-positive | 소폭 overhead 감소 | ON 유지 |
-| 7 | 72K prefill/chunk autotune | 72K는 메모리 여유 얇음 | long prompt 안정성/속도 개선 | 신중한 실험 |
-| 8 | paged attention/KV append tuning | long context에서 비중 증가 | 72K decode 안정성/속도 개선 | 중기 과제 |
-| 9 | GDN BA low-bit pair 재검증 | 현재 느리고 trajectory 악화 | 낮음, quant/scale 재검증 필요 | OFF 유지 |
-| 10 | scalar full-streaming MLP | reference/debug | production 이득 낮음 | 하지 않음 |
-
----
-
-## 3. ROI 1: MTP batch proposer parity repair
-
-### 문제
-
-`LANGBURST_MTP_BATCH_PROPOSER=1`은 speed만 낮은 것이 아니라 draft trajectory 자체를 바꾼다.
+비교:
 
 ```text
-legacy/batch OFF:
-  accepted/rejected/scheduled = 324 / 616 / 189
-
-batch proposer ON:
-  accepted/rejected/scheduled = 312 / 683 / 200
+K=5:
+  64.89 tok/s
+  rejected 증가로 K=4보다 느림
 ```
 
-이 상태에서는 batch proposer를 최적화해도 의미가 없다. 먼저 legacy와 같은 draft sequence를 만들어야 한다.
+현재 트리에서는 K=4가 단일 요청 champion이다. K=5는 켜지 않는다.
 
-### 목표
+### batch=3 decode
+
+조건:
 
 ```text
-B=1에서 legacy proposer와 batch proposer draft token sequence bit-identical
-그 다음 B=2/4에서 batch proposer speed 이득 확인
+recent_window: 2048
+prompt_tokens: 1
+max_new_tokens: 128
+requests: 3
+MTP base K=4
+active pressure cap: 2:1
 ```
 
-### 구현 계획
-
-1. legacy proposer와 batch proposer의 step별 draft token을 로그/텐서로 비교한다.
-2. `first_token`, `raw_hidden`, `pos` signal이 완전히 같은지 검증한다.
-3. MTP local KV/list cache 업데이트 순서가 legacy와 같은지 확인한다.
-4. B=1에서 token sequence parity를 통과시킨다.
-5. B=2/4 continuous batching에서 speed를 측정한다.
-
-### 성공 기준
+결과:
 
 ```text
-accepted/rejected/scheduled = 324 / 616 / 189 유지
-aggregate_decode_tok_s > MLP=1 단독 65.11 tok/s
-B=2 이상에서 proposer overhead 감소 확인
+aggregate_decode_tok_s: 80.23
+aggregate_output_tok_s: 75.52
+avg_scheduled_tokens_per_batch: 4.62
+scheduled_batches: 120
 ```
 
----
-
-## 4. ROI 2: Marlin internal argmax v2
-
-### 문제
-
-현재 `LANGBURST_MARLIN_INTERNAL_ARGMAX=1`은 op가 존재하지만 speed-positive가 아니다.
+per request:
 
 ```text
-MARLIN_INTERNAL_ARGMAX=1:
-  aggregate_decode_tok_s: 62.26~63.52
-
-MLP=1 + MARLIN_INTERNAL_ARGMAX=1:
-  aggregate_decode_tok_s: 64.14
-
-MLP=1 단독:
-  aggregate_decode_tok_s: 64.53~65.11
+req1: decode 39.78 tok/s, accepted/rejected 47 / 33
+req2: decode 40.45 tok/s, accepted/rejected 48 / 31
+req3: decode 36.67 tok/s, accepted/rejected 42 / 106
 ```
 
-### 가능성
+K=2/3/4를 3동시로 그대로 유지하면 16GB에서 12~20 MiB allocation OOM이 났다.
+전역 K=1 또는 pressure cap K=1은 OOM 없이 통과했다.
 
-Verifier lm_head는 매 decode step에서 반복된다. argmax만 필요할 때 full logits/scratch materialization을 줄이면 이론적으로 이득이 있다.
+### prefill
 
-### 의심 병목
+대표 long prefill smoke:
 
 ```text
-- global spin-wait / atomic sync 비용
-- argmax_state 초기화/완료 동기화 비용
-- tie-breaking deterministic 처리 비용
-- batch*T row 수가 작을 때 kernel 내부 argmax overhead가 더 큼
+prompt_tokens: 약 5.2K~5.7K
+prefill: 약 906~908 tok/s
+status: ok
 ```
 
-### 구현 계획
+짧은 요청은 prompt 길이가 너무 작아 prefill tok/s가 낮게 보일 수 있다. 긴 입력에서
+실제 prefill path는 900 tok/s급을 회복했다.
 
-1. `lowbit_marlin_gemm_argmax_out` 내부 sync 비용 측정.
-2. row 수별 benchmark: `M=1`, `M=5`, `M=6`, `M=10`.
-3. full logits argmax와 token parity 확인.
-4. global spin-wait를 줄이거나 per-row/block reduction 구조로 재작성.
-5. MLP=1 기준에서 재측정.
+## VRAM 분석
 
-### 성공 기준
+64K/3-slot arena:
 
 ```text
-MLP=1 + ARGMAX=1 > MLP=1 단독 65.11 tok/s
-accepted/rejected/scheduled = 324 / 616 / 189 유지
+context tiers: 4096,65536
+slots: 2,1
+arena total: 약 1412 MiB
+paged_kv: 약 1188 MiB
+gdn_recurrent: 약 216 MiB
 ```
 
----
-
-## 5. ROI 3: speculative resolve/cache_update fused kernel
-
-### 문제
-
-Verifier 후처리 경로가 여러 단계로 흩어져 있다.
+80K급 대형 슬롯은 16GB에서 너무 빡빡했다.
 
 ```text
-resolve_speculative_gpu
-commit_tokens 계산
-conv trajectory select
-GDN trajectory select
-paged KV append
-arena.pos / arena.kv_len advance
-state.last_raw_hidden update
+4096,81920:
+  arena total: 약 1536 MiB
+  first request 후 free VRAM: 약 15 MiB
+  20 MiB allocation도 OOM
+
+4096,65536:
+  arena total: 약 1412 MiB
+  stress 후 free VRAM: 약 529 MiB
+  short/long/3 concurrent smoke 통과
 ```
 
-이 흐름은 매 speculative decode step마다 실행된다.
+따라서 16GB 운영 기본은 64K 대형 슬롯이 현실적인 상한이다. 더 큰 context는
+24GB 이상 GPU나 더 강한 KV/state workspace 절감이 필요하다.
 
-### 가능성
+## 이번 세션에서 남긴 코드 변경
 
-Full CUDA Graph보다 작은 범위를 직접 fused kernel로 묶는 것이 ROI가 높다. full verifier graph는 느렸지만, post-verify commit은 fixed-shape/작은 tensor 중심이라 통합 효과가 있을 수 있다.
+### Marlin runtime cache SSOT
 
-### 구현 계획
-
-1. 현재 `cache_update` profile time 측정.
-2. `commit_tokens` 기반으로 conv/gdn trajectory select + arena state copy를 단일 CUDA op로 통합.
-3. paged KV append spec path와 arena advance를 가능하면 같은 launch군으로 묶는다.
-4. Python list 기반 trajectory append를 static workspace 구조로 정리한다.
-
-### 성공 기준
+추가된 구조:
 
 ```text
-cache_update profile time 감소
-aggregate_decode_tok_s 개선
-trajectory parity 유지
+marlin_runtime_cache_bytes()
+marlin_runtime_cache_summary()
+clear_marlin_runtime_caches()
+marlin_cache_admitted()
 ```
 
----
+목적:
 
-## 6. ROI 4: CUDA Graph micrograph화
+- `cache=all`의 single decode 속도 이득 유지
+- 긴 prefill/동시 요청에서는 cache 성장을 제한
+- OOM 발생 시 Marlin runtime cache를 먼저 비우고 allocation retry
+- health/debug에서 runtime cache bytes 확인 가능
 
-### 현재 결론
+### Serving pressure 기반 MTP draft cap
 
-Full verifier graph는 구현되어 있지만 현재 champion bucket에서 느리다.
+추가된 구조:
 
 ```text
-CUDA_GRAPH=1: 61.69 tok/s
-MLP=1 + CUDA_GRAPH=1: 64.21 tok/s
-MLP=1 단독: 65.11 tok/s
+LANGBURST_MTP_MAX_DRAFT_BY_ACTIVE=2:1
+BatchedModelRunner.set_serving_pressure_request_count()
+ContinuousBatchScheduler.cap_active_draft_tokens()
+BatchGenerationWorker._update_runner_pressure_count()
 ```
 
-따라서 full verifier graph는 운영 기본 OFF가 맞다.
+목적:
 
-### 새 방향
+- pending/deferred request까지 포함해 serving pressure를 감지
+- 이미 붙은 K4 draft도 pressure 진입 시 K1로 truncate
+- pressure signature가 바뀔 때 model runtime cache와 allocator cache를 정리
 
-전체 model forward가 아니라 다음처럼 작은 영역만 graph화한다.
+### Native MTP proposer 정리
+
+핵심 변경:
+
+- single-row batch proposer는 scalar proposer로 fallback하여 draft trajectory를 보존
+- `LANGBURST_MTP_LEGACY_LIST_CACHE=0`을 기본으로 사용
+- `LANGBURST_MTP_FC_SPLIT=0` 기본값. 현재 트리에서는 split path가 확실한 이득이 아님
+
+### CUDA/ops hot path
+
+추가 또는 유지:
 
 ```text
-- resolve_speculative_gpu
-- cache_update
-- arena.advance_slots
-- argmax_many_out 일부
+copy_selected_trajectory_out
+gdn_recurrent_ab_batch_norm_gate
+gdn_recurrent_ab_spec_trajectory_norm_gate
+lowbit_marlin_gemm_argmax_out
+lowbit_marlin_gemm_silu_packed_out
 ```
 
-### 성공 기준
+기본 ON/OFF 판단:
 
 ```text
-MLP=1 + micrograph > MLP=1 단독
-full verifier graph보다 memory overhead 작음
+ON:
+  MARLIN_INTERNAL_ARGMAX
+  GDN_BA_LOWBIT_PAIR
+  MLP_TENSORCORE_DOWN_SILU_A
+  SPEC_TRAJECTORY_COPY_CUDA
+
+OFF:
+  CUDA_GRAPH
+  VERIFY_FULL_LOGITS
+  GDN_RECURRENT_NORM_GATE_FUSED
+  GDN_SPEC_NORM_GATE_FUSED
+  MTP_FC_SPLIT
 ```
 
----
+CUDA Graph는 아직 production 기본값으로 켜지 않는다. 현재 성능 병목은 graph launch
+overhead보다 verifier/GDN/MLP workspace와 projection 비용 쪽이 크다.
 
-## 7. ROI 5: GDN recurrent+norm+gate 실제 shape 대응
+## 검증
 
-### 문제
-
-`gdn_recurrent_ab_batch_norm_gate` op는 존재하지만 실제 Q4 model shape에서 `norm_w hidden mismatch`가 났다.
-
-### 가능성
-
-GDN recurrent output 이후 RMSNorm + SiLU gate + out projection 전처리를 줄일 수 있다. 다만 현재 ROI는 MTP/argmax/commit보다 낮다.
-
-### 구현 계획
-
-1. 실제 Qwen3.6 Q4 fused shape dump.
-2. `z`, `gdn_norm_w`, `core` shape 계약 재정의.
-3. Qwen3.6 linear_value_head layout에 맞춘 fused kernel variant 추가.
-4. random parity가 아니라 실제 layer weight/tensor에서 parity test.
-5. K=5 champion bucket에서 A/B.
-
-### 성공 기준
+로컬:
 
 ```text
-shape mismatch 없음
-실제 model parity OK
-aggregate_decode_tok_s 개선
+python -m pytest -q \
+  langburst/tests/test_model_runner_cpu.py \
+  langburst/tests/test_speculative_batch_cpu.py \
+  langburst/tests/test_speculative_cpu.py
+
+결과: 46 passed
 ```
 
----
-
-## 8. ROI 6: MLP fused path hot 분기 정리
-
-### 현재 상태
-
-`LANGBURST_MLP_TENSORCORE_DOWN_SILU_A=1`은 이미 speed-positive다.
-
-### 할 일
-
-1. MLP path에서 env check를 layer hot path마다 반복하지 않도록 model init 시 flag로 고정한다.
-2. `Qwen36MLP` 내부의 reference/debug path와 production path를 더 명확히 분리한다.
-3. `_streaming_mlp_scalar_reference`는 debug-only라는 이름/주석을 유지한다.
-4. production path는 `gate_up Marlin + down.gemm_silu_packed`로 단순화한다.
-
-### 기대 이득
-
-크지는 않지만 이미 winner path라 소폭 개선과 코드 안정성 측면에서 ROI가 있다.
-
----
-
-## 9. ROI 7: 72K prefill/chunk autotune
-
-### 관찰
-
-72K server stress는 통과했다.
+원격 `ml-dmc8`:
 
 ```text
-4.4K prompt: prefill_tok_s 873.83
-9.2K prompt: prefill_tok_s 880.68
-동시 2요청도 통과
-GPU process memory: 약 15820 MiB
+CUDA_VISIBLE_DEVICES= python -m pytest -q \
+  tests/test_model_runner_cpu.py \
+  tests/test_quant_lowbit_cpu.py \
+  tests/test_speculative_batch_cpu.py \
+  tests/test_speculative_cpu.py
+
+결과: 51 passed
 ```
 
-### 위험
-
-16GB에서 headroom이 매우 얇다. 72K slot을 2개로 늘리는 것은 금지한다.
-
-### 실험 후보
+API smoke:
 
 ```text
-prefill_chunk_size 64 / 128 / 256
-max_prefill_rows_per_batch 1 유지
-prefix cache max tokens 조정
-trim cache threshold 조정
+POST http://127.0.0.1:8008/v1/chat/completions
+prompt: 안녕. 한 문장으로 답해줘.
+result: 안녕하세요.
+status: OK
 ```
 
-### 성공 기준
+OpenWebUI backend:
 
 ```text
-72K server OOM 없음
-9K~16K prompt prefill 유지 또는 개선
-동시 2요청 안정성 유지
+http://192.168.0.47:8008/v1
+model: langburst-qwen3.6-27b-q4
+max_concurrency: 3
 ```
 
----
+## 남은 고ROI 작업
 
-## 10. ROI 8: paged attention / KV append tuning
+싱글 80 tok/s는 아직 미달이다. 현재 single 66 tok/s에서 80 tok/s까지는 약 21%의
+추가 개선이 필요하다. 단순 옵션 스윕으로는 어렵고 아래 순서가 현실적이다.
 
-72K 운영에서는 long-context attention/KV cost가 점점 커진다.
+1. Marlin lm_head 내부 argmax 완전 fusion
+   현재는 GEMM 결과와 argmax 경로가 완전히 하나의 Marlin tile reduction으로 합쳐진
+   상태가 아니다. vocab tile별 max/index를 Marlin write path 안에서 누적해야 한다.
 
-후보:
+2. GDN recurrent/norm/gate fused kernel parity 후 기본 ON 재검토
+   실제 Q4 shape에 맞춘 커널은 있으나 아직 기본 ON 실측 champion은 아니다.
+
+3. MLP gate_up/down streaming fusion
+   `gate_up -> SiLU*up -> down` 사이의 global memory 왕복을 더 줄여야 한다.
+
+4. speculative verifier workspace 절감
+   batch=3에서 K>=2가 OOM 나는 직접 원인이다. trajectory 전체 보존 대신 selected
+   state만 유지하는 더 작은 commit-aware CUDA contract가 필요하다.
+
+5. long-past INT4_BDR fused block prefill
+   fresh prefill은 900 tok/s급이지만, 긴 past extend prefill은 tiled INT4_BDR
+   attention kernel이 더 필요하다.
+
+## 운영 규칙
+
+기본값으로 올리는 기준:
 
 ```text
-- INT4_BDR tiled layout kernel occupancy 개선
-- attention_append_paged_int4_spec 최적화
-- recent_tokens/window policy 재검증
-- KV block table update와 append 경로 결합
+1. 같은 benchmark bucket에서 tok/s 상승
+2. accepted/rejected/scheduled trajectory가 설명 가능
+3. long prefill과 3동시 OOM smoke 통과
+4. 코드 경계가 production/research/debug로 분리
 ```
 
-이 과제는 decode가 72K 근처에서 길어질 때 중요하다. 단기 champion bucket보다 long-context 운영 안정성 쪽 ROI가 높다.
-
----
-
-## 11. 낮은 ROI / 하지 말 것
-
-### GDN BA low-bit pair 기본 ON 금지
-
-현재 결과:
+금지:
 
 ```text
-GDN_BA_LOWBIT_PAIR=1:
-  aggregate_decode_tok_s: 55.15
-  accepted/rejected: 315 / 670
+synthetic parity만 보고 기본 ON
+OOM을 숨기기 위해 context를 무작정 낮추기
+단일 요청 champion을 깨는 옵션을 운영 기본값으로 유지
+같은 정책을 proposer/scheduler/model에 중복 구현
 ```
-
-속도와 trajectory가 모두 나빠진다.
-
-### scalar full-streaming MLP 성능화 금지
-
-현재 구조:
-
-```text
-scalar dequant + atomic accumulation + CTA spin-wait
-```
-
-debug/reference로는 의미 있지만 production 성능용 구조가 아니다.
-
-### no-materialization single-kernel tensor-core MLP 집착 금지
-
-SiLU nonlinear boundary 때문에 gate/up reduction 완료 후 down GEMM이 필요하다. full no-materialization single-kernel은 재계산 또는 global sync/scratch가 필요해 비용 모델이 나쁘다.
-
----
-
-## 12. 작업 순서
-
-권장 순서:
-
-```text
-1. MTP batch proposer legacy parity repair
-2. Marlin internal argmax v2
-3. speculative resolve/cache_update fused kernel
-4. CUDA Graph micrograph화
-5. GDN recurrent+norm+gate actual shape 대응
-6. MLP fused hot path 정리
-7. 72K prefill/chunk autotune
-8. paged attention/KV append tuning
-```
-
-각 단계는 반드시 다음 방식으로 검증한다.
-
-```text
-- 한 번에 옵션 하나만 변경
-- Q4 fused / K=5 / prompt=1 / max_new=512 champion bucket 측정
-- accepted/rejected/scheduled 기록
-- tok/s 최고값이 아니라 repeat 평균 기록
-- 72K server smoke는 별도 실행
-```
-
----
-
-## 13. 최종 판단
-
-가장 ROI가 높은 과제는 **MTP batch proposer parity repair**다.
-
-이유:
-
-```text
-현재 batch proposer는 켜면 느려지지만, 원인은 overhead보다 trajectory 회귀다.
-legacy와 bit-identical한 draft sequence를 만들면 batch proposer의 원래 목적이 살아난다.
-특히 동시 요청/continuous batching에서 이득 가능성이 가장 크다.
-```
-
-두 번째는 **Marlin internal argmax v2**다. lm_head argmax는 매 step 반복되는 hot path라 제대로 만들면 작지만 확실한 이득 가능성이 있다.
-
-세 번째는 **speculative commit/cache_update fused kernel**이다. full CUDA Graph보다 작은 후처리 path를 직접 통합하는 쪽이 더 현실적이다.

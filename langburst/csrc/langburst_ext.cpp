@@ -421,6 +421,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("state_indices"),
         py::arg("out"),
         py::arg("trajectory"));
+  m.def("gdn_recurrent_ab_spec_trajectory_norm_gate", &gdn_recurrent_ab_spec_trajectory_norm_gate,
+        "Speculative gated delta scan returning per-token state trajectory and fused per-head RMSNorm+SiLU gate output",
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("a"), py::arg("b"),
+        py::arg("A_log"), py::arg("dt_bias"), py::arg("state_arena"), py::arg("state_indices"),
+        py::arg("norm_w"), py::arg("z"), py::arg("eps"));
+  m.def("gdn_recurrent_ab_spec_trajectory_norm_gate_out", &gdn_recurrent_ab_spec_trajectory_norm_gate_out,
+        "Speculative gated delta scan into preallocated norm-gated out/trajectory buffers",
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("a"), py::arg("b"),
+        py::arg("A_log"), py::arg("dt_bias"), py::arg("state_arena"), py::arg("state_indices"),
+        py::arg("norm_w"), py::arg("z"), py::arg("out"), py::arg("trajectory"), py::arg("eps"));
+  m.def("copy_selected_trajectory_out", &copy_selected_trajectory_out,
+        "Copy trajectory[row, commit_tokens[row]-1] into arena state slots",
+        py::arg("trajectory"),
+        py::arg("dest"),
+        py::arg("state_indices"),
+        py::arg("commit_tokens"));
   m.def("depthwise_conv_update", &depthwise_conv_update,
         "Single-token causal depthwise conv update with SiLU");
   m.def("depthwise_conv_update_scan", &depthwise_conv_update_scan,

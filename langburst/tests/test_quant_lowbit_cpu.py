@@ -3,7 +3,15 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from langburst.loader import LowBitTensor, MARLIN_DIRECT_MAX_BATCH, marlin_should_cache_out
+from langburst.loader import (
+    LowBitMarlinTensor,
+    LowBitTensor,
+    MARLIN_DIRECT_MAX_BATCH,
+    clear_marlin_runtime_caches,
+    marlin_cache_admitted,
+    marlin_runtime_cache_bytes,
+    marlin_should_cache_out,
+)
 from langburst.adapters.qwen36_tools.quantize import quantize_symmetric_lowbit
 
 
@@ -72,3 +80,34 @@ def test_marlin_decode_small_cache_policy_bounds_prefill_batches(monkeypatch):
     assert marlin_should_cache_out(2)
     assert not marlin_should_cache_out(3)
     assert not marlin_should_cache_out(256)
+
+
+def test_marlin_runtime_cache_budget_is_global(monkeypatch):
+    monkeypatch.setenv("LANGBURST_MARLIN_OUT_CACHE_POLICY", "all")
+    monkeypatch.setenv("LANGBURST_MARLIN_CACHE_MAX_MIB", "0")
+    monkeypatch.setenv("LANGBURST_MARLIN_CACHE_MIN_FREE_MIB", "0")
+    clear_marlin_runtime_caches()
+
+    tensor = LowBitMarlinTensor(
+        name="toy_marlin",
+        qweight=torch.empty((1, 1), dtype=torch.int32),
+        scales=torch.empty((1, 1), dtype=torch.float16),
+        cols=16,
+        group_size=128,
+    )
+    tensor._out_cache[1] = torch.empty((2, 8), dtype=torch.float16)
+    assert tensor.runtime_cache_bytes() >= 32
+
+    clear_marlin_runtime_caches()
+    assert tensor.runtime_cache_bytes() == 0
+    assert marlin_runtime_cache_bytes() == 0
+
+
+def test_marlin_cache_admission_honors_budget(monkeypatch):
+    monkeypatch.setenv("LANGBURST_MARLIN_OUT_CACHE_POLICY", "all")
+    monkeypatch.setenv("LANGBURST_MARLIN_CACHE_MAX_MIB", "1")
+    monkeypatch.setenv("LANGBURST_MARLIN_CACHE_MIN_FREE_MIB", "0")
+    clear_marlin_runtime_caches()
+
+    assert marlin_cache_admitted(1, device=torch.device("cpu"), new_bytes=512 * 1024)
+    assert not marlin_cache_admitted(1, device=torch.device("cpu"), new_bytes=2 * 1024 * 1024)

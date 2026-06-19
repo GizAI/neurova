@@ -321,6 +321,7 @@ class BatchGenerationWorker:
             include_stop_str_in_output=bool(include_stop_str_in_output),
         )
         self._pending.put((handle, [int(t) for t in prompt_ids]))
+        self._update_runner_pressure_count()
         return handle
 
     def shutdown(self, timeout: float | None = 2.0) -> None:
@@ -368,6 +369,7 @@ class BatchGenerationWorker:
                     self._release_cancelled_active()
                     if not self._active:
                         continue
+                    self._update_runner_pressure_count()
                     step = self.runner.execute_step(device=self.device)
                     if step is not None:
                         self._mark_prefill_done()
@@ -437,6 +439,7 @@ class BatchGenerationWorker:
                 break
             if not self._try_admit(item):
                 break
+        self._update_runner_pressure_count()
         while time.monotonic() < deadline:
             if len(self._active) >= capacity:
                 break
@@ -564,6 +567,12 @@ class BatchGenerationWorker:
             self._cuda_memory_policy.release_idle_cache(active_requests=len(self._active))
         except Exception:
             pass
+
+    def _update_runner_pressure_count(self) -> None:
+        set_count = getattr(self.runner, "set_serving_pressure_request_count", None)
+        if not callable(set_count):
+            return
+        set_count(len(self._active) + self._pending.qsize() + len(self._deferred))
 
 
 def _mean_metric(rows: Sequence[dict[str, object]], key: str) -> float | None:

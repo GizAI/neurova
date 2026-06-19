@@ -4,6 +4,7 @@ import json
 
 import torch
 
+from langburst.adapters.qwen36_mtp import QwenNativeMTP1Proposer
 from langburst.speculation import (
     DraftRequest,
     SpeculativeAcceptanceTracker,
@@ -56,6 +57,30 @@ def test_draft_request_accepts_optional_model_signals():
     request = DraftRequest(history=[1], max_draft=2, signals={"hidden": object()})
     assert request.max_draft == 2
     assert "hidden" in request.signals
+
+
+def test_qwen_mtp_batch_proposer_preserves_legacy_per_row_contract(monkeypatch):
+    proposer = QwenNativeMTP1Proposer.__new__(QwenNativeMTP1Proposer)
+    proposer.mtp = type("MTP", (), {"device": torch.device("cpu")})()
+    calls: list[int] = []
+
+    def propose_tensors(request):
+        token = int(torch.as_tensor(request.signals["first_token"]).item())
+        calls.append(token)
+        return torch.tensor([token + 1, token + 2], dtype=torch.long)
+
+    proposer.propose_tensors = propose_tensors
+    monkeypatch.setenv("LANGBURST_MTP_LEGACY_LIST_CACHE", "1")
+
+    out = proposer.propose_tensors_batch(
+        [
+            DraftRequest(history=[1], max_draft=2, signals={"first_token": torch.tensor(10), "raw_hidden": torch.zeros(4), "pos": 3}),
+            DraftRequest(history=[2], max_draft=2, signals={"first_token": torch.tensor(20), "raw_hidden": torch.zeros(4), "pos": 4}),
+        ]
+    )
+
+    assert calls == [10, 20]
+    assert out.tolist() == [[11, 12], [21, 22]]
 
 
 def test_speculative_verifier_default_is_transaction_block(monkeypatch):

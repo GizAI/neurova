@@ -409,6 +409,20 @@ class CPUFallbackOps:
         trajectory.copy_(traj_ref)
 
     @staticmethod
+    def copy_selected_trajectory_out(
+        trajectory: torch.Tensor,
+        dest: torch.Tensor,
+        state_indices: torch.Tensor,
+        commit_tokens: torch.Tensor,
+    ) -> None:
+        rows = int(trajectory.size(0))
+        tokens = int(trajectory.size(1))
+        for row in range(rows):
+            slot = int(state_indices[row].item())
+            commit_n = max(1, min(int(commit_tokens[row].item()), tokens))
+            dest[slot].copy_(trajectory[row, commit_n - 1])
+
+    @staticmethod
     def depthwise_conv_update(state: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         if weight.ndim == 3:
             w = weight[:, 0, :]

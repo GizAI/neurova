@@ -47,6 +47,14 @@ def _verify_cuda_graph_enabled() -> bool:
     return os.environ.get("LANGBURST_VERIFY_CUDA_GRAPH", "").strip().lower() in {"1", "true", "on", "yes"}
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _spec_trajectory_copy_cuda_enabled() -> bool:
+    return _env_flag("LANGBURST_SPEC_TRAJECTORY_COPY_CUDA", "0")
+
+
 def _paged_int4_tiled_layout(arena: object) -> bool:
     return bool(getattr(arena, "paged_int4_tiled_layout", False))
 
@@ -1367,6 +1375,8 @@ class Qwen36MLP:
         self._stream_accum_cache: dict[int, torch.Tensor] = {}
         self._stream_sync_cache: dict[int, torch.Tensor] = {}
         self._stream_epoch = 0
+        self._tensorcore_down_silu_enabled = _env_flag("LANGBURST_MLP_TENSORCORE_DOWN_SILU_A")
+        self._scalar_streaming_debug_enabled = _env_flag("LANGBURST_MLP_SCALAR_STREAMING_DEBUG")
 
     @property
     def _gate_up_label(self) -> str:
@@ -1392,11 +1402,11 @@ class Qwen36MLP:
 
 
     def _streaming_mlp_scalar_reference(self, x: torch.Tensor) -> torch.Tensor | None:
+        if not self._scalar_streaming_debug_enabled:
+            return None
         if not (isinstance(self.gate_up, LowBitMarlinTensor) and isinstance(self.down, LowBitMarlinTensor)):
             return None
         if x.device.type != "cuda":
-            return None
-        if os.environ.get("LANGBURST_MLP_SCALAR_STREAMING_DEBUG", "0").strip().lower() not in {"1", "true", "on", "yes"}:
             return None
         x2 = x.reshape(1, -1) if x.ndim == 1 else x
         if x2.ndim != 2:
@@ -1439,7 +1449,7 @@ class Qwen36MLP:
 
     def _fused_marlin_down(self, x: torch.Tensor) -> torch.Tensor | None:
         if (
-            os.environ.get("LANGBURST_MLP_TENSORCORE_DOWN_SILU_A", "0").strip().lower() in {"1", "true", "on", "yes"}
+            self._tensorcore_down_silu_enabled
             and isinstance(self.gate_up, LowBitMarlinTensor)
             and isinstance(self.down, LowBitMarlinTensor)
             and x.device.type == "cuda"
@@ -1480,6 +1490,25 @@ class Qwen36GDNLayer:
         self.in_z = weights.optional(*(f"{la}.in_proj_z.weight" for la in la_candidates))
         self.in_a = weights.optional(*(f"{la}.in_proj_a.weight" for la in la_candidates))
         self.in_b = weights.optional(*(f"{la}.in_proj_b.weight" for la in la_candidates))
+        self.in_ba_lowbit = None
+        if (
+            isinstance(self.in_b, LowBitTensor)
+            and isinstance(self.in_a, LowBitTensor)
+            and self.in_b.qweight.device == self.in_a.qweight.device
+            and int(self.in_b.cols) == int(self.in_a.cols)
+            and int(self.in_b.group_size) == int(self.in_a.group_size)
+            and int(self.in_b.bits) == int(self.in_a.bits)
+            and tuple(self.in_b.qweight.shape[1:]) == tuple(self.in_a.qweight.shape[1:])
+            and tuple(self.in_b.scales.shape[1:]) == tuple(self.in_a.scales.shape[1:])
+        ):
+            self.in_ba_lowbit = LowBitTensor(
+                name=f"{p}.linear_attn.in_proj_ba.lowbit_fused",
+                qweight=torch.cat([self.in_b.qweight, self.in_a.qweight], dim=0).contiguous(),
+                scales=torch.cat([self.in_b.scales, self.in_a.scales], dim=0).contiguous(),
+                cols=int(self.in_b.cols),
+                group_size=int(self.in_b.group_size),
+                bits=int(self.in_b.bits),
+            )
         if self.in_qkvz is None and self.in_qkv is None:
             raise KeyError(f"layer {layer}: missing GDN projections")
         if self.in_qkvz is not None and self.in_ba is None and not all(t is not None for t in (self.in_a, self.in_b)):
@@ -1507,6 +1536,8 @@ class Qwen36GDNLayer:
         )
         if self.in_ba is not None and not prefer_split_pair:
             return linear_any(self.in_ba, x, profile="gdn_ba")
+        if prefer_split_pair and batched and self.in_ba_lowbit is not None:
+            return linear_any(self.in_ba_lowbit, x, profile="gdn_ba")
         if self.in_b is None or self.in_a is None:
             if self.in_ba is not None:
                 return linear_any(self.in_ba, x, profile="gdn_ba")
@@ -1709,11 +1740,8 @@ class Qwen36GDNLayer:
                 os.environ.get("LANGBURST_GDN_RECURRENT_NORM_GATE_FUSED", "0").strip().lower()
                 in {"1", "true", "on", "yes"}
             )
-            fused_shape_ok = (
-                z.ndim == 3
-                and int(self.gdn_norm_w.numel()) == int(v.size(1) * v.size(2))
-                and int(z.size(1) * z.size(2)) == int(self.gdn_norm_w.numel())
-            )
+            z_fused = z.reshape(x.size(0), v.size(1), v.size(2)).contiguous()
+            fused_shape_ok = int(self.gdn_norm_w.numel()) == int(v.size(2))
             fused_gdn = getattr(ops, "gdn_recurrent_ab_batch_norm_gate", None) if fused_enabled and fused_shape_ok else None
             if callable(fused_gdn):
                 core_norm_fused = fused_gdn(
@@ -1727,7 +1755,7 @@ class Qwen36GDNLayer:
                     getattr(arena, "gdn_states")[self.layer],
                     state_indices.to(device=x.device, dtype=torch.long).contiguous(),
                     self.gdn_norm_w.to(device=x.device, dtype=torch.float16).contiguous(),
-                    z.to(device=x.device, dtype=torch.float16).contiguous(),
+                    z_fused.to(device=x.device, dtype=torch.float16).contiguous(),
                     self.cfg.rms_norm_eps,
                 ).reshape(x.size(0), -1).contiguous()
                 core = None
@@ -1833,12 +1861,52 @@ class Qwen36GDNLayer:
         ops = cuda_ops()
         a_spec = a.to(device=x.device, dtype=torch.float16).view(batch, tokens, self.cfg.linear_num_value_heads).contiguous()
         b_spec = b.to(device=x.device, dtype=torch.float16).view(batch, tokens, self.cfg.linear_num_value_heads).contiguous()
+        core_norm_fused: torch.Tensor | None = None
         if trajectory is not None:
             workspace = trajectory.get("workspace") if isinstance(trajectory, dict) else None
             layer_ws = workspace.get(self.layer, {}) if isinstance(workspace, dict) else {}
             core = layer_ws.get("gdn_out")
             gdn_traj = layer_ws.get("gdn_traj")
-            if core is None or gdn_traj is None:
+            fused_spec_enabled = _env_flag("LANGBURST_GDN_SPEC_NORM_GATE_FUSED", "0")
+            fused_spec_out = getattr(ops, "gdn_recurrent_ab_spec_trajectory_norm_gate_out", None) if fused_spec_enabled else None
+            fused_spec = getattr(ops, "gdn_recurrent_ab_spec_trajectory_norm_gate", None) if fused_spec_enabled else None
+            z_spec = z.reshape(batch, tokens, self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim).contiguous()
+            fused_shape_ok = int(self.gdn_norm_w.numel()) == int(self.cfg.linear_value_head_dim)
+            if callable(fused_spec_out) and core is not None and gdn_traj is not None and fused_shape_ok:
+                fused_spec_out(
+                    q,
+                    k,
+                    v,
+                    a_spec,
+                    b_spec,
+                    self.A_log,
+                    self.dt_bias,
+                    getattr(arena, "gdn_states")[self.layer],
+                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                    self.gdn_norm_w.to(device=x.device, dtype=torch.float16).contiguous(),
+                    z_spec.to(device=x.device, dtype=torch.float16).contiguous(),
+                    core,
+                    gdn_traj,
+                    self.cfg.rms_norm_eps,
+                )
+                core_norm_fused = core.reshape(batch * tokens, -1).contiguous()
+            elif callable(fused_spec) and fused_shape_ok:
+                core, gdn_traj = fused_spec(
+                    q,
+                    k,
+                    v,
+                    a_spec,
+                    b_spec,
+                    self.A_log,
+                    self.dt_bias,
+                    getattr(arena, "gdn_states")[self.layer],
+                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                    self.gdn_norm_w.to(device=x.device, dtype=torch.float16).contiguous(),
+                    z_spec.to(device=x.device, dtype=torch.float16).contiguous(),
+                    self.cfg.rms_norm_eps,
+                )
+                core_norm_fused = core.reshape(batch * tokens, -1).contiguous()
+            elif core is None or gdn_traj is None:
                 core, gdn_traj = ops.gdn_recurrent_ab_spec_trajectory(
                     q,
                     k,
@@ -1878,7 +1946,7 @@ class Qwen36GDNLayer:
                 state_indices.to(device=x.device, dtype=torch.long).contiguous(),
                 commit_tokens.to(device=x.device, dtype=torch.int32).contiguous(),
             )
-        core_norm = gdn_norm_silu_gate_2d(
+        core_norm = core_norm_fused if core_norm_fused is not None else gdn_norm_silu_gate_2d(
             core.reshape(batch * tokens, -1),
             self.gdn_norm_w,
             z.reshape(batch * tokens, -1),
@@ -3206,12 +3274,25 @@ class Qwen36Model:
         state_idx = state_indices.to(device=device, dtype=torch.long).reshape(-1).contiguous()
         row_index = torch.arange(int(commit_tokens.numel()), device=device, dtype=torch.long)
         last_indices = torch.clamp(commit_tokens.to(device=device, dtype=torch.long) - 1, min=0)
+        copy_selected = (
+            getattr(cuda_ops(), "copy_selected_trajectory_out", None)
+            if _spec_trajectory_copy_cuda_enabled()
+            else None
+        )
         for layer, conv_traj in trajectory.get("conv", []):
-            selected = conv_traj[row_index, last_indices].contiguous()
-            getattr(arena, "gdn_conv_states")[layer].index_copy_(0, state_idx, selected)
+            dest = getattr(arena, "gdn_conv_states")[layer]
+            if callable(copy_selected) and conv_traj.device.type == "cuda":
+                copy_selected(conv_traj.contiguous(), dest, state_idx, commit_tokens.to(device=device, dtype=torch.int32).contiguous())
+            else:
+                selected = conv_traj[row_index, last_indices].contiguous()
+                dest.index_copy_(0, state_idx, selected)
         for layer, gdn_traj in trajectory.get("gdn", []):
-            selected = gdn_traj[row_index, last_indices].contiguous()
-            getattr(arena, "gdn_states")[layer].index_copy_(0, state_idx, selected)
+            dest = getattr(arena, "gdn_states")[layer]
+            if callable(copy_selected) and gdn_traj.device.type == "cuda":
+                copy_selected(gdn_traj.contiguous(), dest, state_idx, commit_tokens.to(device=device, dtype=torch.int32).contiguous())
+            else:
+                selected = gdn_traj[row_index, last_indices].contiguous()
+                dest.index_copy_(0, state_idx, selected)
         for layer, k_btd, v_btd, slot_mapping in trajectory.get("attn", []):
             append_paged_int4_spec_block(arena, layer, k_btd, v_btd, slot_mapping, commit_tokens)
 

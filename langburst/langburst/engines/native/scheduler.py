@@ -314,6 +314,18 @@ class ContinuousBatchScheduler:
     def get_request(self, request_id: str) -> DecodeRequestState | None:
         return self._active.get(request_id) or self._waiting.get(request_id)
 
+    def cap_active_draft_tokens(self, max_draft_tokens: int) -> None:
+        max_draft = max(0, int(max_draft_tokens))
+        for row in self._active.values():
+            if row.num_draft_tokens <= max_draft:
+                continue
+            if max_draft == 0:
+                row.clear_draft_tokens()
+            elif row.draft_token_ids_tensor is not None:
+                row.draft_token_ids_tensor = row.draft_token_ids_tensor[:max_draft].contiguous()
+            elif row.draft_token_ids is not None:
+                row.draft_token_ids = list(row.draft_token_ids[:max_draft])
+
     def schedule(self, *, device: str = "cpu") -> DecodeBatchPlan | None:
         self._admit_waiting()
         if not self._active:

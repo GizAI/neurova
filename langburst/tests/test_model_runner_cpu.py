@@ -5,13 +5,50 @@ from types import SimpleNamespace
 
 import torch
 
-from langburst.engines.native.model_runner import BatchedModelRunner
+from langburst.engines.native.model_runner import BatchedModelRunner, _draft_cap_for_active_rows
 from langburst.correctness import run_batch_path_parity
 from langburst.core.features import RuntimeFeatures
 from langburst.engines.native.runtime import GenerationConfig, RuntimeEngine
 from langburst.engines.native.scheduler import ContinuousBatchScheduler
 
 from test_adapter_runtime_cpu import NativeVerifyBatchToyAdapter, ToyAdapter, ToyModel, ToyState
+
+
+def test_draft_cap_for_active_rows_defaults_to_batch2_k1(monkeypatch):
+    monkeypatch.delenv("LANGBURST_MTP_MAX_DRAFT_BY_ACTIVE", raising=False)
+
+    assert _draft_cap_for_active_rows(4, 1) == 4
+    assert _draft_cap_for_active_rows(4, 2) == 1
+    assert _draft_cap_for_active_rows(4, 3) == 1
+
+
+def test_draft_cap_for_active_rows_uses_ordered_env_caps(monkeypatch):
+    monkeypatch.setenv("LANGBURST_MTP_MAX_DRAFT_BY_ACTIVE", "2:2,3:1")
+
+    assert _draft_cap_for_active_rows(4, 1) == 4
+    assert _draft_cap_for_active_rows(4, 2) == 2
+    assert _draft_cap_for_active_rows(4, 3) == 1
+
+
+def test_scheduler_caps_existing_tensor_drafts(tmp_path: Path):
+    engine = RuntimeEngine(
+        adapter=ToyAdapter(),
+        hf_model=tmp_path,
+        qb_model=tmp_path,
+        device="cpu",
+        recent_window=16,
+        weight_device="cpu",
+    )
+    scheduler = ContinuousBatchScheduler(max_num_requests=1, max_num_batched_tokens=8, prefill_chunk_size=2)
+    runner = BatchedModelRunner(engine=engine, scheduler=scheduler)
+    row = runner.add_request("a", [1], generation_config=GenerationConfig(ignore_eos=True))
+    row.computed_tokens = row.total_len
+    row.draft_token_ids_tensor = torch.tensor([2, 3, 4, 5])
+
+    scheduler.cap_active_draft_tokens(1)
+
+    assert row.draft_token_ids_tensor is not None
+    assert row.draft_token_ids_tensor.tolist() == [2]
 
 
 def test_batched_model_runner_prefill_then_decode_step(tmp_path: Path):
