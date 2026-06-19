@@ -10,6 +10,7 @@ from langburst.core.features import RuntimeFeatures
 from langburst.engines.native.manager import load_model_specs
 from langburst.server import (
     ChatCompletionRequest,
+    _final_response_text,
     _long_document_stop_strings,
     _native_generation_config,
     _native_stop_token_sequences,
@@ -124,7 +125,7 @@ def test_native_generation_defaults_disable_thinking_and_min_output(monkeypatch)
 
     assert cfg.min_new_tokens == 0
     assert 248047 in cfg.suppress_tokens
-    assert 248046 in cfg.suppress_tokens
+    assert 248046 not in cfg.suppress_tokens
     assert 248068 not in cfg.suppress_tokens
     assert 248069 not in cfg.suppress_tokens
 
@@ -152,7 +153,7 @@ def test_native_generation_can_opt_into_think_token_suppression(monkeypatch):
     cfg = _native_generation_config(Engine(), req)
 
     assert 248047 in cfg.suppress_tokens
-    assert 248046 in cfg.suppress_tokens
+    assert 248046 not in cfg.suppress_tokens
     assert 248068 in cfg.suppress_tokens
     assert 248069 in cfg.suppress_tokens
 
@@ -302,6 +303,35 @@ def test_leading_role_echo_filter_preserves_normal_opening_on_final():
     assert filt.push("assistant tools can help", final=True) == "assistant tools can help"
 
 
+def test_final_response_text_filters_nonstream_split_stop_string():
+    req = ChatCompletionRequest(
+        model="langburst-qwen3.6-27b-q4",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=64,
+    )
+
+    assert _final_response_text(
+        "정상 답변\n\n--- hidden",
+        req=req,
+        model_name=req.model,
+        extra_stop_strings=("\n\n---",),
+    ) == "정상 답변"
+
+
+def test_final_response_text_filters_leading_role_echo_nonstream():
+    req = ChatCompletionRequest(
+        model="langburst-qwen3.6-27b-q4",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=64,
+    )
+
+    assert _final_response_text(
+        "user\nassistant\n\n안녕하세요",
+        req=req,
+        model_name=req.model,
+    ) == "안녕하세요"
+
+
 def test_native_generation_allows_think_tokens_when_explicitly_enabled(monkeypatch):
     class Tokenizer:
         def encode(self, text: str, add_special_tokens: bool = False):
@@ -325,7 +355,7 @@ def test_native_generation_allows_think_tokens_when_explicitly_enabled(monkeypat
     cfg = _native_generation_config(Engine(), req)
 
     assert 248047 in cfg.suppress_tokens
-    assert 248046 in cfg.suppress_tokens
+    assert 248046 not in cfg.suppress_tokens
     assert 248068 not in cfg.suppress_tokens
     assert 248069 not in cfg.suppress_tokens
 

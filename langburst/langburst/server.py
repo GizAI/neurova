@@ -167,7 +167,7 @@ def _default_suppress_tokens(engine, *, include_thinking_tokens: bool) -> tuple[
     if tokenizer is None:
         return ()
     if os.environ.get("LANGBURST_SUPPRESS_CHAT_CONTROL_TOKENS", "1").strip().lower() not in {"0", "false", "off", "no"}:
-        for text in ("<|im_start|>", "<|im_end|>"):
+        for text in ("<|im_start|>",):
             token = _encoded_single_token(tokenizer, text)
             if token is not None:
                 out.append(token)
@@ -390,6 +390,24 @@ def _native_stop_token_sequences(
         if ids:
             out.append(ids)
     return tuple(out)
+
+
+def _final_response_text(
+    text: str,
+    *,
+    req: ChatCompletionRequest,
+    model_name: str,
+    extra_stop_strings: tuple[str, ...] = (),
+) -> str:
+    if not _chat_template_kwargs(req)["enable_thinking"]:
+        text = hide_thinking_text(text)
+    text = StopTextFilter(tuple(_stop_strings(req)) + extra_stop_strings).push(text, final=True)
+    text = LeadingRoleEchoFilter().push(text, final=True)
+    return _with_visible_prefix_once(
+        text,
+        _thinking_visible_prefix(req, model_name),
+        emitted=False,
+    )[0]
 
 
 def create_app(manager: EngineManager):
@@ -640,15 +658,12 @@ def create_app(manager: EngineManager):
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": _with_visible_prefix_once(
-                                (
-                                    engine.tokenizer.decode(ids, skip_special_tokens=True)
-                                    if _chat_template_kwargs(req)["enable_thinking"]
-                                    else hide_thinking_text(engine.tokenizer.decode(ids, skip_special_tokens=True))
-                                ),
-                                _thinking_visible_prefix(req, engine.model_name),
-                                emitted=False,
-                            )[0],
+                            "content": _final_response_text(
+                                engine.tokenizer.decode(ids, skip_special_tokens=True),
+                                req=req,
+                                model_name=engine.model_name,
+                                extra_stop_strings=extra_stop_strings,
+                            ),
                         },
                         "finish_reason": handle.finish_reason,
                     }
