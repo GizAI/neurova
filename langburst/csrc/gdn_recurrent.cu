@@ -1758,17 +1758,10 @@ __global__ void gdn_recurrent_ab_spec_trajectory_norm_gate_128_kernel(
     }
     __syncthreads();
 
-    float q_norm_sum = 0.0f;
-    #pragma unroll
-    for (int d = 0; d < QB_GDN_D; ++d) {
-      float qd = __half2float(q[q_off + d]);
-      q_norm_sum += qd * qd;
-    }
-    float q_scale = rsqrtf(q_norm_sum + 1e-6f) * rsqrtf(static_cast<float>(QB_GDN_D));
     float yj = 0.0f;
     #pragma unroll
     for (int d = 0; d < QB_GDN_D; ++d) {
-      yj += (__half2float(q[q_off + d]) * q_scale) * S_col[d];
+      yj += q_s[d] * S_col[d];
     }
 
     float y_half = __half2float(__float2half_rn(yj));

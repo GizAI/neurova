@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -115,3 +116,79 @@ class ThinkingTextFilter:
 
 def hide_thinking_text(text: str) -> str:
     return ThinkingTextFilter(enabled=True).push(text, final=True)
+
+
+class StopTextFilter:
+    """Streaming text stop filter that does not leak split stop strings."""
+
+    def __init__(self, stop_strings: tuple[str, ...] = ()) -> None:
+        self.stop_strings = tuple(s for s in stop_strings if s)
+        self._buffer = ""
+        self._stopped = False
+        self._keep = max((len(s) for s in self.stop_strings), default=1) - 1
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped
+
+    def push(self, text: str, *, final: bool = False) -> str:
+        if self._stopped:
+            return ""
+        if not self.stop_strings:
+            return text
+        self._buffer += text
+        stop_idx = self._first_stop_index(self._buffer)
+        if stop_idx is not None:
+            out = self._buffer[:stop_idx]
+            self._buffer = ""
+            self._stopped = True
+            return out
+        if final:
+            out = self._buffer
+            self._buffer = ""
+            return out
+        if len(self._buffer) <= self._keep:
+            return ""
+        out = self._buffer[: -self._keep]
+        self._buffer = self._buffer[-self._keep :]
+        return out
+
+    def _first_stop_index(self, text: str) -> int | None:
+        found: list[int] = []
+        for stop in self.stop_strings:
+            idx = text.find(stop)
+            if idx >= 0:
+                found.append(idx)
+        return min(found) if found else None
+
+
+_LEADING_ROLE_ECHO_RE = re.compile(
+    r"^\s*(?:[*_`>#\-\s]{0,16})?(?:user|system)\s+(?:assistant)\s*",
+    re.IGNORECASE,
+)
+
+
+class LeadingRoleEchoFilter:
+    """Remove model-emitted ChatML role labels at the very start only."""
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._decided = False
+        self._max_probe = 128
+
+    def push(self, text: str, *, final: bool = False) -> str:
+        if self._decided:
+            return text
+        self._buffer += text
+        match = _LEADING_ROLE_ECHO_RE.match(self._buffer)
+        if match is not None:
+            self._decided = True
+            out = self._buffer[match.end() :].lstrip()
+            self._buffer = ""
+            return out
+        if final or len(self._buffer) >= self._max_probe:
+            self._decided = True
+            out = self._buffer
+            self._buffer = ""
+            return out
+        return ""

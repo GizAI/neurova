@@ -128,7 +128,7 @@ class CPUFallbackOps:
         group_size: int,
     ) -> None:
         # CPU fallback preserves the public contract.  The CUDA implementation
-        # performs the argmax inside the Marlin kernel and writes argmax_out
+        # reduces logits inside the Marlin write path and writes argmax_out
         # directly; scratch_out is only needed by this fallback path.
         CPUFallbackOps.lowbit_marlin_gemm_out(qweight, scales, x, scratch_out, workspace, cols, group_size)
         CPUFallbackOps.argmax_many_out(scratch_out, argmax_out)

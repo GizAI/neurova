@@ -1,0 +1,105 @@
+model:
+  hf_model: /home/user/models/Qwen3.6-27B
+  qb_model: /home/user/models/Qwen3.6-27B-qb4-marlin-fused
+  name: langburst-qwen3.6-27b-q4
+  adapter: qwen36
+  engine: native
+  device: cuda
+  weight_device: cuda
+  cpu_embed: false
+
+server:
+  host: 0.0.0.0
+  port: 8008
+  restart: true
+  log_dir: /tmp
+  request_timeout_s: 300
+  prefix_cache: "on"
+
+serving:
+  context_window: 65536
+  context_tiers: [4096, 65536]
+  context_tier_slots: [2, 1]
+  exclusive_prefill_tokens:
+  allow_context_overflow: true
+  max_active_requests: 3
+  max_queued_requests: 8
+  max_state_pool_size: 3
+  max_generation_tokens: 1024
+  default_max_tokens: 256
+  default_min_new_tokens: 16
+  min_completion_budget: 0
+  message_context_policy: auto_long_user
+  standalone_user_min_tokens: 1024
+  reserve_free_vram_mib: 256
+  batch_wait_ms: 8
+  max_num_batched_tokens: 256
+  prefill_chunk_size: 64
+  max_prefill_rows_per_batch: 1
+  decode_prefill_interleave_steps: 16
+
+kv:
+  cache_dtype: int4_bdr
+  paged: true
+  paged_mirror: false
+  paged_shadow: true
+  paged_attention_kernels: true
+  paged_prefill_block: true
+  short_prefill_sdpa_tokens: 2048
+  short_prefill_sdpa_min_free_mib: 384
+  attention_recent_tokens: 32
+  paged_attention_backend: flash
+  int4_layout: tiled
+  raw_prefill_block_tokens:
+
+marlin:
+  out_cache_policy: all
+  out_cache_max_batch: 4
+  cache_max_mib: 32
+  cache_min_free_mib: 256
+  direct_max_batch: 256
+  lowbit_rows_per_cta: 4
+  internal_argmax: true
+  max_par:
+
+mtp:
+  enabled: true
+  speculative_tokens: 4
+  max_draft: 4
+  draft_candidates: 4
+  max_draft_by_active: "2:1"
+  legacy_list_cache: false
+  local_tkh_attention: false
+  batch_proposer: true
+  fc_split: false
+  skip_after_reject: false
+  adaptive: false
+  min_free_vram_mib: 128
+
+kernels:
+  cuda_graph: false
+  verify_full_logits: false
+  gdn_recurrent_norm_gate_fused: false
+  gdn_spec_norm_gate_fused: true
+  gdn_ba_lowbit_pair: true
+  mlp_tensorcore_down_silu_a: true
+  mlp_scalar_streaming_debug: false
+  spec_trajectory_copy_cuda: true
+  batch_state_arena: auto
+
+runtime:
+  serve_batch: true
+  suppress_think_tokens: false
+  suppress_chat_control_tokens: false
+  repetition_stop_min_ngram_size: 32
+  repetition_stop_ngram_size: 96
+  repetition_stop_repeats: 2
+  trim_cache_after_request: true
+  trim_cache_free_below_mib: 1024
+  trim_model_cache_before_prefill: true
+  trim_model_cache_prefill_free_below_mib: 1024
+  prefix_cache_max_entries: 2
+  prefix_cache_max_tokens: 16384
+  prefix_cache_min_free_mib: 768
+  prefix_cache_min_free_blocks: 512
+  pytorch_cuda_alloc_conf: expandable_segments:True

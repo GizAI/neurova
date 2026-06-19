@@ -145,10 +145,11 @@ class BatchGenerationHandle:
     def _matched_repetition_stop(self) -> bool:
         cfg = self.generation_config
         max_n = int(getattr(cfg, "repetition_stop_ngram_size", 0) or 0)
+        min_n = max(1, int(getattr(cfg, "repetition_stop_min_ngram_size", 1) or 1))
         repeats = int(getattr(cfg, "repetition_stop_repeats", 0) or 0)
-        if max_n <= 0 or repeats <= 1:
+        if max_n <= 0 or repeats <= 1 or min_n > max_n:
             return False
-        for n in range(1, max_n + 1):
+        for n in range(min_n, max_n + 1):
             total = n * repeats
             if len(self.generated) < total:
                 continue

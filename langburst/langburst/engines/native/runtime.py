@@ -43,6 +43,7 @@ class GenerationConfig:
     eos_token_ids: tuple[int, ...] = ()
     stop_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
+    repetition_stop_min_ngram_size: int = 1
     repetition_stop_ngram_size: int = 0
     repetition_stop_repeats: int = 0
 

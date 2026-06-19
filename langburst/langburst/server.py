@@ -27,8 +27,9 @@ from .core.defaults import (
 )
 from .core.chat_template import resolve_chat_template_kwargs
 from .core.features import RuntimeFeatures
+from .core.message_context import MessageContextPolicy, metadata_context_policy, select_messages_for_generation
 from .core.platform import PLATFORM_NAME
-from .core.text_stream import StreamingTextDecoder, ThinkingTextFilter, hide_thinking_text
+from .core.text_stream import LeadingRoleEchoFilter, StopTextFilter, StreamingTextDecoder, ThinkingTextFilter, hide_thinking_text
 from .core.usage import RequestUsage
 from .engines import ensure_engines_loaded, engine_registry
 from .engines.base import EngineBackend, EngineChatRequest, EngineSamplingParams
@@ -112,6 +113,11 @@ def _sse_payload(payload: dict[str, Any]) -> str:
 def _requested_generation_tokens(req: ChatCompletionRequest) -> int:
     fallback = int(os.environ.get("LANGBURST_DEFAULT_MAX_TOKENS", "8192"))
     requested = int(req.max_new_tokens or req.max_completion_tokens or req.max_tokens or fallback)
+    metadata = req.metadata or {}
+    strict_max = bool(metadata.get("langburst_strict_max_tokens") or metadata.get("strict_max_tokens"))
+    floor = max(0, int(os.environ.get("LANGBURST_MIN_COMPLETION_TOKENS", "0")))
+    if floor and not strict_max:
+        requested = max(requested, floor)
     cap = int(os.environ.get("LANGBURST_MAX_GENERATION_TOKENS", str(fallback)))
     if cap > 0:
         return min(requested, cap)
@@ -137,24 +143,51 @@ def _repetition_stop_ngram_size() -> int:
     return max(0, int(os.environ.get("LANGBURST_REPETITION_STOP_NGRAM_SIZE", "2")))
 
 
+def _repetition_stop_min_ngram_size() -> int:
+    return max(1, int(os.environ.get("LANGBURST_REPETITION_STOP_MIN_NGRAM_SIZE", "1")))
+
+
 def _repetition_stop_repeats() -> int:
     return max(0, int(os.environ.get("LANGBURST_REPETITION_STOP_REPEATS", "8")))
 
 
-def _default_suppress_tokens(engine) -> tuple[int, ...]:
-    if os.environ.get("LANGBURST_SUPPRESS_THINK_TOKENS", "0").strip().lower() in {"0", "false", "off", "no"}:
-        return ()
+def _encoded_single_token(tokenizer, text: str) -> int | None:
+    try:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        ids = tokenizer.encode(text)
+    if len(ids) == 1:
+        return int(ids[0])
+    return None
+
+
+def _default_suppress_tokens(engine, *, include_thinking_tokens: bool) -> tuple[int, ...]:
     out: list[int] = []
     tokenizer = getattr(engine, "tokenizer", None)
     if tokenizer is None:
         return ()
+    if os.environ.get("LANGBURST_SUPPRESS_CHAT_CONTROL_TOKENS", "1").strip().lower() not in {"0", "false", "off", "no"}:
+        for text in ("<|im_start|>", "<|im_end|>"):
+            token = _encoded_single_token(tokenizer, text)
+            if token is not None:
+                out.append(token)
+    if not include_thinking_tokens:
+        return tuple(dict.fromkeys(out))
     for text in ("<think>", "</think>"):
-        try:
-            ids = tokenizer.encode(text, add_special_tokens=False)
-        except TypeError:
-            ids = tokenizer.encode(text)
-        if len(ids) == 1:
-            out.append(int(ids[0]))
+        token = _encoded_single_token(tokenizer, text)
+        if token is not None:
+            out.append(token)
+    return tuple(dict.fromkeys(out))
+
+
+def _default_stop_token_ids(engine) -> tuple[int, ...]:
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        return ()
+    out: list[int] = []
+    token = _encoded_single_token(tokenizer, "<|im_start|>")
+    if token is not None:
+        out.append(token)
     return tuple(dict.fromkeys(out))
 
 
@@ -173,6 +206,25 @@ def _request_messages(req: ChatCompletionRequest) -> list[dict[str, Any]]:
                 continue
         out.append({"role": message.role, "content": content})
     return out
+
+
+def _message_context_policy() -> MessageContextPolicy:
+    return MessageContextPolicy.from_env(os.environ)
+
+
+def _generation_messages(engine, req: ChatCompletionRequest) -> list[dict[str, Any]]:
+    messages = _request_messages(req)
+    template_kwargs = _chat_template_kwargs(req)
+
+    def encode(candidate: list[dict[str, Any]]) -> list[int]:
+        return engine.encode_messages(candidate, chat_template_kwargs=template_kwargs)
+
+    return select_messages_for_generation(
+        messages,
+        encoder=encode,
+        policy=_message_context_policy(),
+        metadata=req.metadata,
+    )
 
 
 def _chat_template_kwargs(req: ChatCompletionRequest) -> dict[str, Any]:
@@ -206,6 +258,27 @@ def _stop_strings(req: ChatCompletionRequest) -> list[str]:
     if req.stop_sequences:
         out.extend(str(v) for v in req.stop_sequences)
     return [s for s in out if s]
+
+
+def _long_document_stop_strings(
+    *,
+    selected_messages: list[dict[str, Any]],
+    original_messages: list[dict[str, Any]],
+    metadata: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    if metadata_context_policy(metadata) in {"raw", "none", "off"}:
+        return ()
+    long_user_chars = max(
+        (
+            len(str(message.get("content", "")))
+            for message in selected_messages
+            if str(message.get("role", "")).lower() == "user"
+        ),
+        default=0,
+    )
+    if long_user_chars < int(os.environ.get("LANGBURST_LONG_DOCUMENT_STOP_MIN_CHARS", "2000")):
+        return ()
+    return ("\n\n---",)
 
 
 def _usage_payload(usage: RequestUsage) -> dict[str, Any]:
@@ -276,7 +349,11 @@ def _request_feature_overrides(req: ChatCompletionRequest, base: RuntimeFeatures
 def _native_generation_config(engine, req: ChatCompletionRequest) -> GenerationConfig:
     request_suppress = tuple(int(t) for t in (req.suppress_tokens or []) + (req.begin_suppress_tokens or []))
     template_kwargs = _chat_template_kwargs(req)
-    default_suppress = () if template_kwargs["enable_thinking"] else _default_suppress_tokens(engine)
+    suppress_think = (
+        (not template_kwargs["enable_thinking"])
+        and os.environ.get("LANGBURST_SUPPRESS_THINK_TOKENS", "0").strip().lower() not in {"0", "false", "off", "no"}
+    )
+    default_suppress = _default_suppress_tokens(engine, include_thinking_tokens=suppress_think)
     return GenerationConfig(
         max_new_tokens=_requested_generation_tokens(req),
         min_new_tokens=_requested_min_generation_tokens(req),
@@ -293,16 +370,22 @@ def _native_generation_config(engine, req: ChatCompletionRequest) -> GenerationC
         suppress_tokens=tuple(dict.fromkeys(request_suppress + default_suppress)),
         seed=req.seed,
         eos_token_ids=engine.eos_token_ids(),
-        stop_token_ids=tuple(int(t) for t in (req.stop_token_ids or [])),
+        stop_token_ids=tuple(dict.fromkeys(tuple(int(t) for t in (req.stop_token_ids or [])) + _default_stop_token_ids(engine))),
         ignore_eos=bool(req.ignore_eos),
+        repetition_stop_min_ngram_size=_repetition_stop_min_ngram_size(),
         repetition_stop_ngram_size=_repetition_stop_ngram_size(),
         repetition_stop_repeats=_repetition_stop_repeats(),
     )
 
 
-def _native_stop_token_sequences(engine, req: ChatCompletionRequest) -> tuple[tuple[int, ...], ...]:
+def _native_stop_token_sequences(
+    engine,
+    req: ChatCompletionRequest,
+    *,
+    extra_stop_strings: tuple[str, ...] = (),
+) -> tuple[tuple[int, ...], ...]:
     out: list[tuple[int, ...]] = []
-    for stop in _stop_strings(req):
+    for stop in [*_stop_strings(req), *extra_stop_strings]:
         ids = tuple(int(t) for t in engine.tokenizer.encode(stop))
         if ids:
             out.append(ids)
@@ -346,7 +429,9 @@ def create_app(manager: EngineManager):
         try:
             engine = manager.get(req.model)
             features = _request_feature_overrides(req, engine.features)
-            prompt_ids = engine.encode_messages(_request_messages(req), chat_template_kwargs=_chat_template_kwargs(req))
+            original_messages = _request_messages(req)
+            messages = _generation_messages(engine, req)
+            prompt_ids = engine.encode_messages(messages, chat_template_kwargs=_chat_template_kwargs(req))
             generation_tokens = _requested_generation_tokens(req)
             manager.validate_generation_request(prompt_tokens=len(prompt_ids), generation_tokens=generation_tokens)
             admission_tokens = manager.effective_admission_tokens(
@@ -367,7 +452,12 @@ def create_app(manager: EngineManager):
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
         worker = manager.create_batch_worker(engine.model_name, features)
-        stop_sequences = _native_stop_token_sequences(engine, req)
+        extra_stop_strings = _long_document_stop_strings(
+            selected_messages=messages,
+            original_messages=original_messages,
+            metadata=req.metadata,
+        )
+        stop_sequences = _native_stop_token_sequences(engine, req, extra_stop_strings=extra_stop_strings)
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
 
         if req.stream:
@@ -378,6 +468,8 @@ def create_app(manager: EngineManager):
                 visible_prefix = _thinking_visible_prefix(req, engine.model_name)
                 hide_thinking = not _chat_template_kwargs(req)["enable_thinking"]
                 thinking_filter = ThinkingTextFilter(enabled=hide_thinking)
+                stop_filter = StopTextFilter(tuple(_stop_strings(req)) + extra_stop_strings)
+                role_echo_filter = LeadingRoleEchoFilter()
                 visible_prefix_emitted = False
                 live_usage = _wants_live_usage(req)
                 last_live_usage_s = 0.0
@@ -396,7 +488,7 @@ def create_app(manager: EngineManager):
                         include_stop_str_in_output=req.include_stop_str_in_output,
                         request_id=request_id,
                     )
-                    decoder = StreamingTextDecoder(engine.tokenizer, skip_special_tokens=False)
+                    decoder = StreamingTextDecoder(engine.tokenizer, skip_special_tokens=True)
                     yield _sse_payload(
                         {
                             "id": request_id,
@@ -418,6 +510,10 @@ def create_app(manager: EngineManager):
                         text = decoder.push(token_id)
                         if text:
                             text = thinking_filter.push(text)
+                        if text:
+                            text = stop_filter.push(text)
+                        if text:
+                            text = role_echo_filter.push(text)
                         if text:
                             text, visible_prefix_emitted = _with_visible_prefix_once(
                                 text,
@@ -452,6 +548,8 @@ def create_app(manager: EngineManager):
                                 )
                     tail = decoder.flush()
                     tail = thinking_filter.push(tail, final=True)
+                    tail = stop_filter.push(tail, final=True)
+                    tail = role_echo_filter.push(tail, final=True)
                     usage.apply_metrics(handle.metrics())
                     usage.requested_completion_tokens = generation_tokens
                     usage.finish_reason = handle.finish_reason

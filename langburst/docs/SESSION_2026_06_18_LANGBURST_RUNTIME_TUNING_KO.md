@@ -999,6 +999,21 @@ ml-dmc8 실측:
   또한 create_batch_worker(features=...)가 인자를 무시하던 버그를 수정했다.
   요청 단위 feature override가 runner 생성에 반영되지 않아 speculative_decoding=false가
   실제로 적용되지 않는 파편화 원인이었다.
+
+2026-06-19 추가 RCA:
+  같은 긴 반복 입력을 direct generate 경로에서 target-only/MTP 양쪽으로 확인했을 때는
+  정상 요약이 나왔고, API/chat 경로에서는 긴 반복 구문을 출력으로 복사하다가
+  finish_reason=length로 끝나는 케이스가 재현됐다.
+  따라서 이번에 고정한 문제는 MTP verifier 자체가 아니라, 생성된 suffix 반복 감지 폭이
+  너무 좁아 문장 단위 반복을 놓치는 runtime 종료 계약이었다.
+  기존 repetition_stop_ngram_size=8은 1~8토큰 반복만 잡는다.
+  한국어 문장이나 입력 문단 복사처럼 반복 단위가 10토큰 이상이면 같은 phrase가 여러 번
+  반복되어도 guard가 발동하지 않는다.
+  운영 기본값은 repetition_stop_min_ngram_size=32,
+  repetition_stop_ngram_size=96, repetition_stop_repeats=2로 둔다.
+  이것은 logits suppression이나 샘플링 penalty가 아니라, 이미 생성된 tail이 같은 구간을
+  2회 반복하는 degenerate output을 finish_reason=repetition으로 종료하는 정확한 suffix
+  detector다.
 ```
 
 추가 CPU gate:

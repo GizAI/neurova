@@ -23,4 +23,5 @@ def resolve_chat_template_kwargs(
         out["enable_thinking"] = False
     elif reasoning_effort is not None:
         out["enable_thinking"] = True
+    out.setdefault("preserve_thinking", bool(out["enable_thinking"]))
     return out

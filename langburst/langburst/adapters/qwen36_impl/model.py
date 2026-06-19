@@ -55,6 +55,11 @@ def _spec_trajectory_copy_cuda_enabled() -> bool:
     return _env_flag("LANGBURST_SPEC_TRAJECTORY_COPY_CUDA", "0")
 
 
+def _device_contiguous(t: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    out = t.to(device=device, dtype=dtype)
+    return out if out.is_contiguous() else out.contiguous()
+
+
 def _paged_int4_tiled_layout(arena: object) -> bool:
     return bool(getattr(arena, "paged_int4_tiled_layout", False))
 
@@ -654,6 +659,7 @@ def attention_decode_paged_batch(
     plan: Any,
     scale: float,
 ) -> torch.Tensor:
+    profile_name = "attention_paged_batch"
     k_pages = getattr(arena, "paged_attn_k", None)
     v_pages = getattr(arena, "paged_attn_v", None)
     if k_pages is None or v_pages is None:
@@ -682,90 +688,93 @@ def attention_decode_paged_batch(
         block_tables = torch.where(valid, shifted, torch.zeros((), device=block_tables.device, dtype=block_tables.dtype)).contiguous()
         seq_lens = (seq_lens - start_blocks.to(device=seq_lens.device, dtype=seq_lens.dtype) * int(block_size)).contiguous()
     if not paged_attention_kernels_enabled():
-        return attention_decode_paged_reference(
-            arena,
-            layer,
-            q,
-            k,
-            v,
-            slot_mapping,
-            block_tables,
-            seq_lens,
-            block_size,
-            scale,
-            getattr(plan, "state_indices", None),
-            getattr(plan, "positions", None),
-        )
-    if kv_spec.is_int4:
-        k_scales = getattr(arena, "paged_attn_k_scale", None)
-        v_scales = getattr(arena, "paged_attn_v_scale", None)
-        k_zeros = getattr(arena, "paged_attn_k_zero", None)
-        v_zeros = getattr(arena, "paged_attn_v_zero", None)
-        if k_scales is None or v_scales is None or k_zeros is None or v_zeros is None:
-            raise RuntimeError("INT4 paged attention requires paged scale/zero tensors")
-        ops = cuda_ops()
-        backend = paged_attention_backend()
-        if backend == "auto":
-            if hasattr(ops, "attention_paged_int4_flash"):
-                op = ops.attention_paged_int4_flash
-            else:
+        profile_name = "attention_paged_reference"
+        with decode_profile_scope(profile_name):
+            return attention_decode_paged_reference(
+                arena,
+                layer,
+                q,
+                k,
+                v,
+                slot_mapping,
+                block_tables,
+                seq_lens,
+                block_size,
+                scale,
+                getattr(plan, "state_indices", None),
+                getattr(plan, "positions", None),
+            )
+    with decode_profile_scope(profile_name):
+        if kv_spec.is_int4:
+            k_scales = getattr(arena, "paged_attn_k_scale", None)
+            v_scales = getattr(arena, "paged_attn_v_scale", None)
+            k_zeros = getattr(arena, "paged_attn_k_zero", None)
+            v_zeros = getattr(arena, "paged_attn_v_zero", None)
+            if k_scales is None or v_scales is None or k_zeros is None or v_zeros is None:
+                raise RuntimeError("INT4 paged attention requires paged scale/zero tensors")
+            ops = cuda_ops()
+            backend = paged_attention_backend()
+            if backend == "auto":
+                if hasattr(ops, "attention_paged_int4_flash"):
+                    op = ops.attention_paged_int4_flash
+                else:
+                    op = ops.attention_decode_paged_int4
+            elif backend == "direct":
                 op = ops.attention_decode_paged_int4
-        elif backend == "direct":
-            op = ops.attention_decode_paged_int4
-        elif backend == "flash":
-            if not hasattr(ops, "attention_paged_int4_flash"):
-                raise RuntimeError("LANGBURST_PAGED_ATTENTION_BACKEND=flash requires attention_paged_int4_flash")
-            op = ops.attention_paged_int4_flash
-        else:  # pragma: no cover - paged_attention_backend validates this.
-            raise ValueError(f"unknown paged attention backend: {backend}")
-        out = op(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            k_pages[layer],
-            v_pages[layer],
-            k_scales[layer],
-            v_scales[layer],
-            k_zeros[layer],
-            v_zeros[layer],
-            slot_mapping,
-            block_tables,
-            seq_lens,
-            block_size,
-            scale,
-            int(kv_spec.hadamard_order),
-            bool(kv_spec.uses_bdr),
-            bool(kv_spec.rotate_v),
-            _paged_int4_tiled_layout(arena),
-        )
-    elif kv_spec.is_fp8:
-        out = cuda_ops().attention_decode_paged_fp8_e4m3(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            k_pages[layer],
-            v_pages[layer],
-            slot_mapping,
-            block_tables,
-            seq_lens,
-            block_size,
-            scale,
-            float(kv_spec.k_scale),
-            float(kv_spec.v_scale),
-        )
-    else:
-        out = cuda_ops().attention_decode_paged_fp16(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            k_pages[layer],
-            v_pages[layer],
-            slot_mapping,
-            block_tables,
-            seq_lens,
-            block_size,
-            scale,
-        )
+            elif backend == "flash":
+                if not hasattr(ops, "attention_paged_int4_flash"):
+                    raise RuntimeError("LANGBURST_PAGED_ATTENTION_BACKEND=flash requires attention_paged_int4_flash")
+                op = ops.attention_paged_int4_flash
+            else:  # pragma: no cover - paged_attention_backend validates this.
+                raise ValueError(f"unknown paged attention backend: {backend}")
+            out = op(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                k_pages[layer],
+                v_pages[layer],
+                k_scales[layer],
+                v_scales[layer],
+                k_zeros[layer],
+                v_zeros[layer],
+                slot_mapping,
+                block_tables,
+                seq_lens,
+                block_size,
+                scale,
+                int(kv_spec.hadamard_order),
+                bool(kv_spec.uses_bdr),
+                bool(kv_spec.rotate_v),
+                _paged_int4_tiled_layout(arena),
+            )
+        elif kv_spec.is_fp8:
+            out = cuda_ops().attention_decode_paged_fp8_e4m3(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                k_pages[layer],
+                v_pages[layer],
+                slot_mapping,
+                block_tables,
+                seq_lens,
+                block_size,
+                scale,
+                float(kv_spec.k_scale),
+                float(kv_spec.v_scale),
+            )
+        else:
+            out = cuda_ops().attention_decode_paged_fp16(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                k_pages[layer],
+                v_pages[layer],
+                slot_mapping,
+                block_tables,
+                seq_lens,
+                block_size,
+                scale,
+            )
     # Keep the canonical arena KV view in sync with the paged hot path.  Paged
     # attention is the serving fast path, but snapshots, forks, fallback paths,
     # and parity checks still read DecodeState.attn_k/v.  A stale canonical view
@@ -904,8 +913,8 @@ def append_paged_int4_spec_block(
         v_scales[layer],
         k_zeros[layer],
         v_zeros[layer],
-        slot_mapping.to(device=k.device, dtype=torch.long).contiguous(),
-        commit_tokens.to(device=k.device, dtype=torch.int32).contiguous(),
+        _device_contiguous(slot_mapping, device=k.device, dtype=torch.long),
+        _device_contiguous(commit_tokens, device=k.device, dtype=torch.int32),
         int(getattr(arena, "kv_block_size")),
         int(kv_spec.hadamard_order),
         bool(kv_spec.uses_bdr),
@@ -1337,10 +1346,11 @@ def depthwise_conv_update_spec_trajectory(
     x_in = x.to(device=state_arena.device, dtype=state_arena.dtype).contiguous()
     weight_in = weight.to(device=state_arena.device, dtype=state_arena.dtype).contiguous()
     bias_in = bias.to(device=state_arena.device, dtype=state_arena.dtype).contiguous() if bias is not None else empty_bias
+    state_idx = _device_contiguous(state_indices, device=state_arena.device, dtype=torch.long)
     if out is None or trajectory is None:
         out, trajectory = cuda_ops().depthwise_conv_update_spec_trajectory(
             state_arena,
-            state_indices.to(device=state_arena.device, dtype=torch.long).contiguous(),
+            state_idx,
             x_in,
             weight_in,
             bias_in,
@@ -1348,7 +1358,7 @@ def depthwise_conv_update_spec_trajectory(
     else:
         cuda_ops().depthwise_conv_update_spec_trajectory_out(
             state_arena,
-            state_indices.to(device=state_arena.device, dtype=torch.long).contiguous(),
+            state_idx,
             x_in,
             weight_in,
             bias_in,
@@ -1815,6 +1825,8 @@ class Qwen36GDNLayer:
             raise RuntimeError("speculative GDN batch requires arena-backed states")
         arena, state_indices = arena_ctx
         batch, tokens, hidden = x.shape
+        state_indices_long = _device_contiguous(state_indices, device=x.device, dtype=torch.long)
+        commit_tokens_i32 = _device_contiguous(commit_tokens, device=x.device, dtype=torch.int32)
         flat = x.reshape(batch * tokens, hidden).contiguous()
         residual = flat
         h = qwen_rmsnorm(residual, self.input_norm, self.cfg.rms_norm_eps)
@@ -1835,7 +1847,7 @@ class Qwen36GDNLayer:
             conv_out_raw, conv_traj = depthwise_conv_update_spec_trajectory(
                 arena,
                 self.layer,
-                state_indices,
+                state_indices_long,
                 conv_in,
                 self.conv_weight,
                 self.conv_bias,
@@ -1848,8 +1860,8 @@ class Qwen36GDNLayer:
             conv_out = depthwise_conv_update_spec(
                 arena,
                 self.layer,
-                state_indices,
-                commit_tokens,
+                state_indices_long,
+                commit_tokens_i32,
                 conv_in,
                 self.conv_weight,
                 self.conv_bias,
@@ -1871,6 +1883,8 @@ class Qwen36GDNLayer:
             fused_spec_out = getattr(ops, "gdn_recurrent_ab_spec_trajectory_norm_gate_out", None) if fused_spec_enabled else None
             fused_spec = getattr(ops, "gdn_recurrent_ab_spec_trajectory_norm_gate", None) if fused_spec_enabled else None
             z_spec = z.reshape(batch, tokens, self.cfg.linear_num_value_heads, self.cfg.linear_value_head_dim).contiguous()
+            z_spec_half = _device_contiguous(z_spec, device=x.device, dtype=torch.float16)
+            norm_w = _device_contiguous(self.gdn_norm_w, device=x.device, dtype=torch.float16)
             fused_shape_ok = int(self.gdn_norm_w.numel()) == int(self.cfg.linear_value_head_dim)
             if callable(fused_spec_out) and core is not None and gdn_traj is not None and fused_shape_ok:
                 fused_spec_out(
@@ -1882,9 +1896,9 @@ class Qwen36GDNLayer:
                     self.A_log,
                     self.dt_bias,
                     getattr(arena, "gdn_states")[self.layer],
-                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
-                    self.gdn_norm_w.to(device=x.device, dtype=torch.float16).contiguous(),
-                    z_spec.to(device=x.device, dtype=torch.float16).contiguous(),
+                    state_indices_long,
+                    norm_w,
+                    z_spec_half,
                     core,
                     gdn_traj,
                     self.cfg.rms_norm_eps,
@@ -1900,9 +1914,9 @@ class Qwen36GDNLayer:
                     self.A_log,
                     self.dt_bias,
                     getattr(arena, "gdn_states")[self.layer],
-                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
-                    self.gdn_norm_w.to(device=x.device, dtype=torch.float16).contiguous(),
-                    z_spec.to(device=x.device, dtype=torch.float16).contiguous(),
+                    state_indices_long,
+                    norm_w,
+                    z_spec_half,
                     self.cfg.rms_norm_eps,
                 )
                 core_norm_fused = core.reshape(batch * tokens, -1).contiguous()
@@ -1916,7 +1930,7 @@ class Qwen36GDNLayer:
                     self.A_log,
                     self.dt_bias,
                     getattr(arena, "gdn_states")[self.layer],
-                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                    state_indices_long,
                 )
             else:
                 ops.gdn_recurrent_ab_spec_trajectory_out(
@@ -1928,7 +1942,7 @@ class Qwen36GDNLayer:
                     self.A_log,
                     self.dt_bias,
                     getattr(arena, "gdn_states")[self.layer],
-                    state_indices.to(device=x.device, dtype=torch.long).contiguous(),
+                    state_indices_long,
                     core,
                     gdn_traj,
                 )
@@ -1943,8 +1957,8 @@ class Qwen36GDNLayer:
                 self.A_log,
                 self.dt_bias,
                 getattr(arena, "gdn_states")[self.layer],
-                state_indices.to(device=x.device, dtype=torch.long).contiguous(),
-                commit_tokens.to(device=x.device, dtype=torch.int32).contiguous(),
+                state_indices_long,
+                commit_tokens_i32,
             )
         core_norm = core_norm_fused if core_norm_fused is not None else gdn_norm_silu_gate_2d(
             core.reshape(batch * tokens, -1),
@@ -3271,9 +3285,10 @@ class Qwen36Model:
         commit_tokens: torch.Tensor,
     ) -> None:
         device = commit_tokens.device
-        state_idx = state_indices.to(device=device, dtype=torch.long).reshape(-1).contiguous()
-        row_index = torch.arange(int(commit_tokens.numel()), device=device, dtype=torch.long)
-        last_indices = torch.clamp(commit_tokens.to(device=device, dtype=torch.long) - 1, min=0)
+        state_idx = _device_contiguous(state_indices, device=device, dtype=torch.long).reshape(-1)
+        commit_i32 = _device_contiguous(commit_tokens, device=device, dtype=torch.int32)
+        commit_long = commit_i32.to(dtype=torch.long)
+        fallback_index: tuple[torch.Tensor, torch.Tensor] | None = None
         copy_selected = (
             getattr(cuda_ops(), "copy_selected_trajectory_out", None)
             if _spec_trajectory_copy_cuda_enabled()
@@ -3282,19 +3297,29 @@ class Qwen36Model:
         for layer, conv_traj in trajectory.get("conv", []):
             dest = getattr(arena, "gdn_conv_states")[layer]
             if callable(copy_selected) and conv_traj.device.type == "cuda":
-                copy_selected(conv_traj.contiguous(), dest, state_idx, commit_tokens.to(device=device, dtype=torch.int32).contiguous())
+                copy_selected(conv_traj.contiguous(), dest, state_idx, commit_i32)
             else:
+                if fallback_index is None:
+                    row_index = torch.arange(int(commit_i32.numel()), device=device, dtype=torch.long)
+                    last_indices = torch.clamp(commit_long - 1, min=0)
+                    fallback_index = (row_index, last_indices)
+                row_index, last_indices = fallback_index
                 selected = conv_traj[row_index, last_indices].contiguous()
                 dest.index_copy_(0, state_idx, selected)
         for layer, gdn_traj in trajectory.get("gdn", []):
             dest = getattr(arena, "gdn_states")[layer]
             if callable(copy_selected) and gdn_traj.device.type == "cuda":
-                copy_selected(gdn_traj.contiguous(), dest, state_idx, commit_tokens.to(device=device, dtype=torch.int32).contiguous())
+                copy_selected(gdn_traj.contiguous(), dest, state_idx, commit_i32)
             else:
+                if fallback_index is None:
+                    row_index = torch.arange(int(commit_i32.numel()), device=device, dtype=torch.long)
+                    last_indices = torch.clamp(commit_long - 1, min=0)
+                    fallback_index = (row_index, last_indices)
+                row_index, last_indices = fallback_index
                 selected = gdn_traj[row_index, last_indices].contiguous()
                 dest.index_copy_(0, state_idx, selected)
         for layer, k_btd, v_btd, slot_mapping in trajectory.get("attn", []):
-            append_paged_int4_spec_block(arena, layer, k_btd, v_btd, slot_mapping, commit_tokens)
+            append_paged_int4_spec_block(arena, layer, k_btd, v_btd, slot_mapping, commit_i32)
 
     def _forward_verify_batch_uniform_hot(
         self,

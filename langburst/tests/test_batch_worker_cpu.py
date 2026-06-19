@@ -265,6 +265,53 @@ def test_batch_generation_handle_stops_repeated_ngram_loop():
     assert handle.finish_reason == "repetition"
 
 
+def test_batch_generation_handle_stops_repeated_phrase_loop():
+    phrase = list(range(100, 114))
+    handle = BatchGenerationHandle(
+        request_id="repeat-phrase",
+        max_new_tokens=128,
+        generation_config=GenerationConfig(
+            repetition_stop_ngram_size=32,
+            repetition_stop_repeats=4,
+        ),
+    )
+
+    assert handle.push_tokens(phrase * 4) is True
+    assert handle.finish_reason == "repetition"
+    assert handle.finish_detail == "repetition_ngram"
+
+
+def test_batch_generation_handle_does_not_stop_non_repeated_long_tail():
+    handle = BatchGenerationHandle(
+        request_id="no-repeat-phrase",
+        max_new_tokens=128,
+        generation_config=GenerationConfig(
+            repetition_stop_ngram_size=32,
+            repetition_stop_repeats=4,
+        ),
+    )
+
+    assert handle.push_tokens(list(range(100, 156))) is False
+    assert handle.finish_reason == "stop"
+
+
+def test_batch_generation_handle_respects_min_repetition_ngram_size():
+    handle = BatchGenerationHandle(
+        request_id="repeat-min-ngram",
+        max_new_tokens=128,
+        generation_config=GenerationConfig(
+            repetition_stop_min_ngram_size=8,
+            repetition_stop_ngram_size=16,
+            repetition_stop_repeats=2,
+        ),
+    )
+
+    assert handle.push_tokens([1, 2, 1, 2, 1, 2, 1, 2]) is False
+    phrase = list(range(100, 108))
+    assert handle.push_tokens(phrase * 2) is True
+    assert handle.finish_reason == "repetition"
+
+
 def test_batch_generation_worker_does_not_admit_pending_when_active_capacity_is_full():
     runner = CapacityRunner()
     worker = BatchGenerationWorker(runner=runner, device="cpu", max_wait_s=0.001)

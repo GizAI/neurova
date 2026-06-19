@@ -34,7 +34,11 @@ class PrefillAttentionPolicy:
         return self.fresh_sdpa_tokens > 0 and int(tokens) <= self.fresh_sdpa_tokens
 
     def allows_extend_sdpa(self, *, live_tokens: int) -> bool:
-        return self.extend_sdpa_tokens > 0 and int(live_tokens) <= self.extend_sdpa_tokens
+        if self.extend_sdpa_tokens <= 0:
+            return False
+        if self.recent_tokens > 0:
+            return int(self.recent_tokens) <= self.extend_sdpa_tokens
+        return int(live_tokens) <= self.extend_sdpa_tokens
 
 
 def lowbit_rows_per_cta(value: int | str | None = None) -> int:

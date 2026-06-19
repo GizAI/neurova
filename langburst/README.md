@@ -150,21 +150,31 @@ Force the native GPU-resident path:
 
 ## OpenAI-Compatible Server
 
-Default native Qwen3.6/GDN server:
+Default native Qwen3.6/GDN server on `ml-dmc8`:
 
 ```bash
-LANGBURST_LOWBIT_ROWS_PER_CTA=8 \
-LANGBURST_CONTEXT_WINDOW=8192 \
-langburst-server \
-  --engine native \
-  --adapter qwen36 \
-  --runtime-profile stateful \
-  --hf-model /path/to/hf-model \
-  --qb-model /path/to/converted-runtime-model \
-  --host 0.0.0.0 \
-  --port 8008 \
-  --recent-window "$LANGBURST_CONTEXT_WINDOW"
+cd /home/user/workspace/neurova/langburst
+./scripts/start_langburst.sh
 ```
+
+`scripts/start_langburst.sh` reads one YAML serving profile and then exports the
+small compatibility environment required by older low-level modules. The
+default profile is:
+
+```text
+configs/ml-dmc8-q4.yaml
+```
+
+To run a different deployment profile, copy that YAML and point the launcher at
+it:
+
+```bash
+LANGBURST_CONFIG=/path/to/my-langburst.yaml ./scripts/start_langburst.sh
+```
+
+Keep operational values in YAML. Direct `LANGBURST_*` environment variables are
+kept as a compatibility/debug surface for internal kernels and should not be the
+primary way to configure serving.
 
 Optional vLLM-backed server:
 

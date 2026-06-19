@@ -215,6 +215,46 @@ def test_qwen_adapter_uses_chat_eos_not_pad_as_stop_token():
     assert Qwen36Adapter().eos_token_ids(tokenizer) == (248046,)
 
 
+def test_qwen_adapter_does_not_preserve_thinking_when_thinking_is_disabled_by_default():
+    class Tokenizer:
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(self, payload, **kwargs):
+            self.kwargs = kwargs
+            return [1, 2, 3]
+
+    tokenizer = Tokenizer()
+    Qwen36Adapter().encode_messages(
+        tokenizer,
+        [
+            {"role": "user", "content": "안녕?"},
+            {"role": "assistant", "content": "안녕하세요."},
+            {"role": "user", "content": "더 자세히"},
+        ],
+    )
+
+    assert tokenizer.kwargs["enable_thinking"] is False
+    assert tokenizer.kwargs["preserve_thinking"] is False
+
+
+def test_qwen_adapter_allows_explicit_preserve_thinking_override():
+    class Tokenizer:
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(self, payload, **kwargs):
+            self.kwargs = kwargs
+            return [1, 2, 3]
+
+    tokenizer = Tokenizer()
+    Qwen36Adapter().encode_messages(
+        tokenizer,
+        [{"role": "user", "content": "안녕?"}],
+        chat_template_kwargs={"preserve_thinking": False},
+    )
+
+    assert tokenizer.kwargs["preserve_thinking"] is False
 def test_qwen_verifier_cuda_graph_requires_explicit_opt_in(monkeypatch):
     monkeypatch.setenv("LANGBURST_CUDA_GRAPH", "1")
     monkeypatch.delenv("LANGBURST_VERIFY_CUDA_GRAPH", raising=False)

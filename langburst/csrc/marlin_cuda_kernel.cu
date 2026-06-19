@@ -683,6 +683,15 @@ __global__ void Marlin(
     __syncthreads();
 
     unsigned long long local_argmax = 0ULL;
+    constexpr int row_step = threads / (2 * thread_n_blocks);
+    constexpr int row_iters = ceildiv(16 * thread_m_blocks, row_step);
+    unsigned long long local_argmax_by_row[row_iters];
+    int local_argmax_row[row_iters];
+    #pragma unroll
+    for (int i = 0; i < row_iters; ++i) {
+      local_argmax_by_row[i] = 0ULL;
+      local_argmax_row[i] = -1;
+    }
     #pragma unroll
     for (int i = 0; i < ceildiv(16 * thread_m_blocks, threads / (2 * thread_n_blocks)); i++) {
       if (c_gl_wr < c_gl_wr_end) {
@@ -702,7 +711,8 @@ __global__ void Marlin(
               if (prob_m == 1) {
                 local_argmax = packed > local_argmax ? packed : local_argmax;
               } else {
-                marlin_argmax_update(argmax_state, row_idx, static_cast<unsigned int>(col), __half2float(vals[h]));
+                local_argmax_by_row[i] = packed > local_argmax_by_row[i] ? packed : local_argmax_by_row[i];
+                local_argmax_row[i] = row_idx;
               }
             }
           }
@@ -727,6 +737,14 @@ __global__ void Marlin(
           atomicMax(&argmax_state[0], red[0]);
         }
         __syncthreads();
+      }
+      if (prob_m > 1) {
+        #pragma unroll
+        for (int i = 0; i < row_iters; ++i) {
+          if (local_argmax_row[i] >= 0 && local_argmax_row[i] < prob_m) {
+            atomicMax(&argmax_state[local_argmax_row[i]], local_argmax_by_row[i]);
+          }
+        }
       }
     }
   };

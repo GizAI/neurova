@@ -19,6 +19,7 @@ dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.29",
   "pydantic>=2",
+  "PyYAML>=6.0",
   "rich>=13.7",
   "textual>=0.79",
 ]

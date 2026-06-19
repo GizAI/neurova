@@ -330,7 +330,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("cols"),
         py::arg("group_size"));
   m.def("lowbit_marlin_gemm_argmax_out", &lowbit_marlin_gemm_argmax_out,
-        "Marlin W4A16 GEMM followed by graph-capturable argmax into preallocated output",
+        "Marlin W4A16 GEMM with write-path argmax reduction into preallocated output",
         py::arg("qweight"),
         py::arg("scales"),
         py::arg("x"),
