@@ -387,6 +387,7 @@ class EngineManager:
                     device=engine.device,
                     max_wait_s=float(self.policy.batch_wait_ms) / 1000.0,
                     exclusive_prefill_tokens=self.policy.exclusive_prefill_tokens,
+                    reserve_free_vram_mib=self.policy.reserve_free_vram_mib,
                 )
                 self._batch_workers[key] = worker
             return worker

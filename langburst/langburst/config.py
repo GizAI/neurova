@@ -53,7 +53,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_state_pool_size": 3,
         "max_generation_tokens": 1024,
         "default_max_tokens": 256,
-        "default_min_new_tokens": 16,
+        "default_min_new_tokens": 0,
         "min_completion_budget": 0,
         "message_context_policy": "auto_long_user",
         "standalone_user_min_tokens": 1024,

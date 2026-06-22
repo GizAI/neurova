@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
+import torch
+
 from langburst.engines.native.batch_worker import BatchGenerationHandle, BatchGenerationWorker
 from langburst.engines.native.model_runner import BatchedModelRunner
 from langburst.engines.native.runtime import GenerationConfig, RuntimeEngine
@@ -332,6 +334,28 @@ def test_batch_generation_worker_does_not_admit_pending_when_active_capacity_is_
         assert second.wait_ids(timeout=2.0) == []
         assert runner.added == ["first", "second"]
         assert runner.finished == ["first", "second"]
+    finally:
+        worker.shutdown()
+
+
+def test_batch_generation_worker_defers_when_active_cuda_headroom_is_low(monkeypatch):
+    runner = MultiCapacityIdleRunner(capacity=2)
+    worker = BatchGenerationWorker(
+        runner=runner,
+        device="cuda",
+        max_wait_s=0.001,
+        reserve_free_vram_mib=256,
+    )
+    try:
+        worker._active["active"] = BatchGenerationHandle(request_id="active", max_new_tokens=8)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (300 * 1024 * 1024, 16 * 1024 * 1024 * 1024))
+
+        assert worker._has_vram_headroom_for_admit() is False
+
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (600 * 1024 * 1024, 16 * 1024 * 1024 * 1024))
+
+        assert worker._has_vram_headroom_for_admit() is True
     finally:
         worker.shutdown()
 

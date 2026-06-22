@@ -23,7 +23,7 @@ def test_ml_dmc8_q4_config_resolves_champion_serving_defaults():
     assert env["LANGBURST_DEFAULT_MAX_TOKENS"] == "256"
     assert env["LANGBURST_MTP_MAX_DRAFT"] == "4"
     assert env["LANGBURST_MTP_MAX_DRAFT_BY_ACTIVE"] == "2:1"
-    assert env["LANGBURST_DEFAULT_MIN_NEW_TOKENS"] == "16"
+    assert env["LANGBURST_DEFAULT_MIN_NEW_TOKENS"] == "0"
     assert env["LANGBURST_MIN_COMPLETION_TOKENS"] == "0"
     assert env["LANGBURST_MESSAGE_CONTEXT_POLICY"] == "auto_long_user"
     assert env["LANGBURST_STANDALONE_USER_MIN_TOKENS"] == "1024"

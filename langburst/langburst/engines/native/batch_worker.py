@@ -275,15 +275,19 @@ class BatchGenerationWorker:
         device: str,
         max_wait_s: float = 0.002,
         exclusive_prefill_tokens: int | None = None,
+        reserve_free_vram_mib: int = 0,
     ) -> None:
         if max_wait_s < 0:
             raise ValueError("max_wait_s must be >= 0")
         if exclusive_prefill_tokens is not None and exclusive_prefill_tokens < 1:
             raise ValueError("exclusive_prefill_tokens must be >= 1")
+        if reserve_free_vram_mib < 0:
+            raise ValueError("reserve_free_vram_mib must be >= 0")
         self.runner = runner
         self.device = device
         self.max_wait_s = float(max_wait_s)
         self.exclusive_prefill_tokens = int(exclusive_prefill_tokens) if exclusive_prefill_tokens is not None else None
+        self.reserve_free_vram_mib = int(reserve_free_vram_mib)
         self._pending: queue.Queue[tuple[BatchGenerationHandle, list[int]]] = queue.Queue()
         self._deferred: deque[tuple[BatchGenerationHandle, list[int]]] = deque()
         self._active: dict[str, BatchGenerationHandle] = {}
@@ -474,8 +478,26 @@ class BatchGenerationWorker:
         if self._is_exclusive_request(handle) and self._active:
             self._deferred.appendleft(item)
             return False
+        if not self._has_vram_headroom_for_admit():
+            self._deferred.appendleft(item)
+            return False
         self._admit(item)
         return True
+
+    def _has_vram_headroom_for_admit(self) -> bool:
+        if not self._active or self.reserve_free_vram_mib <= 0:
+            return True
+        try:
+            import torch
+
+            if not torch.cuda.is_available() or not str(self.device).startswith("cuda"):
+                return True
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(torch.device(self.device))
+        except Exception:
+            return True
+        prospective_active = len(self._active) + 1
+        required_bytes = int(self.reserve_free_vram_mib) * max(1, prospective_active) * 1024 * 1024
+        return int(free_bytes) >= required_bytes
 
     def _is_exclusive_request(self, handle: BatchGenerationHandle) -> bool:
         threshold = self.exclusive_prefill_tokens
