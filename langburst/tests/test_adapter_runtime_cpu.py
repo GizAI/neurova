@@ -9,6 +9,7 @@ import torch
 import langburst.adapters  # noqa: F401 - registers built-in adapters
 from langburst.core.adapter import AdapterDescriptor, adapter_registry
 from langburst.core.features import RuntimeCapabilities, RuntimeFeatures
+from langburst.core.messages import normalize_for_chat_template
 from langburst.engines.native.conformance import assert_minimal_adapter_conformance
 from langburst.engines.native.block_table import KVBlockTable
 from langburst.engines.native.model_runner import BatchedModelRunner
@@ -44,6 +45,36 @@ class ToyState:
                 state.pos = pos
 
         return Snapshot()
+
+
+def test_normalize_for_chat_template_preserves_tool_calls_as_qwen_arguments():
+    messages = [
+        {"role": "system", "content": "follow tools"},
+        {"role": "user", "content": "create file"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"cat tool_test.txt"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": "LangBurst tool call ok"},
+    ]
+
+    normalized = normalize_for_chat_template(messages)
+
+    assert normalized[2]["role"] == "assistant"
+    assert normalized[2]["tool_calls"] == [
+        {"name": "exec_command", "arguments": {"cmd": "cat tool_test.txt"}}
+    ]
+    assert normalized[3] == {"role": "tool", "content": "LangBurst tool call ok"}
 
 
 class ToyTokenizer:
@@ -255,6 +286,75 @@ def test_qwen_adapter_allows_explicit_preserve_thinking_override():
     )
 
     assert tokenizer.kwargs["preserve_thinking"] is False
+
+
+def test_qwen_adapter_normalizes_openai_developer_role_for_chat_template():
+    class Tokenizer:
+        def __init__(self):
+            self.payload = None
+
+        def apply_chat_template(self, payload, **_kwargs):
+            self.payload = payload
+            return [1, 2, 3]
+
+    tokenizer = Tokenizer()
+    Qwen36Adapter().encode_messages(
+        tokenizer,
+        [
+            {"role": "developer", "content": "developer instructions"},
+            {"role": "system", "content": "system instructions"},
+            {"role": "user", "content": "hello"},
+        ],
+    )
+
+    assert tokenizer.payload == [
+        {"role": "system", "content": "developer instructions\n\nsystem instructions"},
+        {"role": "user", "content": "hello"},
+    ]
+
+
+def test_qwen_adapter_passes_openai_function_tools_to_chat_template():
+    class Tokenizer:
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(self, payload, **kwargs):
+            self.kwargs = kwargs
+            return [1, 2, 3]
+
+    tokenizer = Tokenizer()
+    Qwen36Adapter().encode_messages(
+        tokenizer,
+        [{"role": "user", "content": "write a file"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                        "required": ["path", "content"],
+                    },
+                },
+            }
+        ],
+    )
+
+    assert tokenizer.kwargs["tools"] == [
+        {
+            "name": "write_file",
+            "description": "Write a file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["path", "content"],
+            },
+        }
+    ]
+
+
 def test_qwen_verifier_cuda_graph_requires_explicit_opt_in(monkeypatch):
     monkeypatch.setenv("LANGBURST_CUDA_GRAPH", "1")
     monkeypatch.delenv("LANGBURST_VERIFY_CUDA_GRAPH", raising=False)

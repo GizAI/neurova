@@ -1,0 +1,19 @@
+api-keys:
+  - sk-codex-local
+host: 127.0.0.1
+port: 8317
+
+openai-compatibility:
+  - name: neurova
+    base-url: ${LANGBURST_BASE_URL:-http://192.168.0.47:8008/v1}
+    api-key-entries:
+      - api-key: ${LANGBURST_OPENAI_COMPAT_API_KEY:-local-langburst}
+    models:
+      - alias: neurova/qwen
+        name: langburst-qwen3.6-27b-q4
+        thinking:
+          levels:
+            - low
+            - medium
+            - high
+            - xhigh

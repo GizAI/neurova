@@ -37,6 +37,10 @@ def test_chat_payload_keeps_history():
     assert "metadata" not in payload
     assert "max_tokens" not in payload
     assert payload["reasoning_effort"] == "none"
+    assert payload["chat_template_kwargs"] == {
+        "enable_thinking": False,
+        "preserve_thinking": False,
+    }
 
 
 def test_stateless_payload_keeps_history():
@@ -57,8 +61,11 @@ def test_stateless_payload_keeps_history():
         {"role": "user", "content": "next"},
     ]
     assert payload["top_p"] == 0.9
-    assert "enable_thinking" not in payload
     assert payload["reasoning_effort"] == "high"
+    assert payload["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "preserve_thinking": True,
+    }
 
 
 def test_thinking_command_updates_state():

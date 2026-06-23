@@ -30,6 +30,7 @@ from .core.features import RuntimeFeatures
 from .core.message_context import MessageContextPolicy, metadata_context_policy, select_messages_for_generation
 from .core.platform import PLATFORM_NAME
 from .core.text_stream import LeadingRoleEchoFilter, StopTextFilter, StreamingTextDecoder, ThinkingTextFilter, hide_thinking_text
+from .core.tool_calls import openai_tool_calls, parse_qwen_tool_calls
 from .core.usage import RequestUsage
 from .engines import ensure_engines_loaded, engine_registry
 from .engines.base import EngineBackend, EngineChatRequest, EngineSamplingParams
@@ -43,6 +44,9 @@ class StreamOptions(BaseModel):
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"] | str
     content: str | list[dict[str, Any]] | None = ""
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -104,6 +108,13 @@ class ChatCompletionRequest(BaseModel):
     episodic_memory: bool | None = None
     ttt_sidecar: bool | None = None
     prefill_chunk_size: int | None = None
+
+
+class UnsupportedRequestError(ValueError):
+    """Request asks for an OpenAI feature the selected engine cannot execute."""
+
+
+_TOOLS_UNSET = object()
 
 
 def _sse_payload(payload: dict[str, Any]) -> str:
@@ -196,16 +207,42 @@ def _request_messages(req: ChatCompletionRequest) -> list[dict[str, Any]]:
     for message in req.messages:
         content = message.content
         if message.role == "assistant":
+            tool_calls = message.tool_calls or []
             empty_text = content is None or (isinstance(content, str) and not content.strip())
             empty_parts = isinstance(content, list) and not any(
                 str(part.get("text", "")).strip()
                 for part in content
                 if isinstance(part, dict) and part.get("type") == "text"
             )
-            if empty_text or empty_parts:
+            if (empty_text or empty_parts) and not tool_calls:
                 continue
-        out.append({"role": message.role, "content": content})
+        row: dict[str, Any] = {"role": message.role, "content": content}
+        if message.tool_calls:
+            row["tool_calls"] = message.tool_calls
+        if message.tool_call_id:
+            row["tool_call_id"] = message.tool_call_id
+        if message.name:
+            row["name"] = message.name
+        out.append(row)
     return out
+
+
+def _has_tool_transcript(messages: list[dict[str, Any]]) -> bool:
+    for message in messages:
+        role = str(message.get("role", "")).lower()
+        if role == "tool":
+            return True
+        if role == "assistant" and message.get("tool_calls"):
+            return True
+    return False
+
+
+def _tools_for_generation(req: ChatCompletionRequest, messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    if not req.tools:
+        return None
+    if messages and str(messages[-1].get("role", "")).lower() == "tool":
+        return None
+    return req.tools
 
 
 def _message_context_policy() -> MessageContextPolicy:
@@ -214,16 +251,23 @@ def _message_context_policy() -> MessageContextPolicy:
 
 def _generation_messages(engine, req: ChatCompletionRequest) -> list[dict[str, Any]]:
     messages = _request_messages(req)
-    template_kwargs = _chat_template_kwargs(req)
+    metadata = dict(req.metadata or {})
+    if req.tools:
+        metadata.setdefault("langburst_agent_context", "plain_text")
 
     def encode(candidate: list[dict[str, Any]]) -> list[int]:
-        return engine.encode_messages(candidate, chat_template_kwargs=template_kwargs)
+        tools = _tools_for_generation(req, candidate)
+        return engine.encode_messages(
+            candidate,
+            chat_template_kwargs=_generation_chat_template_kwargs(req, tools=tools),
+            tools=tools,
+        )
 
     return select_messages_for_generation(
         messages,
         encoder=encode,
         policy=_message_context_policy(),
-        metadata=req.metadata,
+        metadata=metadata,
     )
 
 
@@ -231,22 +275,50 @@ def _chat_template_kwargs(req: ChatCompletionRequest) -> dict[str, Any]:
     return resolve_chat_template_kwargs(req)
 
 
-def _model_uses_visible_thinking(model_name: str | None) -> bool:
-    return "qwen" in str(model_name or "").lower()
+def _generation_chat_template_kwargs(
+    req: ChatCompletionRequest,
+    *,
+    tools: list[dict[str, Any]] | None | object = _TOOLS_UNSET,
+) -> dict[str, Any]:
+    return _chat_template_kwargs(req)
 
 
-def _thinking_visible_prefix(req: ChatCompletionRequest, model_name: str | None = None) -> str:
-    if _model_uses_visible_thinking(model_name or req.model) and _chat_template_kwargs(req)["enable_thinking"]:
-        return "<think>\n"
-    return ""
+def _encode_generation_messages(engine, messages: list[dict[str, Any]], req: ChatCompletionRequest) -> list[int]:
+    tools = _tools_for_generation(req, messages)
+    return engine.encode_messages(
+        messages,
+        chat_template_kwargs=_generation_chat_template_kwargs(req, tools=tools),
+        tools=tools,
+    )
 
 
-def _with_visible_prefix_once(text: str, prefix: str, *, emitted: bool) -> tuple[str, bool]:
-    if emitted or not prefix or not text:
-        return text, emitted
-    if text.startswith(prefix) or text.startswith("<think>"):
-        return text, True
-    return prefix + text, True
+def _assistant_message_from_text(
+    text: str,
+    *,
+    req: ChatCompletionRequest,
+    model_name: str,
+    extra_stop_strings: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], str]:
+    final_text = _final_response_text(
+        text,
+        req=req,
+        model_name=model_name,
+        extra_stop_strings=extra_stop_strings,
+    )
+    active_tools = _tools_for_generation(req, _request_messages(req))
+    if active_tools:
+        content, calls = parse_qwen_tool_calls(final_text, tools=active_tools)
+        if calls:
+            return (
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": openai_tool_calls(calls),
+                },
+                "tool_calls",
+            )
+    return {"role": "assistant", "content": final_text}, "stop"
+
 
 
 def _stop_strings(req: ChatCompletionRequest) -> list[str]:
@@ -402,12 +474,7 @@ def _final_response_text(
     if not _chat_template_kwargs(req)["enable_thinking"]:
         text = hide_thinking_text(text)
     text = StopTextFilter(tuple(_stop_strings(req)) + extra_stop_strings).push(text, final=True)
-    text = LeadingRoleEchoFilter().push(text, final=True)
-    return _with_visible_prefix_once(
-        text,
-        _thinking_visible_prefix(req, model_name),
-        emitted=False,
-    )[0]
+    return LeadingRoleEchoFilter().push(text, final=True)
 
 
 def create_app(manager: EngineManager):
@@ -445,11 +512,13 @@ def create_app(manager: EngineManager):
     @app.post("/v1/chat/completions")
     def chat_completions(request: Request, req: ChatCompletionRequest):
         try:
+            _validate_request_shape(req)
             engine = manager.get(req.model)
             features = _request_feature_overrides(req, engine.features)
             original_messages = _request_messages(req)
             messages = _generation_messages(engine, req)
-            prompt_ids = engine.encode_messages(messages, chat_template_kwargs=_chat_template_kwargs(req))
+            active_tools = _tools_for_generation(req, messages)
+            prompt_ids = _encode_generation_messages(engine, messages, req)
             generation_tokens = _requested_generation_tokens(req)
             manager.validate_generation_request(prompt_tokens=len(prompt_ids), generation_tokens=generation_tokens)
             admission_tokens = manager.effective_admission_tokens(
@@ -464,6 +533,8 @@ def create_app(manager: EngineManager):
             gen_cfg = _native_generation_config(engine, req)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except UnsupportedRequestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -483,12 +554,10 @@ def create_app(manager: EngineManager):
                 lease = manager.acquire_request(prompt_tokens=admission_tokens, engine=engine)
                 acquired = False
                 handle = None
-                visible_prefix = _thinking_visible_prefix(req, engine.model_name)
                 hide_thinking = not _chat_template_kwargs(req)["enable_thinking"]
                 thinking_filter = ThinkingTextFilter(enabled=hide_thinking)
                 stop_filter = StopTextFilter(tuple(_stop_strings(req)) + extra_stop_strings)
                 role_echo_filter = LeadingRoleEchoFilter()
-                visible_prefix_emitted = False
                 live_usage = _wants_live_usage(req)
                 last_live_usage_s = 0.0
                 try:
@@ -507,6 +576,7 @@ def create_app(manager: EngineManager):
                         request_id=request_id,
                     )
                     decoder = StreamingTextDecoder(engine.tokenizer, skip_special_tokens=True)
+                    streamed_ids: list[int] = []
                     yield _sse_payload(
                         {
                             "id": request_id,
@@ -525,6 +595,12 @@ def create_app(manager: EngineManager):
                             break
                         if token_id is None:
                             continue
+                        streamed_ids.append(int(token_id))
+                        if active_tools:
+                            usage.apply_metrics(handle.metrics())
+                            usage.requested_completion_tokens = generation_tokens
+                            usage.finish_reason = handle.finish_reason
+                            continue
                         text = decoder.push(token_id)
                         if text:
                             text = thinking_filter.push(text)
@@ -533,11 +609,6 @@ def create_app(manager: EngineManager):
                         if text:
                             text = role_echo_filter.push(text)
                         if text:
-                            text, visible_prefix_emitted = _with_visible_prefix_once(
-                                text,
-                                visible_prefix,
-                                emitted=visible_prefix_emitted,
-                            )
                             yield _sse_payload(
                                 {
                                     "id": request_id,
@@ -564,7 +635,7 @@ def create_app(manager: EngineManager):
                                         "choices": [],
                                     }
                                 )
-                    tail = decoder.flush()
+                    tail = "" if active_tools else decoder.flush()
                     tail = thinking_filter.push(tail, final=True)
                     tail = stop_filter.push(tail, final=True)
                     tail = role_echo_filter.push(tail, final=True)
@@ -578,11 +649,6 @@ def create_app(manager: EngineManager):
                         request_id=request_id,
                     )
                     if tail:
-                        tail, visible_prefix_emitted = _with_visible_prefix_once(
-                            tail,
-                            visible_prefix,
-                            emitted=visible_prefix_emitted,
-                        )
                         yield _sse_payload(
                             {
                                 "id": request_id,
@@ -592,13 +658,60 @@ def create_app(manager: EngineManager):
                                 "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}],
                             }
                         )
+                    finish_reason = handle.finish_reason
+                    if active_tools:
+                        decoded_text = engine.tokenizer.decode(streamed_ids, skip_special_tokens=True)
+                        assistant_message, parsed_finish_reason = _assistant_message_from_text(
+                            decoded_text,
+                            req=req,
+                            model_name=engine.model_name,
+                            extra_stop_strings=extra_stop_strings,
+                        )
+                        calls = assistant_message.get("tool_calls") or []
+                        if calls:
+                            finish_reason = parsed_finish_reason
+                            yield _sse_payload(
+                                {
+                                    "id": request_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": engine.model_name,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "tool_calls": [
+                                                    {"index": i, **call} for i, call in enumerate(calls)
+                                                ]
+                                            },
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
+                        elif assistant_message.get("content"):
+                            yield _sse_payload(
+                                {
+                                    "id": request_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": engine.model_name,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": assistant_message["content"]},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
                     done = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": engine.model_name,
                         **({"usage": _usage_payload(usage)} if req.stream_options and req.stream_options.include_usage else {}),
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": handle.finish_reason}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                     }
                     yield _sse_payload(done)
                     yield "data: [DONE]\n\n"
@@ -647,6 +760,15 @@ def create_app(manager: EngineManager):
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+        decoded_text = engine.tokenizer.decode(ids, skip_special_tokens=True)
+        assistant_message, parsed_finish_reason = _assistant_message_from_text(
+            decoded_text,
+            req=req,
+            model_name=engine.model_name,
+            extra_stop_strings=extra_stop_strings,
+        )
+        finish_reason = parsed_finish_reason if parsed_finish_reason == "tool_calls" else handle.finish_reason
+
         return JSONResponse(
             {
                 "id": request_id,
@@ -656,16 +778,8 @@ def create_app(manager: EngineManager):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": _final_response_text(
-                                engine.tokenizer.decode(ids, skip_special_tokens=True),
-                                req=req,
-                                model_name=engine.model_name,
-                                extra_stop_strings=extra_stop_strings,
-                            ),
-                        },
-                        "finish_reason": handle.finish_reason,
+                        "message": assistant_message,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": _usage_payload(usage),
@@ -677,11 +791,13 @@ def create_app(manager: EngineManager):
 
 def _validate_request_shape(req: ChatCompletionRequest) -> None:
     if req.n != 1:
-        raise ValueError("LangBurst currently supports n=1")
+        raise UnsupportedRequestError("LangBurst currently supports n=1")
     if req.logprobs or req.top_logprobs:
-        raise ValueError("logprobs are delegated only when the selected engine provider supports them")
-    if req.tools or req.tool_choice or req.parallel_tool_calls:
-        raise ValueError("tool calling is delegated only when the selected engine provider supports it")
+        raise UnsupportedRequestError("logprobs are delegated only when the selected engine provider supports them")
+    if isinstance(req.tool_choice, dict):
+        raise UnsupportedRequestError("forced tool_choice requires a tool-capable engine provider")
+    if isinstance(req.tool_choice, str) and req.tool_choice not in {"", "none", "auto"}:
+        raise UnsupportedRequestError("forced tool_choice requires a tool-capable engine provider")
 
 
 def _engine_sampling(req: ChatCompletionRequest) -> EngineSamplingParams:
@@ -749,33 +865,30 @@ def create_engine_app(backend: EngineBackend):
     def chat_completions(request: Request, req: ChatCompletionRequest):
         try:
             engine_req = _engine_chat_request(req)
+        except UnsupportedRequestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if req.stream:
             async def events():
-                visible_prefix = _thinking_visible_prefix(req, engine_req.model)
-                visible_prefix_emitted = False
                 try:
                     for chunk in backend.stream_chat(engine_req):
                         if await request.is_disconnected():
                             break
                         if chunk.text:
-                            if not visible_prefix and not visible_prefix_emitted:
-                                visible_prefix = _thinking_visible_prefix(req, chunk.model)
-                            text, visible_prefix_emitted = _with_visible_prefix_once(
-                                chunk.text,
-                                visible_prefix,
-                                emitted=visible_prefix_emitted,
-                            )
-                            yield _sse_payload(
-                                {
-                                    "id": engine_req.request_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": chunk.model,
-                                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
-                                }
-                            )
+                            text = chunk.text
+                            if not _chat_template_kwargs(req)["enable_thinking"]:
+                                text = hide_thinking_text(text)
+                            if text:
+                                yield _sse_payload(
+                                    {
+                                        "id": engine_req.request_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": chunk.model,
+                                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                                    }
+                                )
                         if chunk.finish_reason:
                             done = {
                                 "id": engine_req.request_id,
@@ -816,11 +929,11 @@ def create_engine_app(backend: EngineBackend):
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": _with_visible_prefix_once(
+                            "content": _final_response_text(
                                 result.text,
-                                _thinking_visible_prefix(req, result.model),
-                                emitted=False,
-                            )[0],
+                                req=req,
+                                model_name=result.model,
+                            ),
                         },
                         "finish_reason": result.finish_reason,
                     }

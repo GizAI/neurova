@@ -10,14 +10,16 @@ from langburst.core.features import RuntimeFeatures
 from langburst.engines.native.manager import load_model_specs
 from langburst.server import (
     ChatCompletionRequest,
+    _assistant_message_from_text,
     _final_response_text,
+    _generation_chat_template_kwargs,
+    _generation_messages,
     _long_document_stop_strings,
     _native_generation_config,
     _native_stop_token_sequences,
     _request_messages,
     _requested_generation_tokens,
-    _thinking_visible_prefix,
-    _with_visible_prefix_once,
+    _validate_request_shape,
 )
 
 
@@ -351,37 +353,18 @@ def test_native_generation_allows_think_tokens_when_explicitly_enabled(monkeypat
 
     monkeypatch.delenv("LANGBURST_SUPPRESS_THINK_TOKENS", raising=False)
 
-    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hello"}], max_tokens=128, reasoning_effort="low")
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=128,
+        reasoning_effort="low",
+        chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+    )
     cfg = _native_generation_config(Engine(), req)
 
     assert 248047 in cfg.suppress_tokens
     assert 248046 not in cfg.suppress_tokens
     assert 248068 not in cfg.suppress_tokens
     assert 248069 not in cfg.suppress_tokens
-
-
-def test_visible_thinking_prefix_defaults_off_and_can_be_enabled():
-    default_req = ChatCompletionRequest(
-        model="langburst-qwen3.6-27b-q3",
-        messages=[{"role": "user", "content": "hello"}],
-        max_tokens=16,
-    )
-    enabled_req = ChatCompletionRequest(
-        model="langburst-qwen3.6-27b-q3",
-        messages=[{"role": "user", "content": "hello"}],
-        max_tokens=16,
-        reasoning_effort="low",
-    )
-    non_qwen_req = ChatCompletionRequest(
-        model="llama-test",
-        messages=[{"role": "user", "content": "hello"}],
-        max_tokens=16,
-        reasoning_effort="low",
-    )
-
-    assert _thinking_visible_prefix(default_req) == ""
-    assert _thinking_visible_prefix(enabled_req) == "<think>\n"
-    assert _thinking_visible_prefix(non_qwen_req) == ""
 
 
 def test_chat_template_policy_has_single_non_thinking_default():
@@ -393,14 +376,39 @@ def test_chat_template_policy_has_single_non_thinking_default():
     assert resolve_chat_template_kwargs()["preserve_thinking"] is False
     req = Request()
     req.chat_template_kwargs = {"enable_thinking": True}
-    assert resolve_chat_template_kwargs(req)["enable_thinking"] is False
-    assert resolve_chat_template_kwargs(req)["preserve_thinking"] is False
+    assert resolve_chat_template_kwargs(req)["enable_thinking"] is True
+    assert resolve_chat_template_kwargs(req)["preserve_thinking"] is True
     req.reasoning_effort = "none"
     assert resolve_chat_template_kwargs(req)["enable_thinking"] is False
     assert resolve_chat_template_kwargs(req)["preserve_thinking"] is False
-    req.reasoning_effort = "low"
-    assert resolve_chat_template_kwargs(req)["enable_thinking"] is True
-    assert resolve_chat_template_kwargs(req)["preserve_thinking"] is True
+    effort_only_req = Request()
+    effort_only_req.reasoning_effort = "low"
+    assert resolve_chat_template_kwargs(effort_only_req)["enable_thinking"] is False
+    assert resolve_chat_template_kwargs(effort_only_req)["preserve_thinking"] is False
+
+
+def test_tools_do_not_force_visible_thinking_template():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    kwargs = _generation_chat_template_kwargs(req, tools=req.tools)
+
+    assert kwargs["enable_thinking"] is False
+    assert kwargs["preserve_thinking"] is False
 
 
 def test_request_messages_preserves_content_without_hidden_rewrite():
@@ -440,18 +448,573 @@ def test_request_messages_drops_empty_assistant_turns_only():
     ]
 
 
-def test_visible_thinking_prefix_is_prepended_once():
-    text, emitted = _with_visible_prefix_once("reasoning", "<think>\n", emitted=False)
-    assert text == "<think>\nreasoning"
-    assert emitted
+def test_native_request_shape_allows_advertised_tools_without_forced_choice():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "description": "noop",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
 
-    text, emitted = _with_visible_prefix_once(" more", "<think>\n", emitted=emitted)
-    assert text == " more"
-    assert emitted
+    _validate_request_shape(req)
 
-    text, emitted = _with_visible_prefix_once("<think>\nalready", "<think>\n", emitted=False)
-    assert text == "<think>\nalready"
-    assert emitted
+
+def test_native_request_shape_rejects_forced_tool_choice():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "description": "noop",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice={"type": "function", "function": {"name": "noop"}},
+    )
+
+    try:
+        _validate_request_shape(req)
+    except ValueError as exc:
+        assert "tool_choice" in str(exc)
+    else:
+        raise AssertionError("forced tool_choice must require a tool-capable engine")
+
+
+def test_request_messages_preserves_empty_assistant_tool_calls():
+    req = ChatCompletionRequest(
+        messages=[
+            {"role": "user", "content": "create file"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"echo ok > tool_test.txt"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": ""},
+            {"role": "user", "content": "what happened?"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    messages = _request_messages(req)
+
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert messages[2] == {"role": "tool", "content": "", "tool_call_id": "call_1"}
+
+
+def test_generation_messages_keeps_tool_transcript_instead_of_plain_text_shortcut():
+    class Engine:
+        def encode_messages(self, messages, **_kwargs):
+            return [0] * len(str(messages))
+
+    req = ChatCompletionRequest(
+        messages=[
+            {"role": "system", "content": "be concise"},
+            {"role": "user", "content": "create file"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"echo ok > tool_test.txt"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "user", "content": "report the result"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    selected = _generation_messages(Engine(), req)
+
+    assert [message["role"] for message in selected] == ["user", "assistant", "tool", "user"]
+    assert selected[1]["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert selected[2]["content"] == "ok"
+
+
+def test_qwen_tool_call_xml_becomes_openai_tool_calls():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        """I will call it.
+<tool_call>
+<function=write_file>
+<parameter=path>
+tool_test.txt
+</parameter>
+<parameter=content>
+LangBurst tool call ok
+</parameter>
+</function>
+</tool_call>""",
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["role"] == "assistant"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["type"] == "function"
+    assert message["tool_calls"][0]["function"]["name"] == "write_file"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "path": "tool_test.txt",
+        "content": "LangBurst tool call ok",
+    }
+
+
+def test_qwen_tool_call_parser_accepts_name_line_variant():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        """</think>
+
+<tool_call>
+write_file
+<parameter=path>
+tool_test.txt
+</parameter>
+<parameter=content>
+LangBurst tool call ok
+</parameter>
+</function>
+</tool_call>""",
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "write_file"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "path": "tool_test.txt",
+        "content": "LangBurst tool call ok",
+    }
+
+
+def test_qwen_tool_call_parser_accepts_schema_matched_json_block():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}, "workdir": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_stdin",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"session_id": {"type": "integer"}, "chars": {"type": "string"}},
+                        "required": ["session_id"],
+                    },
+                },
+            },
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        """I will invoke the tool.
+```json
+{"cmd":"echo \\"LangBurst tool call ok\\" > tool_test.txt"}
+```""",
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "cmd": 'echo "LangBurst tool call ok" > tool_test.txt',
+    }
+
+
+def test_qwen_tool_call_parser_accepts_exec_command_shell_block():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        """I'll use `exec_command`.
+```bash
+echo "LangBurst tool call ok" > tool_test.txt && cat tool_test.txt
+```""",
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "cmd": 'echo "LangBurst tool call ok" > tool_test.txt && cat tool_test.txt',
+    }
+
+
+def test_qwen_tool_call_parser_accepts_tagged_json_tool_call():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        '<exec_command>{"cmd": "echo \\"LangBurst tool call ok\\" > tool_test.txt"}',
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "cmd": 'echo "LangBurst tool call ok" > tool_test.txt',
+    }
+
+
+def test_qwen_tool_call_parser_accepts_invoke_xml_tool_call():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        '<invoke name="exec_command">\n'
+        '<parameter name="cmd">echo "LangBurst tool call ok" > tool_test.txt</parameter>\n'
+        "</invoke>",
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "cmd": 'echo "LangBurst tool call ok" > tool_test.txt',
+    }
+
+
+def test_qwen_tool_call_parser_accepts_tool_use_json_xml():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        '<tool_use>\n{"name": "exec_command", "arguments": {"cmd": "cat tool_test.txt"}}\n</tool_use>',
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"cmd": "cat tool_test.txt"}
+
+
+def test_qwen_tool_call_parser_accepts_embedded_json_tool_call():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        'Now call it. {"cmd": "echo \\"LangBurst tool call ok\\" > tool_test.txt", "name": "exec_command"}',
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "cmd": 'echo "LangBurst tool call ok" > tool_test.txt',
+    }
+
+
+def test_qwen_tool_call_parser_accepts_schema_matched_json_without_name():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_goal",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        '{"cmd": "echo \\"LangBurst tool call ok\\" > tool_test.txt"}',
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "cmd": 'echo "LangBurst tool call ok" > tool_test.txt',
+    }
+
+
+def test_tool_result_phase_does_not_reparse_tool_like_text_as_new_call():
+    req = ChatCompletionRequest(
+        messages=[
+            {"role": "user", "content": "create file"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "exec_command", "arguments": '{"cmd":"cat tool_test.txt"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "LangBurst tool call ok"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        '<exec_command>{"cmd":"cat tool_test.txt"}',
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "stop"
+    assert message == {"role": "assistant", "content": '<exec_command>{"cmd":"cat tool_test.txt"}'}
+
+
+def test_qwen_tool_call_parser_accepts_named_tool_input_pair():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        '<tool_uses>exec_command</tool_uses>\n'
+        '<tool_input>echo "LangBurst tool call ok" > tool_test.txt && cat tool_test.txt</tool_input>',
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "cmd": 'echo "LangBurst tool call ok" > tool_test.txt && cat tool_test.txt',
+    }
+
+
+def test_qwen_tool_call_parser_accepts_fenced_tool_name_block():
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "write"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+
+    message, finish_reason = _assistant_message_from_text(
+        '```exec_command\necho "LangBurst tool call ok" > tool_test.txt && cat tool_test.txt',
+        req=req,
+        model_name="langburst-qwen3.6-27b-q4",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "exec_command"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "cmd": 'echo "LangBurst tool call ok" > tool_test.txt && cat tool_test.txt',
+    }
 
 
 def test_hide_thinking_text_removes_reasoning_spans():

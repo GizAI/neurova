@@ -11,7 +11,9 @@ from ..core.adapter import AdapterDescriptor, adapter_registry
 from ..core.chat_template import resolve_chat_template_kwargs
 from ..core.features import RuntimeCapabilities, RuntimeFeatures
 from ..core.kv_cache import KVCacheLayout, KVCacheSpec
+from ..core.messages import normalize_for_chat_template
 from ..core.platform import resolve_index_file
+from ..core.tool_calls import normalize_tools_for_chat_template
 from ..loader import QuantizedStore
 from .qwen36_impl.model import Qwen36Model
 from .qwen36_mtp import native_mtp1_proposer_for_model
@@ -41,18 +43,6 @@ def choose_qwen_weight_device(qb_model: Path, requested: str, runtime_device: st
         if meta.get("kind") == "lowbit_symmetric_groupwise"
     }
     return runtime_device if bits and max(bits) <= 3 else "cpu"
-
-
-def _content_to_text(content: str | list[dict[str, Any]] | None) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    parts: list[str] = []
-    for item in content:
-        if item.get("type") == "text":
-            parts.append(str(item.get("text", "")))
-    return "\n".join(p for p in parts if p)
 
 
 class Qwen36Adapter:
@@ -196,18 +186,21 @@ class Qwen36Adapter:
         return self.encode_messages(tokenizer, messages)
 
     def encode_messages(self, tokenizer, messages: Sequence[dict[str, Any]], **kwargs: Any) -> list[int]:
-        payload = [{"role": m.get("role", "user"), "content": _content_to_text(m.get("content", ""))} for m in messages]
+        payload = normalize_for_chat_template(messages)
         if hasattr(tokenizer, "apply_chat_template"):
             chat_template_kwargs = resolve_chat_template_kwargs(
                 base=kwargs.get("chat_template_kwargs") or None
             )
+            tools = normalize_tools_for_chat_template(kwargs.get("tools"))
             try:
-                encoded = tokenizer.apply_chat_template(
-                    payload,
-                    tokenize=True,
-                    add_generation_prompt=True,
+                template_args: dict[str, Any] = {
+                    "tokenize": True,
+                    "add_generation_prompt": True,
                     **chat_template_kwargs,
-                )
+                }
+                if tools:
+                    template_args["tools"] = tools
+                encoded = tokenizer.apply_chat_template(payload, **template_args)
             except TypeError:
                 encoded = tokenizer.apply_chat_template(payload, tokenize=True, add_generation_prompt=True)
             if isinstance(encoded, dict):

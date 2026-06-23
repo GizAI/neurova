@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CODEX_BIN="${CODEX_BIN:-codex}"
+PROXY_BASE_URL="${CODEXPROXY_BASE_URL:-http://127.0.0.1:8317/v1}"
+PROXY_TOKEN="${CODEXPROXY_TOKEN:-sk-codex-local}"
+DEFAULT_MODEL="${CODEXPROXY_DEFAULT_MODEL:-neurova/qwen}"
+
+if [ "$#" -gt 0 ]; then
+  exec "$CODEX_BIN" --profile proxy "$@"
+fi
+
+models_json="$(curl -fsS -H "Authorization: Bearer ${PROXY_TOKEN}" "${PROXY_BASE_URL}/models")"
+mapfile -t models < <(
+  printf '%s' "$models_json" | python3 -c 'import json,sys
+data=json.load(sys.stdin).get("data", [])
+for item in data:
+    model_id=item.get("id")
+    owner=item.get("owned_by") or ""
+    if model_id:
+        print(f"{model_id}\t{owner}")'
+)
+
+if [ "${#models[@]}" -eq 0 ]; then
+  exec "$CODEX_BIN" --profile proxy
+fi
+
+echo "Select CLIProxyAPI model:"
+for i in "${!models[@]}"; do
+  model_id="${models[$i]%%$'\t'*}"
+  owner="${models[$i]#*$'\t'}"
+  printf "%2d. %-32s %s\n" "$((i + 1))" "$model_id" "$owner"
+done
+
+default_index=1
+for i in "${!models[@]}"; do
+  if [ "${models[$i]%%$'\t'*}" = "$DEFAULT_MODEL" ]; then
+    default_index=$((i + 1))
+    break
+  fi
+done
+
+printf "Model [%d]: " "$default_index"
+read -r selected
+selected="${selected:-$default_index}"
+
+if ! [[ "$selected" =~ ^[0-9]+$ ]] || [ "$selected" -lt 1 ] || [ "$selected" -gt "${#models[@]}" ]; then
+  echo "Invalid model selection: $selected" >&2
+  exit 2
+fi
+
+model="${models[$((selected - 1))]%%$'\t'*}"
+exec "$CODEX_BIN" --profile proxy -m "$model"

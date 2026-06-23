@@ -357,6 +357,11 @@ def _chat_payload(
         payload["top_p"] = top_p
     if reasoning_effort is not None:
         payload["reasoning_effort"] = reasoning_effort
+        thinking_enabled = reasoning_effort != "none"
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": thinking_enabled,
+            "preserve_thinking": thinking_enabled,
+        }
     return payload
 
 

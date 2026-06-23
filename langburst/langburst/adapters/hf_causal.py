@@ -11,7 +11,9 @@ import torch
 
 from ..core.adapter import AdapterDescriptor
 from ..core.features import RuntimeCapabilities, RuntimeFeatures
+from ..core.messages import normalize_for_chat_template
 from ..core.platform import env, env_flag
+from ..core.tool_calls import normalize_tools_for_chat_template
 
 
 def _clone_cache_obj(obj: Any) -> Any:
@@ -305,10 +307,14 @@ class HFAutoCausalAdapter:
         messages.append({"role": "user", "content": prompt})
         return self.encode_messages(tokenizer, messages)
 
-    def encode_messages(self, tokenizer: Any, messages: Sequence[dict[str, Any]], **_kwargs: Any) -> list[int]:
-        payload = [{"role": m.get("role", "user"), "content": str(m.get("content", ""))} for m in messages]
+    def encode_messages(self, tokenizer: Any, messages: Sequence[dict[str, Any]], **kwargs: Any) -> list[int]:
+        payload = normalize_for_chat_template(messages)
         if hasattr(tokenizer, "apply_chat_template"):
-            encoded = tokenizer.apply_chat_template(payload, tokenize=True, add_generation_prompt=True)
+            template_args: dict[str, Any] = {"tokenize": True, "add_generation_prompt": True}
+            tools = normalize_tools_for_chat_template(kwargs.get("tools"))
+            if tools:
+                template_args["tools"] = tools
+            encoded = tokenizer.apply_chat_template(payload, **template_args)
             if isinstance(encoded, torch.Tensor):
                 return [int(x) for x in encoded.reshape(-1).tolist()]
             if encoded and isinstance(encoded[0], (list, tuple)):

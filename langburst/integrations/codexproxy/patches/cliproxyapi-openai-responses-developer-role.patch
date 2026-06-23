@@ -1,0 +1,42 @@
+diff --git a/internal/translator/openai/openai/responses/openai_openai-responses_request.go b/internal/translator/openai/openai/responses/openai_openai-responses_request.go
+index 551bd785..470e0292 100644
+--- a/internal/translator/openai/openai/responses/openai_openai-responses_request.go
++++ b/internal/translator/openai/openai/responses/openai_openai-responses_request.go
+@@ -152,7 +152,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
+ 				// Handle regular message conversion
+ 				role := item.Get("role").String()
+ 				if role == "developer" {
+-					role = "user"
++					role = "system"
+ 				}
+ 				message := []byte(`{"role":"","content":[]}`)
+ 				message, _ = sjson.SetBytes(message, "role", role)
+diff --git a/internal/translator/openai/openai/responses/openai_openai-responses_request_test.go b/internal/translator/openai/openai/responses/openai_openai-responses_request_test.go
+index 9dd0e288..8f2025c7 100644
+--- a/internal/translator/openai/openai/responses/openai_openai-responses_request_test.go
++++ b/internal/translator/openai/openai/responses/openai_openai-responses_request_test.go
+@@ -122,3 +122,24 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DefersMessageUntil
+ 		t.Fatalf("messages.3.content = %q, want %q", got, "next")
+ 	}
+ }
++
++func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DeveloperBecomesSystem(t *testing.T) {
++	raw := []byte(`{
++		"input": [
++			{"type":"message","role":"developer","content":[{"type":"input_text","text":"system rules"}]},
++			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
++		]
++	}`)
++
++	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("openai-compatible", raw, false)
++
++	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "system" {
++		t.Fatalf("messages.0.role = %q, want system; output=%s", got, prettyJSONForTest(out))
++	}
++	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "system rules" {
++		t.Fatalf("messages.0.content.0.text = %q, want system rules; output=%s", got, prettyJSONForTest(out))
++	}
++	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
++		t.Fatalf("messages.1.role = %q, want user; output=%s", got, prettyJSONForTest(out))
++	}
++}

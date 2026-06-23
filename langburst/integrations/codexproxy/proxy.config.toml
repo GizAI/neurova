@@ -1,0 +1,9 @@
+model_provider = "cliproxyapi"
+model = "neurova/qwen"
+model_reasoning_effort = "medium"
+
+[model_providers.cliproxyapi]
+name = "CLIProxyAPI"
+base_url = "http://127.0.0.1:8317/v1"
+experimental_bearer_token = "sk-codex-local"
+wire_api = "responses"
