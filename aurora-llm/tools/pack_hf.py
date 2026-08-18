@@ -104,6 +104,7 @@ def main():
     eos_cfg=cfg.get('eos_token_id',[])
     if isinstance(eos_cfg,int): eos_cfg=[eos_cfg]
     eos_ids=[int(x) for x in eos_cfg[:2]]
+    eos_count=len(eos_ids)
     eos_ids += [0]*(2-len(eos_ids))
     max_seq=min(int(args.max_seq),int(cfg.get('max_position_embeddings',args.max_seq)))
     theta=float(cfg.get('rope_theta',10000.0))
@@ -118,6 +119,7 @@ def main():
         struct.pack_into('<f',hdr,44,eps)
         struct.pack_into('<I',hdr,48,hd)
         struct.pack_into('<II',hdr,52,*eos_ids)
+        struct.pack_into('<I',hdr,60,eos_count)
         f.write(hdr); align64(f)
         print('embedding')
         write_q8_from_name(f,src,emb,(vocab,dim))

@@ -40,7 +40,8 @@ The 64-byte ALI v1 header records the checkpoint's `rms_norm_eps` at byte
 offset 44 and attention `head_dim` at byte offset 48. Zero values preserve
 the original `1e-5` and `hidden_size / heads` defaults for legacy files;
 newly packed files preserve the checkpoint values. Offsets 52 and 56 hold up
-to two EOS token IDs; a zero value disables EOS stopping for legacy files.
+to two EOS token IDs, and offset 60 holds the EOS count. A zero count disables
+EOS stopping for legacy files.
 
 Each matrix is stored row-major. A row begins with a float32 scale followed by signed int8 values and is padded to 64 bytes:
 

@@ -137,6 +137,7 @@ g_rms_norm_eps:    .long 0
 .align 8
 g_eos1:            .quad 0
 g_eos2:            .quad 0
+g_eos_count:       .long 0
 g_embeddings:      .quad 0
 g_final_norm:      .quad 0
 g_output:          .quad 0
@@ -401,6 +402,8 @@ map_model:
     mov [rip+g_eos1], rax
     mov eax, dword ptr [rdi+56]
     mov [rip+g_eos2], rax
+    mov eax, dword ptr [rdi+60]
+    mov [rip+g_eos_count], rax
 
     mov rax, [rip+g_layers_n]
     cmp rax, MAX_LAYERS
@@ -1717,10 +1720,15 @@ generate_tokens:
     mov rcx,[rip+g_output_tokens]
     mov [rcx+r15*8],rbp
     inc r15
+    cmp qword ptr [rip+g_eos_count],0
+    je .gt_continue
     cmp rbp,[rip+g_eos1]
     je .gt_done
+    cmp qword ptr [rip+g_eos_count],1
+    je .gt_continue
     cmp rbp,[rip+g_eos2]
     je .gt_done
+.gt_continue:
     cmp r15,r14
     jae .gt_done
     mov rdi,rbp
