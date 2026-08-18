@@ -1,0 +1,79 @@
+{
+  "engine": "No-hardcoded-intent Qwen-BPE Exemplar Transducer",
+  "tokenizer": {
+    "normalizer": "NFC",
+    "pre_tokenizer_type": "Sequence",
+    "decoder": "ByteLevel",
+    "model_type": "BPE",
+    "vocab_size": 248044,
+    "merges": 247587,
+    "added_tokens": 26
+  },
+  "model": {
+    "pairs": 35,
+    "global_contexts": 7381,
+    "order": 6,
+    "beam": 8,
+    "branch": 16
+  },
+  "result": {
+    "prompt": "토크나이저 구조가 뭐야?",
+    "output": "토크나이저 구조는 normalizer, pre-tokenizer, BPE vocab, merge table, decoder로 이루어진다. 이 구조 덕분에 미등록 한국어도 byte-level 조각으로 표현할 수 있다.",
+    "neighbors": [
+      {
+        "index": 6,
+        "score": 0.639451,
+        "source": "토크나이저 구조를 알려줘",
+        "target": "토크나이저 구조는 normalizer, pre-tokenizer, BPE vocab, merge table, decoder로 이루어진다. 이 구조 덕분에 미등록 한국어도 byte-level 조각으로 표현할 수 있다."
+      },
+      {
+        "index": 5,
+        "score": 0.193195,
+        "source": "BPE와 ByteLevel이 뭐야?",
+        "target": "ByteLevel은 문자를 UTF-8 바이트 단위의 안전한 기호로 바꾸는 단계이고, BPE는 자주 붙어 나오는 기호 쌍을 합쳐 더 큰 토큰을 만드는 단계다."
+      },
+      {
+        "index": 0,
+        "score": 0.1292,
+        "source": "너는 누구야?",
+        "target": "나는 Qwen ByteLevel BPE 토크나이저 위에서 동작하는 CPU 전용 언어 프로토타입이다. 거대한 Transformer를 실행하지 않고, 학습 예시와 토큰 문맥을 이용해 답변을 생성한다."
+      },
+      {
+        "index": 8,
+        "score": 0.010528,
+        "source": "질의응답은 어떻게 가능해?",
+        "target": "질의응답은 질문과 비슷한 학습 요청을 검색하고, 그 요청들의 답변에서 다음 토큰 확률을 모아 새로운 답변을 생성하는 방식으로 가능하다."
+      },
+      {
+        "index": 7,
+        "score": 0.01042,
+        "source": "의미 기반 검색은 어떻게 해?",
+        "target": "의미 기반 검색은 입력을 Qwen 토큰과 문자 n-gram 특징으로 바꾼 뒤, 학습 예시와의 겹침을 IDF로 가중해 가장 가까운 요청을 찾는 방식으로 수행한다."
+      },
+      {
+        "index": 22,
+        "score": 0.009924,
+        "source": "CPU만으로 언어 모델을 만들 수 있어?",
+        "target": "가능하지만 범용 지능은 제한적이다. CPU에서는 거대한 행렬곱보다 검색, 압축식 문맥 예측, 예시 재조합, 희소 인덱스가 현실적인 접근이다."
+      },
+      {
+        "index": 24,
+        "score": 0.009556,
+        "source": "새로운 요청에 대응하는 법은?",
+        "target": "새로운 요청이 들어오면 먼저 학습 예시 중 표현이 가장 가까운 것들을 찾는다. 그다음 그 예시들의 답변이 공유하는 토큰 흐름을 따라가며 문장을 생성한다."
+      },
+      {
+        "index": 11,
+        "score": 0.009479,
+        "source": "휴리스틱 없이 일반화하는 방법은?",
+        "target": "일반화는 수작업 의도표가 아니라 많은 예시 사이의 유사도와 토큰 조건부 확률에서 나온다. 비슷한 요청들이 같은 답변 패턴을 공유하면 새 요청도 그 패턴을 따라간다."
+      }
+    ],
+    "exact_training_target_match": true,
+    "longest_training_target_substring_chars": 120,
+    "timings": {
+      "retrieve_seconds": 0.002773,
+      "decode_seconds": 0.186004
+    }
+  }
+}

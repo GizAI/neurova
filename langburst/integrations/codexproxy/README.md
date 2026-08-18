@@ -10,6 +10,8 @@ It intentionally stores only reproducible integration assets:
 - `proxy.config.toml`: Codex profile template for the Responses API wire.
 - `cli-proxy-api.config.yaml`: secret-free CLIProxyAPI config template for
   LangBurst.
+- `bench_openrouter_glm52.py`: short benchmark for OpenRouter provider
+  routing.
 - `patches/cliproxyapi-openai-responses-developer-role.patch`: required
   upstream patch for CLIProxyAPI.
 
@@ -55,8 +57,17 @@ Optional environment overrides:
 ```bash
 CLIPROXYAPI_SRC=/home/user/opensources/CLIProxyAPI \
 LANGBURST_BASE_URL=http://192.168.0.47:8008/v1 \
+OPENROUTER_ENV_FILE=/home/user/workspace/giz/giz.env \
 ./langburst/integrations/codexproxy/install.sh
 ```
+
+OpenRouter provider aliases are exposed as separate models:
+
+- `glm-5.2:together`
+- `glm-5.2:friendli`
+
+Each alias routes the same upstream `z-ai/glm-5.2` model with a pinned
+OpenRouter provider policy and `high` thinking level.
 
 ## Smoke tests
 
@@ -69,6 +80,8 @@ codexproxy -m neurova/qwen exec \
   "가계부앱 만들어줘. 첫 문장은 한국어로 해."
 
 sed -n '1,40p' /tmp/codex_qwen_last.txt
+
+python3 ./langburst/integrations/codexproxy/bench_openrouter_glm52.py
 ```
 
 Expected behavior: the answer starts with the budget-app task, not with Codex

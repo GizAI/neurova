@@ -2,11 +2,35 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CLIPROXYAPI_SRC="${CLIPROXYAPI_SRC:-/home/user/opensources/CLIProxyAPI}"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CLIPROXY_CONFIG_DIR="${CLIPROXY_CONFIG_DIR:-$HOME/.cli-proxy-api}"
 LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
 LANGBURST_BASE_URL="${LANGBURST_BASE_URL:-http://192.168.0.47:8008/v1}"
+OPENROUTER_ENV_FILE="${OPENROUTER_ENV_FILE:-$REPO_ROOT/../giz/giz.env}"
+if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$OPENROUTER_ENV_FILE" ]; then
+  OPENROUTER_API_KEY="$(
+    python3 - "$OPENROUTER_ENV_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+value = ""
+for line in path.read_text().splitlines():
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, raw = line.split("=", 1)
+    if key.strip() != "OPENROUTER_API_KEY":
+        continue
+    value = raw.strip().strip("'").strip('"')
+    break
+print(value)
+PY
+  )"
+  export OPENROUTER_API_KEY
+fi
 
 if [ ! -d "$CLIPROXYAPI_SRC/.git" ]; then
   echo "CLIProxyAPI source not found: $CLIPROXYAPI_SRC" >&2
@@ -38,6 +62,7 @@ if dst.exists():
 text = src.read_text()
 text = text.replace("${LANGBURST_BASE_URL:-http://192.168.0.47:8008/v1}", base_url)
 text = text.replace("${LANGBURST_OPENAI_COMPAT_API_KEY:-local-langburst}", os.environ.get("LANGBURST_OPENAI_COMPAT_API_KEY", "local-langburst"))
+text = text.replace("${OPENROUTER_API_KEY}", os.environ.get("OPENROUTER_API_KEY", ""))
 dst.write_text(text)
 PY
 

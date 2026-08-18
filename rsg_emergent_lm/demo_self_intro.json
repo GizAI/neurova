@@ -1,0 +1,79 @@
+{
+  "engine": "No-hardcoded-intent Qwen-BPE Exemplar Transducer",
+  "tokenizer": {
+    "normalizer": "NFC",
+    "pre_tokenizer_type": "Sequence",
+    "decoder": "ByteLevel",
+    "model_type": "BPE",
+    "vocab_size": 248044,
+    "merges": 247587,
+    "added_tokens": 26
+  },
+  "model": {
+    "pairs": 35,
+    "global_contexts": 7381,
+    "order": 6,
+    "beam": 8,
+    "branch": 16
+  },
+  "result": {
+    "prompt": "자기소개해라",
+    "output": "나는 하드코딩된 의도 분기 없이 Qwen 토큰, 문자 조각, 예시 기억, 가변 길이 문맥 모델을 결합해 답을 생성하는 CPU-only 프로토타입이다.",
+    "neighbors": [
+      {
+        "index": 2,
+        "score": 0.130803,
+        "source": "자기소개를 해줘",
+        "target": "나는 하드코딩된 의도 분기 없이 Qwen 토큰, 문자 조각, 예시 기억, 가변 길이 문맥 모델을 결합해 답을 생성하는 CPU-only 프로토타입이다."
+      },
+      {
+        "index": 1,
+        "score": 0.020796,
+        "source": "정체를 설명해줘",
+        "target": "나는 입력과 출력의 대응을 예시에서 배우고, 비슷한 요청이 들어오면 가까운 예시들의 출력 분포를 섞어 문장을 만드는 실험용 언어 엔진이다."
+      },
+      {
+        "index": 27,
+        "score": 0.020326,
+        "source": "오늘 계획 수립해줘",
+        "target": "오늘은 목표 설정, 집중 실행, 점검, 정리 순서로 움직인다. 오전 첫 블록은 가장 가치가 큰 일에 쓰고, 오후에는 소통과 보조 업무를 처리하며, 마지막에는 결과와 다음 단계를 기록한다."
+      },
+      {
+        "index": 20,
+        "score": 0.020252,
+        "source": "짧게 요약해줘",
+        "target": "핵심 주장 하나, 근거 두 가지, 다음 행동 하나로 압축해서 요약한다."
+      },
+      {
+        "index": 32,
+        "score": 0.017093,
+        "source": "오늘 루틴을 설계해줘",
+        "target": "시작 블록에서는 목표를 정한다. 첫 집중 블록에서는 가장 중요한 일을 처리한다. 중간 블록에서는 확인과 연락을 처리한다. 마무리 블록에서는 기록, 정리, 다음 행동 예약을 한다."
+      },
+      {
+        "index": 21,
+        "score": 0.016822,
+        "source": "기술 아이디어를 평가해줘",
+        "target": "아이디어는 문제의 크기, 구현 난이도, 기존 방식 대비 장점, 검증 가능한 실험 지표로 나누어 평가하는 것이 좋다."
+      },
+      {
+        "index": 34,
+        "score": 0.01621,
+        "source": "오늘 스케줄을 구성해줘",
+        "target": "09:00 목표 확인, 09:30 핵심 작업 시작, 11:30 중간 점검, 13:30 보조 업무 처리, 15:00 결과 정리, 15:30 다음 행동 예약 순서로 스케줄을 구성한다."
+      },
+      {
+        "index": 3,
+        "score": 0.014935,
+        "source": "너의 작동 원리를 말해줘",
+        "target": "나는 질문을 토큰과 문자 조각으로 표현한 뒤 가장 가까운 학습 예시를 찾고, 그 예시들의 답변 토큰 분포와 전체 말뭉치 언어모델을 합쳐 다음 토큰을 고른다."
+      }
+    ],
+    "exact_training_target_match": true,
+    "longest_training_target_substring_chars": 83,
+    "timings": {
+      "retrieve_seconds": 0.001634,
+      "decode_seconds": 0.173341
+    }
+  }
+}

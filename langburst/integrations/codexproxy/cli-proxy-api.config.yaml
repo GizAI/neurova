@@ -17,3 +17,34 @@ openai-compatibility:
             - medium
             - high
             - xhigh
+  - name: openrouter
+    base-url: https://openrouter.ai/api/v1
+    api-key-entries:
+      - api-key: ${OPENROUTER_API_KEY}
+    headers:
+      HTTP-Referer: https://www.giz.ai
+      X-Title: LangBurst
+    models:
+      - alias: glm-5.2:together
+        name: z-ai/glm-5.2
+        thinking:
+          levels:
+            - high
+      - alias: glm-5.2:friendli
+        name: z-ai/glm-5.2
+        thinking:
+          levels:
+            - high
+
+payload:
+  override-raw:
+    - models:
+        - name: "glm-5.2:together"
+          protocol: "openai"
+      params:
+        "provider": "{\"only\":[\"together\"]}"
+    - models:
+        - name: "glm-5.2:friendli"
+          protocol: "openai"
+      params:
+        "provider": "{\"only\":[\"friendli\"]}"
