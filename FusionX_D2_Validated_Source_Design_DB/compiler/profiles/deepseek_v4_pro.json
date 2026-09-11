@@ -1,0 +1,6 @@
+{
+  "model_id": "deepseek-ai/DeepSeek-V4-Pro",
+  "architecture": "large MoE decoder with MLA/sparse attention and speculative head",
+  "module_count": 6,
+  "graph": ["MLA_ATTENTION", "SPARSE_ATTENTION", "MOE_FFN", "MTP_HEAD"]
+}

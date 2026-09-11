@@ -1,0 +1,6 @@
+{
+  "model_id": "zai-org/GLM-5.2",
+  "architecture": "MoE decoder with indexed sparse attention and MTP",
+  "module_count": 3,
+  "graph": ["SPARSE_ATTENTION", "MOE_FFN", "MTP_HEAD"]
+}

@@ -1,0 +1,6 @@
+{
+  "model_id": "MiniMaxAI/MiniMax-H3",
+  "architecture": "video transformer plus visual/audio VAE",
+  "module_count": 1,
+  "graph": ["VISION_ENCODER", "VIDEO_TRANSFORMER", "VIDEO_VAE"]
+}

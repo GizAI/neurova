@@ -1,0 +1,64 @@
+./scripts/run_source_tests.sh
+== generate_abi ==
+== abi_consistency ==
+PASS ABI consistency registers=20
+== structural_tokens ==
+PASS structural tokens files=26 definitions=26
+NOTE: structural check is not HDL compile/elaboration
+== audit_contract ==
+PASS mxu_row_held_until_last_beat
+PASS mxu_canonical_q8_8_output
+PASS tensor_uses_m_n_k
+PASS packed_lowbit_operand_loader
+PASS fp4_six_finite
+PASS fp8_448_finite_nan_only_7f
+PASS scale_and_rne
+PASS stream_rmsnorm_connected
+PASS stream_softmax_connected
+PASS stream_rope_connected
+PASS stream_state_update_connected
+PASS stream_moe_topk_connected
+PASS stream_mtp_verify_connected
+PASS stream_sparse_gather_connected
+PASS stream_patchify3d_connected
+PASS stream_adaln_connected
+PASS no_fake_mla_conv3d_vae_native_opcode
+PASS scratchpad_in_compute_path
+PASS queue_abi_sq_head_cq_tail
+PASS cq_32byte_entry_64byte_alignment
+PASS cdc_async_fifo_connected
+PASS compiler_high_level_lowering
+PASS verify_fail_closed
+PASS audit contract 23/23
+== python_reference ==
+PASS test_fp4
+PASS test_fp8
+PASS test_packing
+PASS test_rne
+PASS test_gemm_64
+PASS test_edge_tiles
+PASS test_stream
+PASS test_abi
+PASS 8/8 FusionX D2 reference tests
+== compiler_unit ==
+PASS compiler lowering
+== compiler_profiles ==
+PASS deepseek-ai/DeepSeek-V4-Flash -> 25 primitives
+PASS deepseek-ai/DeepSeek-V4-Pro -> 25 primitives
+PASS zai-org/GLM-5.2 -> 18 primitives
+PASS MiniMaxAI/MiniMax-H3 -> 25 primitives
+PASS MiniMaxAI/MiniMax-M3 -> 18 primitives
+PASS Qwen/Qwen3.8-27B -> 30 primitives
+== c_runtime_build ==
+== c_runtime_exec ==
+PASS runtime ABI
+== cpp_numeric_build ==
+== cpp_numeric_exec ==
+PASS FusionX D2 C++ numeric
+FUSIONX_D2_SOURCE_TESTS_PASS
+./scripts/run_hdl_tests.sh
+BLOCKED_TOOL_MISSING=iverilog
+BLOCKED_TOOL_MISSING=vvp
+BLOCKED_TOOL_MISSING=verilator
+BLOCKED_TOOL_MISSING=yosys
+make: *** [Makefile:6: hdl] Error 2

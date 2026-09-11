@@ -1,0 +1,9 @@
+PASS test_fp4
+PASS test_fp8
+PASS test_packing
+PASS test_rne
+PASS test_gemm_64
+PASS test_edge_tiles
+PASS test_stream
+PASS test_abi
+PASS 8/8 FusionX D2 reference tests

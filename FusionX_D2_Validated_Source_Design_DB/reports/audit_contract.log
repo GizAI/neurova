@@ -1,0 +1,24 @@
+PASS mxu_row_held_until_last_beat
+PASS mxu_canonical_q8_8_output
+PASS tensor_uses_m_n_k
+PASS packed_lowbit_operand_loader
+PASS fp4_six_finite
+PASS fp8_448_finite_nan_only_7f
+PASS scale_and_rne
+PASS stream_rmsnorm_connected
+PASS stream_softmax_connected
+PASS stream_rope_connected
+PASS stream_state_update_connected
+PASS stream_moe_topk_connected
+PASS stream_mtp_verify_connected
+PASS stream_sparse_gather_connected
+PASS stream_patchify3d_connected
+PASS stream_adaln_connected
+PASS no_fake_mla_conv3d_vae_native_opcode
+PASS scratchpad_in_compute_path
+PASS queue_abi_sq_head_cq_tail
+PASS cq_32byte_entry_64byte_alignment
+PASS cdc_async_fifo_connected
+PASS compiler_high_level_lowering
+PASS verify_fail_closed
+PASS audit contract 23/23

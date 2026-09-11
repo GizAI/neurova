@@ -1,0 +1,9 @@
+{
+  "model_id": "Qwen/Qwen3.8-27B",
+  "architecture": "48 Gated DeltaNet + 16 gated full-attention layers with MTP",
+  "module_count": 1,
+  "graph": [
+    "GATED_DELTANET", "GATED_DELTANET", "GATED_DELTANET", "GATED_ATTENTION",
+    "DENSE_FFN", "MTP_HEAD"
+  ]
+}

@@ -21,3 +21,5 @@ papers/
 tokenizers/
 **/tokenizers/
 kor-racing-predictor/
+models/
+vendor/

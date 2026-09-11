@@ -1,0 +1,6 @@
+{
+  "model_id": "MiniMaxAI/MiniMax-M3",
+  "architecture": "MoE decoder with sparse attention and MTP",
+  "module_count": 2,
+  "graph": ["SPARSE_ATTENTION", "MOE_FFN", "MTP_HEAD"]
+}

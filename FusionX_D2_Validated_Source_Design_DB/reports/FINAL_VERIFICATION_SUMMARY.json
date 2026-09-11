@@ -1,0 +1,76 @@
+{
+  "release": "FusionX-D2-validated-source-db",
+  "classification": "integrated validated source/reference design database; not foundry manufacturing release",
+  "source_tests": {
+    "command": [
+      "bash",
+      "scripts/run_source_tests.sh"
+    ],
+    "returncode": 0,
+    "pass": true,
+    "stdout_tail": "== generate_abi ==\n== abi_consistency ==\nPASS ABI consistency registers=20\n== structural_tokens ==\nPASS structural tokens files=26 definitions=26\nNOTE: structural check is not HDL compile/elaboration\n== audit_contract ==\nPASS mxu_row_held_until_last_beat\nPASS mxu_canonical_q8_8_output\nPASS tensor_uses_m_n_k\nPASS packed_lowbit_operand_loader\nPASS fp4_six_finite\nPASS fp8_448_finite_nan_only_7f\nPASS scale_and_rne\nPASS stream_rmsnorm_connected\nPASS stream_softmax_connected\nPASS stream_rope_connected\nPASS stream_state_update_connected\nPASS stream_moe_topk_connected\nPASS stream_mtp_verify_connected\nPASS stream_sparse_gather_connected\nPASS stream_patchify3d_connected\nPASS stream_adaln_connected\nPASS no_fake_mla_conv3d_vae_native_opcode\nPASS scratchpad_in_compute_path\nPASS queue_abi_sq_head_cq_tail\nPASS cq_32byte_entry_64byte_alignment\nPASS cdc_async_fifo_connected\nPASS compiler_high_level_lowering\nPASS verify_fail_closed\nPASS audit contract 23/23\n== python_reference ==\nPASS test_fp4\nPASS test_fp8\nPASS test_packing\nPASS test_rne\nPASS test_gemm_64\nPASS test_edge_tiles\nPASS test_stream\nPASS test_abi\nPASS 8/8 FusionX D2 reference tests\n== compiler_unit ==\nPASS compiler lowering\n== compiler_profiles ==\nPASS deepseek-ai/DeepSeek-V4-Flash -> 25 primitives\nPASS deepseek-ai/DeepSeek-V4-Pro -> 25 primitives\nPASS zai-org/GLM-5.2 -> 18 primitives\nPASS MiniMaxAI/MiniMax-H3 -> 25 primitives\nPASS MiniMaxAI/MiniMax-M3 -> 18 primitives\nPASS Qwen/Qwen3.8-27B -> 30 primitives\n== c_runtime_build ==\n== c_runtime_exec ==\nPASS runtime ABI\n== firmware_syntax ==\n== cpp_numeric_build ==\n== cpp_numeric_exec ==\nPASS FusionX D2 C++ numeric\nFUSIONX_D2_SOURCE_TESTS_PASS\n"
+  },
+  "hdl_tests": {
+    "command": [
+      "bash",
+      "scripts/run_hdl_tests.sh"
+    ],
+    "returncode": 2,
+    "pass": false,
+    "stdout_tail": "BLOCKED_TOOL_MISSING=iverilog\nBLOCKED_TOOL_MISSING=vvp\nBLOCKED_TOOL_MISSING=verilator\nBLOCKED_TOOL_MISSING=yosys\n"
+  },
+  "hdl_gate_status": "BLOCKED_TOOL_MISSING",
+  "tool_paths": {
+    "iverilog": null,
+    "vvp": null,
+    "verilator": null,
+    "yosys": null,
+    "openroad": null,
+    "klayout": null
+  },
+  "metrics": {
+    "rtl_files": 27,
+    "module_definitions": 29,
+    "package_definitions": 2,
+    "rtl_lines": 1117
+  },
+  "audit_contract": {
+    "pass": true,
+    "checks": {
+      "mxu_row_held_until_last_beat": true,
+      "mxu_canonical_q8_8_output": true,
+      "tensor_uses_m_n_k": true,
+      "packed_lowbit_operand_loader": true,
+      "fp4_six_finite": true,
+      "fp8_448_finite_nan_only_7f": true,
+      "scale_and_rne": true,
+      "stream_rmsnorm_connected": true,
+      "stream_softmax_connected": true,
+      "stream_rope_connected": true,
+      "stream_state_update_connected": true,
+      "stream_moe_topk_connected": true,
+      "stream_mtp_verify_connected": true,
+      "stream_sparse_gather_connected": true,
+      "stream_patchify3d_connected": true,
+      "stream_adaln_connected": true,
+      "no_fake_mla_conv3d_vae_native_opcode": true,
+      "scratchpad_in_compute_path": true,
+      "queue_abi_sq_head_cq_tail": true,
+      "cq_32byte_entry_64byte_alignment": true,
+      "cdc_async_fifo_connected": true,
+      "compiler_high_level_lowering": true,
+      "verify_fail_closed": true
+    },
+    "failed": []
+  },
+  "foundry_release_allowed": false,
+  "foundry_blockers": [
+    "N3P PDK and sign-off decks",
+    "standard cell/I/O/SRAM compiler views",
+    "HBM4/PCIe6/CXL/UCIe3/PLL/SerDes hard IP",
+    "commercial verification and DFT closure",
+    "P&R/CTS/STA/EMIR/SI/DRC/LVS",
+    "package/board sign-off",
+    "GDS/OASIS and foundry acceptance"
+  ]
+}

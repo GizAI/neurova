@@ -1,0 +1,6 @@
+{
+  "model_id": "deepseek-ai/DeepSeek-V4-Flash",
+  "architecture": "MoE decoder with MLA/sparse attention and speculative head",
+  "module_count": 1,
+  "graph": ["MLA_ATTENTION", "SPARSE_ATTENTION", "MOE_FFN", "MTP_HEAD"]
+}

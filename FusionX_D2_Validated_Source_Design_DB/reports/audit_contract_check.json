@@ -1,0 +1,29 @@
+{
+  "pass": true,
+  "checks": {
+    "mxu_row_held_until_last_beat": true,
+    "mxu_canonical_q8_8_output": true,
+    "tensor_uses_m_n_k": true,
+    "packed_lowbit_operand_loader": true,
+    "fp4_six_finite": true,
+    "fp8_448_finite_nan_only_7f": true,
+    "scale_and_rne": true,
+    "stream_rmsnorm_connected": true,
+    "stream_softmax_connected": true,
+    "stream_rope_connected": true,
+    "stream_state_update_connected": true,
+    "stream_moe_topk_connected": true,
+    "stream_mtp_verify_connected": true,
+    "stream_sparse_gather_connected": true,
+    "stream_patchify3d_connected": true,
+    "stream_adaln_connected": true,
+    "no_fake_mla_conv3d_vae_native_opcode": true,
+    "scratchpad_in_compute_path": true,
+    "queue_abi_sq_head_cq_tail": true,
+    "cq_32byte_entry_64byte_alignment": true,
+    "cdc_async_fifo_connected": true,
+    "compiler_high_level_lowering": true,
+    "verify_fail_closed": true
+  },
+  "failed": []
+}

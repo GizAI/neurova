@@ -1,0 +1,6 @@
+PASS deepseek-ai/DeepSeek-V4-Flash -> 25 primitives
+PASS deepseek-ai/DeepSeek-V4-Pro -> 25 primitives
+PASS zai-org/GLM-5.2 -> 18 primitives
+PASS MiniMaxAI/MiniMax-H3 -> 25 primitives
+PASS MiniMaxAI/MiniMax-M3 -> 18 primitives
+PASS Qwen/Qwen3.8-27B -> 30 primitives

@@ -54,6 +54,7 @@
 .equ JOB_NWORK,            56
 .equ JOB_DONE,             64
 .equ JOB_STOP,             72
+.equ JOB_READY,            80
 .equ JOB_SIZE,            128
 
 /* Layer descriptor */
@@ -118,6 +119,7 @@ f_maxexp:    .float 80.0
 .align 64
 g_model_base:      .quad 0
 g_model_len:       .quad 0
+g_model_version:   .quad 0
 g_dim:             .quad 0
 g_hidden:          .quad 0
 g_layers_n:        .quad 0
@@ -163,7 +165,15 @@ g_vcache:           .quad 0
 
 g_workers:          .quad 0
 g_worker_id:        .quad 0
+g_allowed_workers:  .quad 0
+g_physical_workers: .quad 0
 g_port:             .quad 0
+.align 64
+g_cpu_order:        .skip 128
+g_smt_order:        .skip 128
+g_core_keys:        .skip 256
+g_use_avx512:       .long 0
+.align 8
 
 g_listen_fd:        .quad 0
 g_http_buf:         .quad 0
@@ -373,8 +383,13 @@ map_model:
     mov rdx, 0x3130494c41525541 /* "AURALI01" little endian */
     cmp rax, rdx
     jne .mm_magic_fail
-    cmp dword ptr [rdi+8], 1
+    mov eax, dword ptr [rdi+8]
+    cmp eax, 1
+    je .mm_version_ok
+    cmp eax, 2
     jne .mm_magic_fail
+.mm_version_ok:
+    mov [rip+g_model_version], rax
 
     mov eax, dword ptr [rdi+12]
     mov [rip+g_dim], rax
@@ -481,6 +496,24 @@ map_model:
     pop rbx
     ret
 
+q8_matrix_bytes:
+    /* rdi=output rows, rsi=input cols. v1=row-major; v2=8x16 interleaved. */
+    cmp qword ptr [rip+g_model_version], 2
+    jne .qmb_v1
+    mov rax, rsi
+    shl rax, 3                     /* 8 * input cols */
+    add rax, 64                    /* scale/header cache line per 8 rows */
+    mov rcx, rdi
+    shr rcx, 3                     /* output groups of 8 */
+    imul rax, rcx
+    ret
+.qmb_v1:
+    mov rax, rsi
+    add rax, 67                    /* align64(4 + input cols) */
+    and rax, -64
+    imul rax, rdi
+    ret
+
 parse_model_layout:
     /* compute pointers from the fixed ALI v1 layout. rax=0 ok */
     push rbx
@@ -514,26 +547,30 @@ parse_model_layout:
 
     /* wq */
     mov [r14+LD_WQ], r12
-    mov rax, [rip+g_q_dim]
-    imul rax, [rip+g_stride_dim]
+    mov rdi, [rip+g_q_dim]
+    mov rsi, [rip+g_dim]
+    call q8_matrix_bytes
     add r12, rax
 
     /* wk */
     mov [r14+LD_WK], r12
-    mov rax, [rip+g_kv_dim]
-    imul rax, [rip+g_stride_dim]
+    mov rdi, [rip+g_kv_dim]
+    mov rsi, [rip+g_dim]
+    call q8_matrix_bytes
     add r12, rax
 
     /* wv */
     mov [r14+LD_WV], r12
-    mov rax, [rip+g_kv_dim]
-    imul rax, [rip+g_stride_dim]
+    mov rdi, [rip+g_kv_dim]
+    mov rsi, [rip+g_dim]
+    call q8_matrix_bytes
     add r12, rax
 
     /* wo */
     mov [r14+LD_WO], r12
-    mov rax, [rip+g_dim]
-    imul rax, [rip+g_stride_q]
+    mov rdi, [rip+g_dim]
+    mov rsi, [rip+g_q_dim]
+    call q8_matrix_bytes
     add r12, rax
 
     /* ffn norm */
@@ -546,20 +583,23 @@ parse_model_layout:
 
     /* w1 gate */
     mov [r14+LD_W1], r12
-    mov rax, [rip+g_hidden]
-    imul rax, [rip+g_stride_dim]
+    mov rdi, [rip+g_hidden]
+    mov rsi, [rip+g_dim]
+    call q8_matrix_bytes
     add r12, rax
 
     /* w3 up */
     mov [r14+LD_W3], r12
-    mov rax, [rip+g_hidden]
-    imul rax, [rip+g_stride_dim]
+    mov rdi, [rip+g_hidden]
+    mov rsi, [rip+g_dim]
+    call q8_matrix_bytes
     add r12, rax
 
     /* w2 down */
     mov [r14+LD_W2], r12
-    mov rax, [rip+g_dim]
-    imul rax, [rip+g_stride_hidden]
+    mov rdi, [rip+g_dim]
+    mov rsi, [rip+g_hidden]
+    call q8_matrix_bytes
     add r12, rax
 
     add r14, LAYER_DESC_SIZE
@@ -575,8 +615,9 @@ parse_model_layout:
     and r12, -64
 
     mov [rip+g_output], r12
-    mov rax, [rip+g_vocab]
-    imul rax, [rip+g_stride_dim]
+    mov rdi, [rip+g_vocab]
+    mov rsi, [rip+g_dim]
+    call q8_matrix_bytes
     add r12, rax
 
     add r12, 63
@@ -773,7 +814,7 @@ spawn_workers:
     mov eax, SYS_fork
     syscall
     test rax, rax
-    js .sw_parent_done
+    js .sw_fork_failed
     jz .sw_child
     inc rbx
     jmp .sw_loop
@@ -785,105 +826,388 @@ spawn_workers:
     call worker_loop
     mov edi, 0
     jmp exit_now
+.sw_fork_failed:
+    /* rbx equals the number of workers that actually exist: IDs 0..rbx-1. */
+    mov [rip+g_workers], rbx
 .sw_parent_done:
+    /* Do not publish a first matvec until every child has captured JOB_SEQ. */
+    mov rdx, [rip+g_job]
+    mov rax, [rip+g_workers]
+    dec rax
+.sw_wait_ready:
+    cmp qword ptr [rdx+JOB_READY], rax
+    jae .sw_all_ready
+    pause
+    jmp .sw_wait_ready
+.sw_all_ready:
     xor edi, edi
     call pin_current_cpu
     pop rbx
     ret
 
-detect_workers:
-    /* return affinity CPU count in rax, capped to 128; fallback 1 */
-    sub rsp,32
-    pxor xmm0,xmm0
-    movdqu xmmword ptr [rsp],xmm0
-    mov eax,SYS_sched_getaffinity
-    xor edi,edi
-    mov esi,16
-    lea rdx,[rsp]
-    syscall
-    test rax,rax
-    js .dw_one
-    mov r8,[rsp]
-    mov r9,[rsp+8]
-    xor ecx,ecx
-.dw_l0:
-    test r8,r8
-    jz .dw_l1
-    lea rax,[r8-1]
-    and r8,rax
-    inc ecx
-    jmp .dw_l0
-.dw_l1:
-    test r9,r9
-    jz .dw_done
-    lea rax,[r9-1]
-    and r9,rax
-    inc ecx
-    jmp .dw_l1
-.dw_done:
-    mov eax,ecx
-    test rax,rax
-    jnz .dw_ret
-.dw_one:
-    mov eax,1
-.dw_ret:
-    add rsp,32
+detect_avx512:
+    /* Return 1 when AVX-512F/DQ and full ZMM OS state are available. */
+    push rbx
+    xor r8d, r8d
+    xor eax, eax
+    cpuid
+    cmp eax, 7
+    jb .dav_done
+    mov eax, 1
+    cpuid
+    mov eax, ecx
+    and eax, (1<<27) | (1<<28)      /* OSXSAVE + AVX */
+    cmp eax, (1<<27) | (1<<28)
+    jne .dav_done
+    xor ecx, ecx
+    xgetbv
+    and eax, 0xe6                   /* XMM,YMM,opmask,ZMM_hi256,hi16_ZMM */
+    cmp eax, 0xe6
+    jne .dav_done
+    mov eax, 7
+    xor ecx, ecx
+    cpuid
+    bt ebx, 16                      /* AVX512F */
+    jnc .dav_done
+    bt ebx, 17                      /* AVX512DQ (vextractf32x8) */
+    jnc .dav_done
+    mov r8d, 1
+.dav_done:
+    mov eax, r8d
+    pop rbx
     ret
 
-pin_current_cpu:
-    /* rdi logical worker id; pin to its ordinal online CPU */
-    sub rsp, 48
-    mov [rsp+32], rdi
+detect_workers:
+    /* Build a physical-core-first CPU order from the current affinity mask.
+       AMD 0x8000001e exposes core IDs directly. Generic x86 falls back to
+       affinity order. Return the preferred auto-worker count. */
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 32                     /* original mask + temporary one-CPU mask */
+    pxor xmm0, xmm0
+    movdqu xmmword ptr [rsp], xmm0
     mov eax, SYS_sched_getaffinity
     xor edi, edi
     mov esi, 16
     lea rdx, [rsp]
     syscall
     test rax, rax
-    js .pcc_done
-    mov r8, [rsp]
-    mov r9, [rsp+8]
-    mov r10, [rsp+32]
-    xor eax, eax
-.pcc_low_scan:
-    test r8, r8
-    jz .pcc_high_scan
-    test r10, r10
-    jz .pcc_low_found
-    lea rcx, [r8-1]
-    and r8, rcx
-    dec r10
-    jmp .pcc_low_scan
-.pcc_low_found:
-    bsf rcx, r8
+    js .dw_one
+    mov r12, [rsp]
+    mov r13, [rsp+8]
+
+    /* Prefer AMD's topology leaf when available. */
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x8000001e
+    jb .dw_flat_order
+
+    xor r14d, r14d                 /* unique physical cores */
+    xor r15d, r15d                 /* SMT duplicates */
+    xor ebp, ebp                    /* candidate CPU 0..127 */
+.dw_topo_scan:
+    cmp ebp, 128
+    jae .dw_topo_done
+    cmp ebp, 64
+    jae .dw_test_hi
+    bt r12, rbp
+    jnc .dw_topo_next
+    jmp .dw_candidate
+.dw_test_hi:
+    mov ecx, ebp
+    sub ecx, 64
+    bt r13, rcx
+    jnc .dw_topo_next
+
+.dw_candidate:
+    mov qword ptr [rsp+16], 0
+    mov qword ptr [rsp+24], 0
+    mov ecx, ebp
+    cmp ecx, 64
+    jb .dw_mask_low
+    sub ecx, 64
+    mov rax, 1
+    shl rax, cl
+    mov [rsp+24], rax
+    jmp .dw_pin_probe
+.dw_mask_low:
     mov rax, 1
     shl rax, cl
     mov [rsp+16], rax
-    mov qword ptr [rsp+24], 0
-    jmp .pcc_call
-.pcc_high_scan:
-    test r9, r9
-    jz .pcc_done
-    test r10, r10
-    jz .pcc_high_found
-    lea rcx, [r9-1]
-    and r9, rcx
-    dec r10
-    jmp .pcc_high_scan
-.pcc_high_found:
-    bsf rcx, r9
-    mov rax, 1
-    shl rax, cl
-    mov qword ptr [rsp+16], 0
-    mov [rsp+24], rax
-.pcc_call:
+.dw_pin_probe:
     mov eax, SYS_sched_setaffinity
     xor edi, edi
     mov esi, 16
     lea rdx, [rsp+16]
     syscall
+    test rax, rax
+    js .dw_topo_next
+
+    mov eax, 0x8000001e
+    xor ecx, ecx
+    cpuid
+    /* key = node_id:core_id; enough to distinguish package-local cores. */
+    and ebx, 0xff
+    and ecx, 0xff
+    shl ecx, 8
+    or ebx, ecx
+
+    xor ecx, ecx
+.dw_key_find:
+    cmp rcx, r14
+    jae .dw_new_core
+    lea rax, [rip+g_core_keys]
+    cmp bx, word ptr [rax+rcx*2]
+    je .dw_smt_cpu
+    inc ecx
+    jmp .dw_key_find
+.dw_new_core:
+    lea rax, [rip+g_core_keys]
+    mov word ptr [rax+r14*2], bx
+    lea rax, [rip+g_cpu_order]
+    mov byte ptr [rax+r14], bpl
+    inc r14
+    jmp .dw_topo_next
+.dw_smt_cpu:
+    lea rax, [rip+g_smt_order]
+    mov byte ptr [rax+r15], bpl
+    inc r15
+.dw_topo_next:
+    inc ebp
+    jmp .dw_topo_scan
+
+.dw_topo_done:
+    /* Append SMT siblings only after every unique core representative. */
+    xor ecx, ecx
+.dw_append_smt:
+    cmp rcx, r15
+    jae .dw_order_ready
+    lea rax, [rip+g_smt_order]
+    movzx edx, byte ptr [rax+rcx]
+    lea rax, [rip+g_cpu_order]
+    lea r8, [r14+rcx]
+    mov byte ptr [rax+r8], dl
+    inc rcx
+    jmp .dw_append_smt
+.dw_order_ready:
+    lea rax, [r14+r15]
+    mov [rip+g_allowed_workers], rax
+    mov [rip+g_physical_workers], r14
+    test r14, r14
+    jz .dw_use_total
+    mov rax, r14                    /* auto: one worker per physical core */
+    jmp .dw_restore
+.dw_use_total:
+    mov rax, [rip+g_allowed_workers]
+    jmp .dw_restore
+
+.dw_flat_order:
+    /* Generic fallback: preserve the kernel affinity-mask ordering. */
+    xor r14d, r14d
+    xor ebp, ebp
+.dw_flat_scan:
+    cmp ebp, 128
+    jae .dw_flat_done
+    cmp ebp, 64
+    jae .dw_flat_hi
+    bt r12, rbp
+    jnc .dw_flat_next
+    jmp .dw_flat_add
+.dw_flat_hi:
+    mov ecx, ebp
+    sub ecx, 64
+    bt r13, rcx
+    jnc .dw_flat_next
+.dw_flat_add:
+    lea rax, [rip+g_cpu_order]
+    mov byte ptr [rax+r14], bpl
+    inc r14
+.dw_flat_next:
+    inc ebp
+    jmp .dw_flat_scan
+.dw_flat_done:
+    mov [rip+g_allowed_workers], r14
+    mov [rip+g_physical_workers], r14
+    mov rax, r14
+
+.dw_restore:
+    push rax
+    mov eax, SYS_sched_setaffinity
+    xor edi, edi
+    mov esi, 16
+    lea rdx, [rsp+8]                /* original mask moved by push */
+    syscall
+    pop rax
+    test rax, rax
+    jnz .dw_ret
+.dw_one:
+    mov eax, 1
+    mov qword ptr [rip+g_allowed_workers], 1
+    mov qword ptr [rip+g_physical_workers], 1
+    mov byte ptr [rip+g_cpu_order], 0
+.dw_ret:
+    add rsp, 32
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+pin_current_cpu:
+    /* Pin logical worker ID using the physical-core-first order built above. */
+    cmp rdi, [rip+g_allowed_workers]
+    jae .pcc_done
+    sub rsp, 16
+    pxor xmm0, xmm0
+    movdqu xmmword ptr [rsp], xmm0
+    lea rax, [rip+g_cpu_order]
+    movzx ecx, byte ptr [rax+rdi]
+    cmp ecx, 64
+    jae .pcc_high
+    mov rax, 1
+    shl rax, cl
+    mov [rsp], rax
+    jmp .pcc_call
+.pcc_high:
+    sub ecx, 64
+    mov rax, 1
+    shl rax, cl
+    mov [rsp+8], rax
+.pcc_call:
+    mov eax, SYS_sched_setaffinity
+    xor edi, edi
+    mov esi, 16
+    mov rdx, rsp
+    syscall
+    add rsp, 16
 .pcc_done:
-    add rsp, 48
+    ret
+
+tail_rows_cost:
+    /* rdi=output rows, rsi=workers, rdx=row batch -> sum of scalar-tail rows
+       after the same floor-partitioning used by q8_worker_do. */
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                    /* output rows */
+    mov r13, rdx                    /* row batch */
+    xor r14d, r14d                  /* total tails */
+    xor r8d, r8d                    /* previous boundary */
+    mov r9, 1
+.trc_loop:
+    cmp r9, rsi
+    ja .trc_done
+    mov rax, r12
+    mul r9
+    div rsi                         /* boundary=floor(rows*i/workers) */
+    mov r10, rax
+    sub rax, r8                     /* shard length */
+    xor edx, edx
+    div r13
+    add r14, rdx                    /* shard_len % row_batch */
+    mov r8, r10
+    inc r9
+    jmp .trc_loop
+.trc_done:
+    mov rax, r14
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+projection_tail_score:
+    /* rdi=workers, rsi=row batch -> weighted scalar-tail rows per token.
+       Per transformer layer: 2*dim + 2*hidden + q_dim + 2*kv_dim; plus LM head. */
+    push rbx
+    push rbp
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, rsi
+    xor ebp, ebp
+
+    mov rdi, [rip+g_dim]
+    mov rsi, r12
+    mov rdx, r13
+    call tail_rows_cost
+    lea rbp, [rbp+rax*2]
+
+    mov rdi, [rip+g_hidden]
+    mov rsi, r12
+    mov rdx, r13
+    call tail_rows_cost
+    lea rbp, [rbp+rax*2]
+
+    mov rdi, [rip+g_q_dim]
+    mov rsi, r12
+    mov rdx, r13
+    call tail_rows_cost
+    add rbp, rax
+
+    mov rdi, [rip+g_kv_dim]
+    mov rsi, r12
+    mov rdx, r13
+    call tail_rows_cost
+    lea rbp, [rbp+rax*2]
+
+    imul rbp, [rip+g_layers_n]
+    mov rdi, [rip+g_vocab]
+    mov rsi, r12
+    mov rdx, r13
+    call tail_rows_cost
+    add rbp, rax
+    mov rax, rbp
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+tune_auto_workers:
+    /* ALI v2 removes row tails entirely. On the target Zen 5 memory system,
+       six physical workers are the measured bandwidth/synchronization sweet
+       spot; additional workers reduce decode throughput. */
+    cmp qword ptr [rip+g_model_version], 2
+    jne .taw_v1
+    cmp dword ptr [rip+g_use_avx512], 0
+    je .taw_ret
+    /* The measured six-worker cap is specific to small Zen 5 cpusets.  Do
+       not impose it on larger servers where memory channels/core count differ. */
+    cmp rax, 8
+    ja .taw_ret
+    cmp rax, 6
+    jbe .taw_ret
+    mov eax, 6
+    ret
+.taw_v1:
+    /* v1: compare weighted scalar-tail work at the 6/7-worker boundary. */
+    cmp rax, 7
+    jne .taw_ret
+    cmp dword ptr [rip+g_use_avx512], 0
+    je .taw_ret
+    push rbx
+    mov edi, 7
+    mov esi, 6
+    call projection_tail_score
+    mov rbx, rax                    /* score(7 workers, 6-row) */
+    mov edi, 6
+    mov esi, 8
+    call projection_tail_score
+    cmp rax, rbx
+    jae .taw_keep7
+    mov eax, 6
+    pop rbx
+    ret
+.taw_keep7:
+    mov eax, 7
+    pop rbx
+.taw_ret:
     ret
 
 worker_loop:
@@ -894,6 +1218,7 @@ worker_loop:
     mov r12, rdi
     mov r13, [rip+g_job]
     mov r14, [r13+JOB_SEQ]
+    lock inc qword ptr [r13+JOB_READY]
 .wl_spin:
     pause
     cmp qword ptr [r13+JOB_STOP], 0
@@ -926,7 +1251,7 @@ q8_matvec:
     mov rax, [rip+g_workers]
     mov [r12+JOB_NWORK], rax
     mov qword ptr [r12+JOB_DONE], 0
-    mfence
+    /* x86 TSO orders descriptor stores before publishing JOB_SEQ. */
     inc qword ptr [r12+JOB_SEQ]
 
     xor edi, edi
@@ -944,6 +1269,1597 @@ q8_matvec:
     ret
 
 q8_worker_do:
+    /* rdi=worker ID; ALI v2 uses an 8x16 interleaved Q8 stream. */
+    cmp qword ptr [rip+g_model_version], 2
+    je .qwd_v2
+    cmp dword ptr [rip+g_use_avx512], 0
+    jne q8_worker_do_avx512
+    jmp q8_worker_do_avx2
+.qwd_v2:
+    cmp dword ptr [rip+g_use_avx512], 0
+    jne q8_worker_do_v2_avx512
+    jmp q8_worker_do_v2_avx2
+
+q8_worker_do_v2_avx512:
+    /* ALI v2: one contiguous block contains 8 rows. 64 input features are
+       unrolled per iteration; every row keeps the same FP32 FMA order as v1. */
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rdi
+    mov rbx, [rip+g_job]
+    mov r10, [rbx+JOB_OUT]
+    shr r10, 3                     /* total 8-row groups */
+    mov rax, r10
+    mul r15
+    div qword ptr [rbx+JOB_NWORK]
+    mov r12, rax                    /* start group */
+    lea rax, [r15+1]
+    mul r10
+    div qword ptr [rbx+JOB_NWORK]
+    mov r13, rax                    /* end group */
+    cmp r12, r13
+    jae .qv2_done
+    mov r11, [rbx+JOB_IN]
+    mov r14, r11
+    shl r14, 3
+    add r14, 64                    /* packed bytes per 8-row group */
+    mov rax, r12
+    imul rax, r14
+    add rax, [rbx+JOB_W]
+    mov rbp, rax                    /* packed group ptr */
+    mov rax, r12
+    shl rax, 5
+    add rax, [rbx+JOB_Y]
+    mov r15, rax                    /* y ptr */
+    mov rdx, [rbx+JOB_X]
+.qv2_group:
+    vbroadcastss zmm16, dword ptr [rbp+0]
+    vbroadcastss zmm17, dword ptr [rbp+4]
+    vbroadcastss zmm18, dword ptr [rbp+8]
+    vbroadcastss zmm19, dword ptr [rbp+12]
+    vbroadcastss zmm20, dword ptr [rbp+16]
+    vbroadcastss zmm21, dword ptr [rbp+20]
+    vbroadcastss zmm22, dword ptr [rbp+24]
+    vbroadcastss zmm23, dword ptr [rbp+28]
+    vxorps zmm24, zmm24, zmm24
+    vxorps zmm25, zmm25, zmm25
+    vxorps zmm26, zmm26, zmm26
+    vxorps zmm27, zmm27, zmm27
+    vxorps zmm28, zmm28, zmm28
+    vxorps zmm29, zmm29, zmm29
+    vxorps zmm30, zmm30, zmm30
+    vxorps zmm31, zmm31, zmm31
+    xor ecx, ecx
+.qv2_k64:
+    lea rax, [rcx+64]
+    cmp rax, r11
+    ja .qv2_k16
+    vmovups zmm1, zmmword ptr [rdx+rcx*4+0]
+    vmovups zmm2, zmmword ptr [rdx+rcx*4+64]
+    vmovups zmm3, zmmword ptr [rdx+rcx*4+128]
+    vmovups zmm4, zmmword ptr [rdx+rcx*4+192]
+    lea r8, [rbp+rcx*8+64]
+    vpmovsxbd zmm0, xmmword ptr [r8+0]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+16]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+32]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+48]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+64]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+80]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+96]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+112]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+128]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+144]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+160]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+176]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+192]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+208]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+224]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+240]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+256]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+272]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+288]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+304]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+320]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+336]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+352]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+368]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+384]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r8+400]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r8+416]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r8+432]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r8+448]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r8+464]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r8+480]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r8+496]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm4
+    add rcx, 64
+    jmp .qv2_k64
+.qv2_k16:
+    lea rax, [rcx+16]
+    cmp rax, r11
+    ja .qv2_reduce
+    vmovups zmm1, zmmword ptr [rdx+rcx*4]
+    lea r8, [rbp+rcx*8+64]
+    vpmovsxbd zmm0, xmmword ptr [r8+0]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+16]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+32]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+48]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+64]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+80]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+96]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+112]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm1
+    add rcx, 16
+    jmp .qv2_k16
+.qv2_reduce:
+    vextractf32x8 ymm0, zmm24, 1
+    vaddps ymm0, ymm0, ymm24
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm24, xmm0
+    vextractf32x8 ymm0, zmm25, 1
+    vaddps ymm0, ymm0, ymm25
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm25, xmm0
+    vextractf32x8 ymm0, zmm26, 1
+    vaddps ymm0, ymm0, ymm26
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm26, xmm0
+    vextractf32x8 ymm0, zmm27, 1
+    vaddps ymm0, ymm0, ymm27
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm27, xmm0
+    vextractf32x8 ymm0, zmm28, 1
+    vaddps ymm0, ymm0, ymm28
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm28, xmm0
+    vextractf32x8 ymm0, zmm29, 1
+    vaddps ymm0, ymm0, ymm29
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm29, xmm0
+    vextractf32x8 ymm0, zmm30, 1
+    vaddps ymm0, ymm0, ymm30
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm30, xmm0
+    vextractf32x8 ymm0, zmm31, 1
+    vaddps ymm0, ymm0, ymm31
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm31, xmm0
+.qv2_store:
+    vmulss xmm24, xmm24, xmm16
+    vmovss dword ptr [r15+0], xmm24
+    vmulss xmm25, xmm25, xmm17
+    vmovss dword ptr [r15+4], xmm25
+    vmulss xmm26, xmm26, xmm18
+    vmovss dword ptr [r15+8], xmm26
+    vmulss xmm27, xmm27, xmm19
+    vmovss dword ptr [r15+12], xmm27
+    vmulss xmm28, xmm28, xmm20
+    vmovss dword ptr [r15+16], xmm28
+    vmulss xmm29, xmm29, xmm21
+    vmovss dword ptr [r15+20], xmm29
+    vmulss xmm30, xmm30, xmm22
+    vmovss dword ptr [r15+24], xmm30
+    vmulss xmm31, xmm31, xmm23
+    vmovss dword ptr [r15+28], xmm31
+    add rbp, r14
+    add r15, 32
+    inc r12
+    cmp r12, r13
+    jb .qv2_group
+.qv2_done:
+    vzeroupper
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+q8_worker_do_v2_avx2:
+    /* Portable v2 fallback: eight independent AVX2 accumulators. */
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rdi
+    mov rbx, [rip+g_job]
+    mov r10, [rbx+JOB_OUT]
+    shr r10, 3
+    mov rax, r10
+    mul r15
+    div qword ptr [rbx+JOB_NWORK]
+    mov r12, rax
+    lea rax, [r15+1]
+    mul r10
+    div qword ptr [rbx+JOB_NWORK]
+    mov r13, rax
+    cmp r12, r13
+    jae .qv2a_done
+    mov r11, [rbx+JOB_IN]
+    mov r14, r11
+    shl r14, 3
+    add r14, 64
+    mov rax, r12
+    imul rax, r14
+    add rax, [rbx+JOB_W]
+    mov rbp, rax
+    mov rax, r12
+    shl rax, 5
+    add rax, [rbx+JOB_Y]
+    mov r15, rax
+    mov rdx, [rbx+JOB_X]
+.qv2a_group:
+    vxorps ymm8, ymm8, ymm8
+    vxorps ymm9, ymm9, ymm9
+    vxorps ymm10, ymm10, ymm10
+    vxorps ymm11, ymm11, ymm11
+    vxorps ymm12, ymm12, ymm12
+    vxorps ymm13, ymm13, ymm13
+    vxorps ymm14, ymm14, ymm14
+    vxorps ymm15, ymm15, ymm15
+    xor ecx, ecx
+.qv2a_k16:
+    cmp rcx, r11
+    jae .qv2a_reduce
+    vmovups ymm1, ymmword ptr [rdx+rcx*4]
+    vmovups ymm2, ymmword ptr [rdx+rcx*4+32]
+    lea r8, [rbp+rcx*8+64]
+    vbroadcastss ymm3, dword ptr [rbp+0]
+    vpmovsxbd ymm0, qword ptr [r8+0]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm8, ymm0, ymm1
+    vpmovsxbd ymm0, qword ptr [r8+8]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm8, ymm0, ymm2
+    vbroadcastss ymm3, dword ptr [rbp+4]
+    vpmovsxbd ymm0, qword ptr [r8+16]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm9, ymm0, ymm1
+    vpmovsxbd ymm0, qword ptr [r8+24]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm9, ymm0, ymm2
+    vbroadcastss ymm3, dword ptr [rbp+8]
+    vpmovsxbd ymm0, qword ptr [r8+32]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm10, ymm0, ymm1
+    vpmovsxbd ymm0, qword ptr [r8+40]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm10, ymm0, ymm2
+    vbroadcastss ymm3, dword ptr [rbp+12]
+    vpmovsxbd ymm0, qword ptr [r8+48]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm11, ymm0, ymm1
+    vpmovsxbd ymm0, qword ptr [r8+56]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm11, ymm0, ymm2
+    vbroadcastss ymm3, dword ptr [rbp+16]
+    vpmovsxbd ymm0, qword ptr [r8+64]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm12, ymm0, ymm1
+    vpmovsxbd ymm0, qword ptr [r8+72]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm12, ymm0, ymm2
+    vbroadcastss ymm3, dword ptr [rbp+20]
+    vpmovsxbd ymm0, qword ptr [r8+80]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm13, ymm0, ymm1
+    vpmovsxbd ymm0, qword ptr [r8+88]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm13, ymm0, ymm2
+    vbroadcastss ymm3, dword ptr [rbp+24]
+    vpmovsxbd ymm0, qword ptr [r8+96]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm14, ymm0, ymm1
+    vpmovsxbd ymm0, qword ptr [r8+104]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm14, ymm0, ymm2
+    vbroadcastss ymm3, dword ptr [rbp+28]
+    vpmovsxbd ymm0, qword ptr [r8+112]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm15, ymm0, ymm1
+    vpmovsxbd ymm0, qword ptr [r8+120]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vfmadd231ps ymm15, ymm0, ymm2
+    add rcx, 16
+    jmp .qv2a_k16
+.qv2a_reduce:
+    vextractf128 xmm0, ymm8, 1
+    vaddps xmm0, xmm0, xmm8
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss dword ptr [r15+0], xmm0
+    vextractf128 xmm0, ymm9, 1
+    vaddps xmm0, xmm0, xmm9
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss dword ptr [r15+4], xmm0
+    vextractf128 xmm0, ymm10, 1
+    vaddps xmm0, xmm0, xmm10
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss dword ptr [r15+8], xmm0
+    vextractf128 xmm0, ymm11, 1
+    vaddps xmm0, xmm0, xmm11
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss dword ptr [r15+12], xmm0
+    vextractf128 xmm0, ymm12, 1
+    vaddps xmm0, xmm0, xmm12
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss dword ptr [r15+16], xmm0
+    vextractf128 xmm0, ymm13, 1
+    vaddps xmm0, xmm0, xmm13
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss dword ptr [r15+20], xmm0
+    vextractf128 xmm0, ymm14, 1
+    vaddps xmm0, xmm0, xmm14
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss dword ptr [r15+24], xmm0
+    vextractf128 xmm0, ymm15, 1
+    vaddps xmm0, xmm0, xmm15
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovss dword ptr [r15+28], xmm0
+    add rbp, r14
+    add r15, 32
+    inc r12
+    cmp r12, r13
+    jb .qv2a_group
+.qv2a_done:
+    vzeroupper
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+q8_worker_do_avx512:
+    cmp qword ptr [rip+g_workers], 1
+    je q8_worker_do_avx512_8row_compact
+    cmp qword ptr [rip+g_workers], 6
+    jbe q8_worker_do_avx512_8row_unroll4
+    cmp qword ptr [rip+g_workers], 7
+    je q8_worker_do_avx512_6row
+    jmp q8_worker_do_avx512_4row
+
+q8_worker_do_avx512_8row_compact:
+    /* Eight output rows in parallel. On the target AVX-512 CPU this halves
+       activation-load pressure versus the four-row kernel while preserving
+       each row's FP32 accumulation order exactly. */
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rdi
+    mov rbx, [rip+g_job]
+    mov rax, [rbx+JOB_OUT]
+    mul r15
+    div qword ptr [rbx+JOB_NWORK]
+    mov r12, rax                    /* start row */
+    lea rax, [r15+1]
+    mul qword ptr [rbx+JOB_OUT]
+    div qword ptr [rbx+JOB_NWORK]
+    mov r13, rax                    /* end row */
+    cmp r12, r13
+    jae .q8c_done
+
+    mov r14, [rbx+JOB_STRIDE]
+    mov rax, r12
+    imul rax, r14
+    add rax, [rbx+JOB_W]
+    mov rbp, rax                    /* row0 ptr */
+    mov rax, r12
+    shl rax, 2
+    add rax, [rbx+JOB_Y]
+    mov r15, rax                    /* y ptr */
+    mov rax, [rbx+JOB_Y]
+    lea r12, [rax+r13*4]            /* end y ptr */
+    mov rdx, [rbx+JOB_X]
+    mov r11, [rbx+JOB_IN]
+
+.q8c_rows8:
+    lea rax, [r15+32]
+    cmp rax, r12
+    ja .q8c_tail_rows
+
+    mov r8, rbp
+    add r8, r14                     /* row1 */
+    mov r9, r8
+    add r9, r14                     /* row2 */
+    mov r10, r9
+    add r10, r14                    /* row3 */
+    mov rsi, r10
+    add rsi, r14                    /* row4 */
+    mov rdi, rsi
+    add rdi, r14                    /* row5 */
+    mov rbx, rdi
+    add rbx, r14                    /* row6 */
+    mov r13, rbx
+    add r13, r14                    /* row7 */
+
+    vbroadcastss zmm16, dword ptr [rbp]
+    vbroadcastss zmm17, dword ptr [r8]
+    vbroadcastss zmm18, dword ptr [r9]
+    vbroadcastss zmm19, dword ptr [r10]
+    vbroadcastss zmm20, dword ptr [rsi]
+    vbroadcastss zmm21, dword ptr [rdi]
+    vbroadcastss zmm22, dword ptr [rbx]
+    vbroadcastss zmm23, dword ptr [r13]
+    vxorps zmm24, zmm24, zmm24
+    vxorps zmm25, zmm25, zmm25
+    vxorps zmm26, zmm26, zmm26
+    vxorps zmm27, zmm27, zmm27
+    vxorps zmm28, zmm28, zmm28
+    vxorps zmm29, zmm29, zmm29
+    vxorps zmm30, zmm30, zmm30
+    vxorps zmm31, zmm31, zmm31
+    xor ecx, ecx
+
+.q8c_k16:
+    lea rax, [rcx+16]
+    cmp rax, r11
+    ja .q8c_reduce8
+    vmovups zmm1, zmmword ptr [rdx+rcx*4]
+
+    vpmovsxbd zmm0, xmmword ptr [rbp+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [r8+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [r9+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [r10+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [rsi+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [rdi+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [rbx+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [r13+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm1
+
+    add rcx, 16
+    jmp .q8c_k16
+
+.q8c_reduce8:
+    vextractf32x8 ymm0, zmm24, 1
+    vaddps ymm0, ymm0, ymm24
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm24, xmm0
+
+    vextractf32x8 ymm0, zmm25, 1
+    vaddps ymm0, ymm0, ymm25
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm25, xmm0
+
+    vextractf32x8 ymm0, zmm26, 1
+    vaddps ymm0, ymm0, ymm26
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm26, xmm0
+
+    vextractf32x8 ymm0, zmm27, 1
+    vaddps ymm0, ymm0, ymm27
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm27, xmm0
+
+    vextractf32x8 ymm0, zmm28, 1
+    vaddps ymm0, ymm0, ymm28
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm28, xmm0
+
+    vextractf32x8 ymm0, zmm29, 1
+    vaddps ymm0, ymm0, ymm29
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm29, xmm0
+
+    vextractf32x8 ymm0, zmm30, 1
+    vaddps ymm0, ymm0, ymm30
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm30, xmm0
+
+    vextractf32x8 ymm0, zmm31, 1
+    vaddps ymm0, ymm0, ymm31
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm31, xmm0
+
+.q8c_scalar8:
+    cmp rcx, r11
+    jae .q8c_store8
+    vmovss xmm1, dword ptr [rdx+rcx*4]
+
+    movsx eax, byte ptr [rbp+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm24, xmm0, xmm1
+    movsx eax, byte ptr [r8+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm25, xmm0, xmm1
+    movsx eax, byte ptr [r9+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm26, xmm0, xmm1
+    movsx eax, byte ptr [r10+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm27, xmm0, xmm1
+    movsx eax, byte ptr [rsi+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm28, xmm0, xmm1
+    movsx eax, byte ptr [rdi+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm29, xmm0, xmm1
+    movsx eax, byte ptr [rbx+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm30, xmm0, xmm1
+    movsx eax, byte ptr [r13+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm31, xmm0, xmm1
+    inc rcx
+    jmp .q8c_scalar8
+
+.q8c_store8:
+    vmulss xmm24, xmm24, xmm16
+    vmulss xmm25, xmm25, xmm17
+    vmulss xmm26, xmm26, xmm18
+    vmulss xmm27, xmm27, xmm19
+    vmulss xmm28, xmm28, xmm20
+    vmulss xmm29, xmm29, xmm21
+    vmulss xmm30, xmm30, xmm22
+    vmulss xmm31, xmm31, xmm23
+    vmovss dword ptr [r15], xmm24
+    vmovss dword ptr [r15+4], xmm25
+    vmovss dword ptr [r15+8], xmm26
+    vmovss dword ptr [r15+12], xmm27
+    vmovss dword ptr [r15+16], xmm28
+    vmovss dword ptr [r15+20], xmm29
+    vmovss dword ptr [r15+24], xmm30
+    vmovss dword ptr [r15+28], xmm31
+    lea rbp, [r13+r14]
+    add r15, 32
+    cmp r15, r12
+    jb .q8c_rows8
+    jmp .q8c_done
+
+.q8c_tail_rows:
+    /* Generic remainder path, at most seven rows. */
+.q8c_tail_row:
+    cmp r15, r12
+    jae .q8c_done
+    vxorps ymm2, ymm2, ymm2
+    vbroadcastss ymm3, dword ptr [rbp]
+    xor ecx, ecx
+.q8c_tk8:
+    lea rax, [rcx+8]
+    cmp rax, r11
+    ja .q8c_treduce
+    vpmovsxbd ymm0, qword ptr [rbp+rcx+4]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vmovups ymm1, ymmword ptr [rdx+rcx*4]
+    vfmadd231ps ymm2, ymm0, ymm1
+    add rcx, 8
+    jmp .q8c_tk8
+.q8c_treduce:
+    vextractf128 xmm0, ymm2, 1
+    vaddps xmm0, xmm0, xmm2
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm4, xmm0
+.q8c_tscalar:
+    cmp rcx, r11
+    jae .q8c_tstore
+    movsx eax, byte ptr [rbp+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm3
+    vmulss xmm0, xmm0, dword ptr [rdx+rcx*4]
+    vaddss xmm4, xmm4, xmm0
+    inc rcx
+    jmp .q8c_tscalar
+.q8c_tstore:
+    vmovss dword ptr [r15], xmm4
+    add rbp, r14
+    add r15, 4
+    jmp .q8c_tail_row
+
+.q8c_done:
+    vzeroupper
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+q8_worker_do_avx512_8row_unroll4:
+    /* Eight output rows in parallel. On the target AVX-512 CPU this halves
+       activation-load pressure versus the four-row kernel while preserving
+       each row's FP32 accumulation order exactly. */
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rdi
+    mov rbx, [rip+g_job]
+    mov rax, [rbx+JOB_OUT]
+    mul r15
+    div qword ptr [rbx+JOB_NWORK]
+    mov r12, rax                    /* start row */
+    lea rax, [r15+1]
+    mul qword ptr [rbx+JOB_OUT]
+    div qword ptr [rbx+JOB_NWORK]
+    mov r13, rax                    /* end row */
+    cmp r12, r13
+    jae .q8_done
+
+    mov r14, [rbx+JOB_STRIDE]
+    mov rax, r12
+    imul rax, r14
+    add rax, [rbx+JOB_W]
+    mov rbp, rax                    /* row0 ptr */
+    mov rax, r12
+    shl rax, 2
+    add rax, [rbx+JOB_Y]
+    mov r15, rax                    /* y ptr */
+    mov rax, [rbx+JOB_Y]
+    lea r12, [rax+r13*4]            /* end y ptr */
+    mov rdx, [rbx+JOB_X]
+    mov r11, [rbx+JOB_IN]
+
+.q8_rows8:
+    lea rax, [r15+32]
+    cmp rax, r12
+    ja .q8_tail_rows
+
+    mov r8, rbp
+    add r8, r14                     /* row1 */
+    mov r9, r8
+    add r9, r14                     /* row2 */
+    mov r10, r9
+    add r10, r14                    /* row3 */
+    mov rsi, r10
+    add rsi, r14                    /* row4 */
+    mov rdi, rsi
+    add rdi, r14                    /* row5 */
+    mov rbx, rdi
+    add rbx, r14                    /* row6 */
+    mov r13, rbx
+    add r13, r14                    /* row7 */
+
+    vbroadcastss zmm16, dword ptr [rbp]
+    vbroadcastss zmm17, dword ptr [r8]
+    vbroadcastss zmm18, dword ptr [r9]
+    vbroadcastss zmm19, dword ptr [r10]
+    vbroadcastss zmm20, dword ptr [rsi]
+    vbroadcastss zmm21, dword ptr [rdi]
+    vbroadcastss zmm22, dword ptr [rbx]
+    vbroadcastss zmm23, dword ptr [r13]
+    vxorps zmm24, zmm24, zmm24
+    vxorps zmm25, zmm25, zmm25
+    vxorps zmm26, zmm26, zmm26
+    vxorps zmm27, zmm27, zmm27
+    vxorps zmm28, zmm28, zmm28
+    vxorps zmm29, zmm29, zmm29
+    vxorps zmm30, zmm30, zmm30
+    vxorps zmm31, zmm31, zmm31
+    xor ecx, ecx
+
+.q8_k64:
+    lea rax, [rcx+64]
+    cmp rax, r11
+    ja .q8_k16
+    vmovups zmm1, zmmword ptr [rdx+rcx*4+0]
+    vmovups zmm2, zmmword ptr [rdx+rcx*4+64]
+    vmovups zmm3, zmmword ptr [rdx+rcx*4+128]
+    vmovups zmm4, zmmword ptr [rdx+rcx*4+192]
+    vpmovsxbd zmm0, xmmword ptr [rbp+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r9+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r10+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rsi+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rdi+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rbx+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r13+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rbp+rcx+20]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r8+rcx+20]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r9+rcx+20]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r10+rcx+20]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [rsi+rcx+20]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [rdi+rcx+20]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [rbx+rcx+20]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [r13+rcx+20]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm2
+    vpmovsxbd zmm0, xmmword ptr [rbp+rcx+36]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r8+rcx+36]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r9+rcx+36]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r10+rcx+36]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [rsi+rcx+36]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [rdi+rcx+36]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [rbx+rcx+36]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [r13+rcx+36]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm3
+    vpmovsxbd zmm0, xmmword ptr [rbp+rcx+52]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r8+rcx+52]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r9+rcx+52]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r10+rcx+52]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [rsi+rcx+52]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [rdi+rcx+52]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [rbx+rcx+52]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm4
+    vpmovsxbd zmm0, xmmword ptr [r13+rcx+52]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm4
+    add rcx, 64
+    jmp .q8_k64
+.q8_k16:
+    lea rax, [rcx+16]
+    cmp rax, r11
+    ja .q8_reduce8
+    vmovups zmm1, zmmword ptr [rdx+rcx*4]
+    vpmovsxbd zmm0, xmmword ptr [rbp+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm24, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm25, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r9+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm26, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r10+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm27, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rsi+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm28, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rdi+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm29, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rbx+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm30, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r13+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vfmadd231ps zmm31, zmm0, zmm1
+    add rcx, 16
+    jmp .q8_k16
+.q8_reduce8:
+    vextractf32x8 ymm0, zmm24, 1
+    vaddps ymm0, ymm0, ymm24
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm24, xmm0
+
+    vextractf32x8 ymm0, zmm25, 1
+    vaddps ymm0, ymm0, ymm25
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm25, xmm0
+
+    vextractf32x8 ymm0, zmm26, 1
+    vaddps ymm0, ymm0, ymm26
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm26, xmm0
+
+    vextractf32x8 ymm0, zmm27, 1
+    vaddps ymm0, ymm0, ymm27
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm27, xmm0
+
+    vextractf32x8 ymm0, zmm28, 1
+    vaddps ymm0, ymm0, ymm28
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm28, xmm0
+
+    vextractf32x8 ymm0, zmm29, 1
+    vaddps ymm0, ymm0, ymm29
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm29, xmm0
+
+    vextractf32x8 ymm0, zmm30, 1
+    vaddps ymm0, ymm0, ymm30
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm30, xmm0
+
+    vextractf32x8 ymm0, zmm31, 1
+    vaddps ymm0, ymm0, ymm31
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm31, xmm0
+
+.q8_scalar8:
+    cmp rcx, r11
+    jae .q8_store8
+    vmovss xmm1, dword ptr [rdx+rcx*4]
+
+    movsx eax, byte ptr [rbp+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm24, xmm0, xmm1
+    movsx eax, byte ptr [r8+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm25, xmm0, xmm1
+    movsx eax, byte ptr [r9+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm26, xmm0, xmm1
+    movsx eax, byte ptr [r10+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm27, xmm0, xmm1
+    movsx eax, byte ptr [rsi+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm28, xmm0, xmm1
+    movsx eax, byte ptr [rdi+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm29, xmm0, xmm1
+    movsx eax, byte ptr [rbx+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm30, xmm0, xmm1
+    movsx eax, byte ptr [r13+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vfmadd231ss xmm31, xmm0, xmm1
+    inc rcx
+    jmp .q8_scalar8
+
+.q8_store8:
+    vmulss xmm24, xmm24, xmm16
+    vmulss xmm25, xmm25, xmm17
+    vmulss xmm26, xmm26, xmm18
+    vmulss xmm27, xmm27, xmm19
+    vmulss xmm28, xmm28, xmm20
+    vmulss xmm29, xmm29, xmm21
+    vmulss xmm30, xmm30, xmm22
+    vmulss xmm31, xmm31, xmm23
+    vmovss dword ptr [r15], xmm24
+    vmovss dword ptr [r15+4], xmm25
+    vmovss dword ptr [r15+8], xmm26
+    vmovss dword ptr [r15+12], xmm27
+    vmovss dword ptr [r15+16], xmm28
+    vmovss dword ptr [r15+20], xmm29
+    vmovss dword ptr [r15+24], xmm30
+    vmovss dword ptr [r15+28], xmm31
+    lea rbp, [r13+r14]
+    add r15, 32
+    cmp r15, r12
+    jb .q8_rows8
+    jmp .q8_done
+
+.q8_tail_rows:
+    /* Generic remainder path, at most seven rows. */
+.q8_tail_row:
+    cmp r15, r12
+    jae .q8_done
+    vxorps ymm2, ymm2, ymm2
+    vbroadcastss ymm3, dword ptr [rbp]
+    xor ecx, ecx
+.q8_tk8:
+    lea rax, [rcx+8]
+    cmp rax, r11
+    ja .q8_treduce
+    vpmovsxbd ymm0, qword ptr [rbp+rcx+4]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vmovups ymm1, ymmword ptr [rdx+rcx*4]
+    vfmadd231ps ymm2, ymm0, ymm1
+    add rcx, 8
+    jmp .q8_tk8
+.q8_treduce:
+    vextractf128 xmm0, ymm2, 1
+    vaddps xmm0, xmm0, xmm2
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm4, xmm0
+.q8_tscalar:
+    cmp rcx, r11
+    jae .q8_tstore
+    movsx eax, byte ptr [rbp+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm3
+    vmulss xmm0, xmm0, dword ptr [rdx+rcx*4]
+    vaddss xmm4, xmm4, xmm0
+    inc rcx
+    jmp .q8_tscalar
+.q8_tstore:
+    vmovss dword ptr [r15], xmm4
+    add rbp, r14
+    add r15, 4
+    jmp .q8_tail_row
+
+.q8_done:
+    vzeroupper
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+q8_worker_do_avx512_6row:
+    /* Six-row middle-width kernel for high-core-count decode. */
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rdi
+    mov rbx, [rip+g_job]
+    mov rax, [rbx+JOB_OUT]
+    mul r15
+    div qword ptr [rbx+JOB_NWORK]
+    mov r12, rax
+    lea rax, [r15+1]
+    mul qword ptr [rbx+JOB_OUT]
+    div qword ptr [rbx+JOB_NWORK]
+    mov r13, rax
+    cmp r12, r13
+    jae .q6_done
+    mov r14, [rbx+JOB_STRIDE]
+    mov rax, r12
+    imul rax, r14
+    add rax, [rbx+JOB_W]
+    mov rbp, rax
+    mov rax, r12
+    shl rax, 2
+    add rax, [rbx+JOB_Y]
+    mov r15, rax
+    mov rdx, [rbx+JOB_X]
+    mov r11, [rbx+JOB_IN]
+.q6_rows:
+    mov rax, r13
+    sub rax, r12
+    cmp rax, 6
+    jb .q6_tail_rows
+    mov r8, rbp
+    add r8, r14
+    mov r9, r8
+    add r9, r14
+    mov r10, r9
+    add r10, r14
+    mov rsi, r10
+    add rsi, r14
+    mov rdi, rsi
+    add rdi, r14
+    vbroadcastss zmm18, dword ptr [rbp]
+    vbroadcastss zmm19, dword ptr [r8]
+    vbroadcastss zmm20, dword ptr [r9]
+    vbroadcastss zmm21, dword ptr [r10]
+    vbroadcastss zmm22, dword ptr [rsi]
+    vbroadcastss zmm23, dword ptr [rdi]
+    vxorps zmm26, zmm26, zmm26
+    vxorps zmm27, zmm27, zmm27
+    vxorps zmm28, zmm28, zmm28
+    vxorps zmm29, zmm29, zmm29
+    vxorps zmm30, zmm30, zmm30
+    vxorps zmm31, zmm31, zmm31
+    xor ecx, ecx
+.q6_k16:
+    lea rax, [rcx+16]
+    cmp rax, r11
+    ja .q6_reduce
+    vmovups zmm1, zmmword ptr [rdx+rcx*4]
+    vpmovsxbd zmm0, xmmword ptr [rbp+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm18
+    vfmadd231ps zmm26, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r8+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm19
+    vfmadd231ps zmm27, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r9+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm20
+    vfmadd231ps zmm28, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [r10+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm21
+    vfmadd231ps zmm29, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rsi+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm22
+    vfmadd231ps zmm30, zmm0, zmm1
+    vpmovsxbd zmm0, xmmword ptr [rdi+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm23
+    vfmadd231ps zmm31, zmm0, zmm1
+    add rcx, 16
+    jmp .q6_k16
+.q6_reduce:
+    vextractf32x8 ymm0, zmm26, 1
+    vaddps ymm0, ymm0, ymm26
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm26, xmm0
+    vextractf32x8 ymm0, zmm27, 1
+    vaddps ymm0, ymm0, ymm27
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm27, xmm0
+    vextractf32x8 ymm0, zmm28, 1
+    vaddps ymm0, ymm0, ymm28
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm28, xmm0
+    vextractf32x8 ymm0, zmm29, 1
+    vaddps ymm0, ymm0, ymm29
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm29, xmm0
+    vextractf32x8 ymm0, zmm30, 1
+    vaddps ymm0, ymm0, ymm30
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm30, xmm0
+    vextractf32x8 ymm0, zmm31, 1
+    vaddps ymm0, ymm0, ymm31
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm31, xmm0
+.q6_scalar:
+    cmp rcx, r11
+    jae .q6_store
+    vmovss xmm1, dword ptr [rdx+rcx*4]
+    movsx eax, byte ptr [rbp+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm18
+    vfmadd231ss xmm26, xmm0, xmm1
+    movsx eax, byte ptr [r8+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm19
+    vfmadd231ss xmm27, xmm0, xmm1
+    movsx eax, byte ptr [r9+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm20
+    vfmadd231ss xmm28, xmm0, xmm1
+    movsx eax, byte ptr [r10+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm21
+    vfmadd231ss xmm29, xmm0, xmm1
+    movsx eax, byte ptr [rsi+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm22
+    vfmadd231ss xmm30, xmm0, xmm1
+    movsx eax, byte ptr [rdi+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm23
+    vfmadd231ss xmm31, xmm0, xmm1
+    inc rcx
+    jmp .q6_scalar
+.q6_store:
+    vmovss dword ptr [r15], xmm26
+    vmovss dword ptr [r15+4], xmm27
+    vmovss dword ptr [r15+8], xmm28
+    vmovss dword ptr [r15+12], xmm29
+    vmovss dword ptr [r15+16], xmm30
+    vmovss dword ptr [r15+20], xmm31
+    lea rbp, [rdi+r14]
+    add r15, 24
+    add r12, 6
+    cmp r12, r13
+    jb .q6_rows
+    jmp .q6_done
+.q6_tail_rows:
+.q6_tail_row:
+    cmp r12, r13
+    jae .q6_done
+    vxorps ymm2, ymm2, ymm2
+    vbroadcastss ymm3, dword ptr [rbp]
+    xor ecx, ecx
+.q6_tk8:
+    lea rax, [rcx+8]
+    cmp rax, r11
+    ja .q6_treduce
+    vpmovsxbd ymm0, qword ptr [rbp+rcx+4]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vmovups ymm1, ymmword ptr [rdx+rcx*4]
+    vfmadd231ps ymm2, ymm0, ymm1
+    add rcx, 8
+    jmp .q6_tk8
+.q6_treduce:
+    vextractf128 xmm0, ymm2, 1
+    vaddps xmm0, xmm0, xmm2
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm4, xmm0
+.q6_tscalar:
+    cmp rcx, r11
+    jae .q6_tstore
+    movsx eax, byte ptr [rbp+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm3
+    vmulss xmm0, xmm0, dword ptr [rdx+rcx*4]
+    vaddss xmm4, xmm4, xmm0
+    inc rcx
+    jmp .q6_tscalar
+.q6_tstore:
+    vmovss dword ptr [r15], xmm4
+    add rbp, r14
+    add r15, 4
+    inc r12
+    jmp .q6_tail_row
+.q6_done:
+    vzeroupper
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+q8_worker_do_avx512_4row:
+    /* Four output rows in parallel. Reuses each 16-float activation load across
+       four rows and keeps four independent accumulation chains in flight. */
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15, rdi
+    mov rbx, [rip+g_job]
+    mov rax, [rbx+JOB_OUT]
+    mul r15
+    div qword ptr [rbx+JOB_NWORK]
+    mov r12, rax                    /* start row */
+    lea rax, [r15+1]
+    mul qword ptr [rbx+JOB_OUT]
+    div qword ptr [rbx+JOB_NWORK]
+    mov r13, rax                    /* end row */
+    cmp r12, r13
+    jae .q5_done
+
+    mov r14, [rbx+JOB_STRIDE]
+    mov rax, r12
+    imul rax, r14
+    add rax, [rbx+JOB_W]
+    mov rbp, rax                    /* row0 ptr */
+    mov rax, r12
+    shl rax, 2
+    add rax, [rbx+JOB_Y]
+    mov r15, rax                    /* y ptr */
+    mov rdx, [rbx+JOB_X]
+    mov r11, [rbx+JOB_IN]
+
+.q5_rows4:
+    mov rax, r13
+    sub rax, r12
+    cmp rax, 4
+    jb .q5_tail_rows
+
+    mov r8, rbp
+    add r8, r14                     /* row1 */
+    mov r9, r8
+    add r9, r14                     /* row2 */
+    mov r10, r9
+    add r10, r14                    /* row3 */
+
+    vbroadcastss zmm20, dword ptr [rbp]
+    vbroadcastss zmm21, dword ptr [r8]
+    vbroadcastss zmm22, dword ptr [r9]
+    vbroadcastss zmm23, dword ptr [r10]
+    vxorps zmm24, zmm24, zmm24
+    vxorps zmm25, zmm25, zmm25
+    vxorps zmm26, zmm26, zmm26
+    vxorps zmm27, zmm27, zmm27
+    xor ecx, ecx
+
+.q5_k16:
+    lea rax, [rcx+16]
+    cmp rax, r11
+    ja .q5_reduce4
+    vmovups zmm1, zmmword ptr [rdx+rcx*4]
+
+    vpmovsxbd zmm0, xmmword ptr [rbp+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm20
+    vfmadd231ps zmm24, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [r8+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm21
+    vfmadd231ps zmm25, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [r9+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm22
+    vfmadd231ps zmm26, zmm0, zmm1
+
+    vpmovsxbd zmm0, xmmword ptr [r10+rcx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm23
+    vfmadd231ps zmm27, zmm0, zmm1
+
+    add rcx, 16
+    jmp .q5_k16
+
+.q5_reduce4:
+    /* Deterministic horizontal reductions, one scalar result per row. */
+    vextractf32x8 ymm0, zmm24, 1
+    vaddps ymm0, ymm0, ymm24
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm24, xmm0
+
+    vextractf32x8 ymm0, zmm25, 1
+    vaddps ymm0, ymm0, ymm25
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm25, xmm0
+
+    vextractf32x8 ymm0, zmm26, 1
+    vaddps ymm0, ymm0, ymm26
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm26, xmm0
+
+    vextractf32x8 ymm0, zmm27, 1
+    vaddps ymm0, ymm0, ymm27
+    vextractf128 xmm1, ymm0, 1
+    vaddps xmm0, xmm0, xmm1
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm27, xmm0
+
+.q5_tail4:
+    cmp rcx, r11
+    jae .q5_store4
+    vmovss xmm1, dword ptr [rdx+rcx*4]
+
+    movsx eax, byte ptr [rbp+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm20
+    vfmadd231ss xmm24, xmm0, xmm1
+
+    movsx eax, byte ptr [r8+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm21
+    vfmadd231ss xmm25, xmm0, xmm1
+
+    movsx eax, byte ptr [r9+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm22
+    vfmadd231ss xmm26, xmm0, xmm1
+
+    movsx eax, byte ptr [r10+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm23
+    vfmadd231ss xmm27, xmm0, xmm1
+
+    inc rcx
+    jmp .q5_tail4
+
+.q5_store4:
+    vmovss dword ptr [r15], xmm24
+    vmovss dword ptr [r15+4], xmm25
+    vmovss dword ptr [r15+8], xmm26
+    vmovss dword ptr [r15+12], xmm27
+    lea rbp, [r10+r14]
+    add r15, 16
+    add r12, 4
+    cmp r12, r13
+    jb .q5_rows4
+    jmp .q5_done
+
+.q5_tail_rows:
+    /* Rare 1..3-row worker remainder; keep AVX2 summation path for simplicity. */
+.q5_tail_row:
+    cmp r12, r13
+    jae .q5_done
+    vxorps ymm2, ymm2, ymm2
+    vbroadcastss ymm3, dword ptr [rbp]
+    xor ecx, ecx
+.q5_tk8:
+    lea rax, [rcx+8]
+    cmp rax, r11
+    ja .q5_treduce
+    vpmovsxbd ymm0, qword ptr [rbp+rcx+4]
+    vcvtdq2ps ymm0, ymm0
+    vmulps ymm0, ymm0, ymm3
+    vmovups ymm1, ymmword ptr [rdx+rcx*4]
+    vfmadd231ps ymm2, ymm0, ymm1
+    add rcx, 8
+    jmp .q5_tk8
+.q5_treduce:
+    vextractf128 xmm0, ymm2, 1
+    vaddps xmm0, xmm0, xmm2
+    vhaddps xmm0, xmm0, xmm0
+    vhaddps xmm0, xmm0, xmm0
+    vmovaps xmm4, xmm0
+.q5_tscalar:
+    cmp rcx, r11
+    jae .q5_tstore
+    movsx eax, byte ptr [rbp+rcx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm3
+    vmulss xmm0, xmm0, dword ptr [rdx+rcx*4]
+    vaddss xmm4, xmm4, xmm0
+    inc rcx
+    jmp .q5_tscalar
+.q5_tstore:
+    vmovss dword ptr [r15], xmm4
+    add rbp, r14
+    add r15, 4
+    inc r12
+    jmp .q5_tail_row
+
+.q5_done:
+    vzeroupper
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+q8_worker_do_avx2:
     /* rdi=worker ID; reads shared job */
     push rbx
     push rbp
@@ -1025,6 +2941,41 @@ q8_worker_do:
     ret
 
 q8_dequant_row:
+    cmp dword ptr [rip+g_use_avx512], 0
+    je q8_dequant_row_avx2
+    push rbx
+    mov rax, rsi
+    imul rax, r8
+    add rdi, rax
+    vbroadcastss zmm2, dword ptr [rdi]
+    xor ebx, ebx
+.qdr5_loop:
+    lea rax, [rbx+16]
+    cmp rax, rcx
+    ja .qdr5_tail
+    vpmovsxbd zmm0, xmmword ptr [rdi+rbx+4]
+    vcvtdq2ps zmm0, zmm0
+    vmulps zmm0, zmm0, zmm2
+    vmovups zmmword ptr [rdx+rbx*4], zmm0
+    add rbx, 16
+    jmp .qdr5_loop
+.qdr5_tail:
+    cmp rbx, rcx
+    jae .qdr5_done
+.qdr5_tloop:
+    movsx eax, byte ptr [rdi+rbx+4]
+    vcvtsi2ss xmm0, xmm0, eax
+    vmulss xmm0, xmm0, xmm2
+    vmovss dword ptr [rdx+rbx*4], xmm0
+    inc rbx
+    cmp rbx, rcx
+    jb .qdr5_tloop
+.qdr5_done:
+    vzeroupper
+    pop rbx
+    ret
+
+q8_dequant_row_avx2:
     /* rdi=matrix, rsi=row, rdx=out, rcx=dim, r8=stride */
     push rbx
     mov rax, rsi
@@ -1095,6 +3046,21 @@ rmsnorm:
     vsqrtss xmm4,xmm4,xmm4
     vmovss xmm5,dword ptr [rip+f_one]
     vdivss xmm5,xmm5,xmm4
+    cmp dword ptr [rip+g_use_avx512], 0
+    je .rn_apply_avx2
+    vbroadcastss zmm5,xmm5
+    xor ebx,ebx
+.rn_apply_avx512:
+    lea rax,[rbx+16]
+    cmp rax,rcx
+    ja .rn_apply_tail
+    vmovups zmm0,zmmword ptr [rsi+rbx*4]
+    vmulps zmm0,zmm0,zmm5
+    vmulps zmm0,zmm0,zmmword ptr [rdx+rbx*4]
+    vmovups zmmword ptr [rdi+rbx*4],zmm0
+    add rbx,16
+    jmp .rn_apply_avx512
+.rn_apply_avx2:
     vbroadcastss ymm5,xmm5
     xor ebx,ebx
 .rn_apply:
@@ -1124,6 +3090,31 @@ rmsnorm:
     ret
 
 vec_add_inplace:
+    cmp dword ptr [rip+g_use_avx512], 0
+    je vec_add_inplace_avx2
+    xor ecx, ecx
+.vai5_loop:
+    lea rax, [rcx+16]
+    cmp rax, rdx
+    ja .vai5_tail
+    vmovups zmm0, zmmword ptr [rdi+rcx*4]
+    vaddps zmm0, zmm0, zmmword ptr [rsi+rcx*4]
+    vmovups zmmword ptr [rdi+rcx*4], zmm0
+    add rcx, 16
+    jmp .vai5_loop
+.vai5_tail:
+    cmp rcx, rdx
+    jae .vai5_done
+    vmovss xmm0, dword ptr [rdi+rcx*4]
+    vaddss xmm0, xmm0, dword ptr [rsi+rcx*4]
+    vmovss dword ptr [rdi+rcx*4], xmm0
+    inc rcx
+    jmp .vai5_tail
+.vai5_done:
+    vzeroupper
+    ret
+
+vec_add_inplace_avx2:
     /* rdi dst, rsi src, rdx n */
     xor ecx,ecx
 .vai_loop:
@@ -1211,6 +3202,85 @@ exp_approx:
     ret
 
 silu_mul:
+    cmp dword ptr [rip+g_use_avx512], 0
+    jne silu_mul_avx512
+    jmp silu_mul_scalar
+
+silu_mul_avx512:
+    /* rdi=a(gate, overwritten), rsi=b, rdx=n. Vector form is lane-wise
+       identical to exp_approx + scalar SiLU, just 16 elements at once. */
+    push rbx
+    vbroadcastss zmm8,  dword ptr [rip+f_minexp]
+    vbroadcastss zmm9,  dword ptr [rip+f_maxexp]
+    vbroadcastss zmm10, dword ptr [rip+f_log2e]
+    vbroadcastss zmm11, dword ptr [rip+f_ln2_5]
+    vbroadcastss zmm12, dword ptr [rip+f_ln2_4]
+    vbroadcastss zmm13, dword ptr [rip+f_ln2_3]
+    vbroadcastss zmm14, dword ptr [rip+f_ln2_2]
+    vbroadcastss zmm15, dword ptr [rip+f_ln2]
+    vbroadcastss zmm16, dword ptr [rip+f_one]
+    mov eax, 127
+    vpbroadcastd zmm17, eax
+    mov eax, 1
+    vpbroadcastd zmm18, eax
+    mov eax, 254
+    vpbroadcastd zmm19, eax
+    xor ebx, ebx
+.smv_loop:
+    lea rax, [rbx+16]
+    cmp rax, rdx
+    ja .smv_tail
+    vmovups zmm6, zmmword ptr [rdi+rbx*4]   /* x */
+    vxorps zmm0, zmm0, zmm0
+    vsubps zmm0, zmm0, zmm6                 /* -x */
+    vmaxps zmm0, zmm0, zmm8
+    vminps zmm0, zmm0, zmm9
+    vmulps zmm1, zmm0, zmm10                /* y */
+    vrndscaleps zmm2, zmm1, 1               /* floor(y) */
+    vsubps zmm3, zmm1, zmm2                 /* f */
+    vmulps zmm4, zmm11, zmm3
+    vaddps zmm4, zmm4, zmm12
+    vmulps zmm4, zmm4, zmm3
+    vaddps zmm4, zmm4, zmm13
+    vmulps zmm4, zmm4, zmm3
+    vaddps zmm4, zmm4, zmm14
+    vmulps zmm4, zmm4, zmm3
+    vaddps zmm4, zmm4, zmm15
+    vmulps zmm4, zmm4, zmm3
+    vaddps zmm4, zmm4, zmm16
+    vcvtps2dq zmm5, zmm2
+    vpaddd zmm5, zmm5, zmm17
+    vpmaxsd zmm5, zmm5, zmm18
+    vpminsd zmm5, zmm5, zmm19
+    vpslld zmm5, zmm5, 23
+    vmulps zmm0, zmm4, zmm5
+    vaddps zmm0, zmm0, zmm16
+    vdivps zmm6, zmm6, zmm0
+    vmulps zmm6, zmm6, zmmword ptr [rsi+rbx*4]
+    vmovups zmmword ptr [rdi+rbx*4], zmm6
+    add rbx, 16
+    jmp .smv_loop
+.smv_tail:
+    cmp rbx, rdx
+    jae .smv_done
+.smv_tail_loop:
+    vmovss xmm6, dword ptr [rdi+rbx*4]
+    vxorps xmm0, xmm0, xmm0
+    vsubss xmm0, xmm0, xmm6
+    call exp_approx
+    vaddss xmm0, xmm0, dword ptr [rip+f_one]
+    vdivss xmm6, xmm6, xmm0
+    vmulss xmm6, xmm6, dword ptr [rsi+rbx*4]
+    vmovss dword ptr [rdi+rbx*4], xmm6
+    inc rbx
+    cmp rbx, rdx
+    jb .smv_tail_loop
+.smv_done:
+    vzeroupper
+    pop rbx
+    ret
+
+silu_mul_scalar:
     /* rdi=a(gate, overwritten), rsi=b, rdx=n */
     push rbx
     xor ebx,ebx
@@ -1232,6 +3302,128 @@ silu_mul:
     ret
 
 softmax:
+    cmp dword ptr [rip+g_use_avx512], 0
+    jne softmax_avx512
+    jmp softmax_scalar
+
+softmax_avx512:
+    /* Preserve scalar max and scalar summation order; vectorize only the
+       expensive lane-independent exp polynomial and normalization. */
+    push rbx
+    push r12
+    push r13
+    test rsi, rsi
+    jz .sf5_done
+    mov r13, rsi
+    vmovss xmm7, dword ptr [rdi]
+    mov rbx, 1
+.sf5_max:
+    cmp rbx, r13
+    jae .sf5_exp_setup
+    vmaxss xmm7, xmm7, dword ptr [rdi+rbx*4]
+    inc rbx
+    jmp .sf5_max
+.sf5_exp_setup:
+    vbroadcastss zmm20, xmm7
+    vbroadcastss zmm8,  dword ptr [rip+f_minexp]
+    vbroadcastss zmm9,  dword ptr [rip+f_maxexp]
+    vbroadcastss zmm10, dword ptr [rip+f_log2e]
+    vbroadcastss zmm11, dword ptr [rip+f_ln2_5]
+    vbroadcastss zmm12, dword ptr [rip+f_ln2_4]
+    vbroadcastss zmm13, dword ptr [rip+f_ln2_3]
+    vbroadcastss zmm14, dword ptr [rip+f_ln2_2]
+    vbroadcastss zmm15, dword ptr [rip+f_ln2]
+    vbroadcastss zmm16, dword ptr [rip+f_one]
+    mov eax, 127
+    vpbroadcastd zmm17, eax
+    mov eax, 1
+    vpbroadcastd zmm18, eax
+    mov eax, 254
+    vpbroadcastd zmm19, eax
+    xor r12d, r12d
+.sf5_exp_vec:
+    lea rax, [r12+16]
+    cmp rax, r13
+    ja .sf5_exp_tail
+    vmovups zmm0, zmmword ptr [rdi+r12*4]
+    vsubps zmm0, zmm0, zmm20
+    vmaxps zmm0, zmm0, zmm8
+    vminps zmm0, zmm0, zmm9
+    vmulps zmm1, zmm0, zmm10
+    vrndscaleps zmm2, zmm1, 1
+    vsubps zmm3, zmm1, zmm2
+    vmulps zmm4, zmm11, zmm3
+    vaddps zmm4, zmm4, zmm12
+    vmulps zmm4, zmm4, zmm3
+    vaddps zmm4, zmm4, zmm13
+    vmulps zmm4, zmm4, zmm3
+    vaddps zmm4, zmm4, zmm14
+    vmulps zmm4, zmm4, zmm3
+    vaddps zmm4, zmm4, zmm15
+    vmulps zmm4, zmm4, zmm3
+    vaddps zmm4, zmm4, zmm16
+    vcvtps2dq zmm5, zmm2
+    vpaddd zmm5, zmm5, zmm17
+    vpmaxsd zmm5, zmm5, zmm18
+    vpminsd zmm5, zmm5, zmm19
+    vpslld zmm5, zmm5, 23
+    vmulps zmm0, zmm4, zmm5
+    vmovups zmmword ptr [rdi+r12*4], zmm0
+    add r12, 16
+    jmp .sf5_exp_vec
+.sf5_exp_tail:
+    cmp r12, r13
+    jae .sf5_sum
+.sf5_exp_tail_loop:
+    vmovss xmm0, dword ptr [rdi+r12*4]
+    vsubss xmm0, xmm0, xmm7
+    call exp_approx
+    vmovss dword ptr [rdi+r12*4], xmm0
+    inc r12
+    cmp r12, r13
+    jb .sf5_exp_tail_loop
+.sf5_sum:
+    /* Same element order as the original scalar loop => same FP32 sum. */
+    xor r12d, r12d
+    vxorps xmm6, xmm6, xmm6
+.sf5_sum_loop:
+    cmp r12, r13
+    jae .sf5_norm_setup
+    vaddss xmm6, xmm6, dword ptr [rdi+r12*4]
+    inc r12
+    jmp .sf5_sum_loop
+.sf5_norm_setup:
+    vmovss xmm5, dword ptr [rip+f_one]
+    vdivss xmm5, xmm5, xmm6
+    vbroadcastss zmm5, xmm5
+    xor ebx, ebx
+.sf5_norm_vec:
+    lea rax, [rbx+16]
+    cmp rax, r13
+    ja .sf5_norm_tail
+    vmovups zmm0, zmmword ptr [rdi+rbx*4]
+    vmulps zmm0, zmm0, zmm5
+    vmovups zmmword ptr [rdi+rbx*4], zmm0
+    add rbx, 16
+    jmp .sf5_norm_vec
+.sf5_norm_tail:
+    cmp rbx, r13
+    jae .sf5_done
+.sf5_norm_tail_loop:
+    vmovss xmm0, dword ptr [rdi+rbx*4]
+    vmulss xmm0, xmm0, xmm5
+    vmovss dword ptr [rdi+rbx*4], xmm0
+    inc rbx
+    cmp rbx, r13
+    jb .sf5_norm_tail_loop
+.sf5_done:
+    vzeroupper
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+softmax_scalar:
     /* rdi=array, rsi=n */
     push rbx
     push r12
@@ -1437,6 +3629,80 @@ attention_layer:
 .al_score_loop:
     cmp rbp,r13
     ja .al_scores_done
+    /* Four independent time positions hide FMA latency and reuse each Q load.
+       Each score retains the exact old per-chunk accumulation order. */
+    test r14, 7
+    jnz .al_score_single
+    lea rax, [rbp+3]
+    cmp rax, r13
+    ja .al_score_single
+
+    /* K pointer at time t for this layer/KV head. */
+    mov rax,r12
+    imul rax,[rip+g_max_seq]
+    add rax,rbp
+    imul rax,r15
+    mov rcx,r11
+    imul rcx,r14
+    add rax,rcx
+    shl rax,2
+    mov rsi,[rip+g_kcache]
+    add rsi,rax                       /* k0 */
+    mov r8,r15
+    shl r8,2                         /* bytes per cached time row */
+    lea rdi,[rsi+r8]                 /* k1 */
+    lea rdx,[rdi+r8]                 /* k2 */
+    lea r9,[rdx+r8]                  /* k3 */
+
+    vxorps ymm2,ymm2,ymm2
+    vxorps ymm3,ymm3,ymm3
+    vxorps ymm4,ymm4,ymm4
+    vxorps ymm5,ymm5,ymm5
+    xor ecx,ecx
+.al_score4_dim:
+    cmp rcx,r14
+    jae .al_score4_reduce
+    vmovups ymm0,ymmword ptr [r10+rcx*4]
+    vfmadd231ps ymm2,ymm0,ymmword ptr [rsi+rcx*4]
+    vfmadd231ps ymm3,ymm0,ymmword ptr [rdi+rcx*4]
+    vfmadd231ps ymm4,ymm0,ymmword ptr [rdx+rcx*4]
+    vfmadd231ps ymm5,ymm0,ymmword ptr [r9+rcx*4]
+    add rcx,8
+    jmp .al_score4_dim
+.al_score4_reduce:
+    vextractf128 xmm0,ymm2,1
+    vaddps xmm0,xmm0,xmm2
+    vhaddps xmm0,xmm0,xmm0
+    vhaddps xmm0,xmm0,xmm0
+    vmovaps xmm2,xmm0
+    vextractf128 xmm0,ymm3,1
+    vaddps xmm0,xmm0,xmm3
+    vhaddps xmm0,xmm0,xmm0
+    vhaddps xmm0,xmm0,xmm0
+    vmovaps xmm3,xmm0
+    vextractf128 xmm0,ymm4,1
+    vaddps xmm0,xmm0,xmm4
+    vhaddps xmm0,xmm0,xmm0
+    vhaddps xmm0,xmm0,xmm0
+    vmovaps xmm4,xmm0
+    vextractf128 xmm0,ymm5,1
+    vaddps xmm0,xmm0,xmm5
+    vhaddps xmm0,xmm0,xmm0
+    vhaddps xmm0,xmm0,xmm0
+    vmovaps xmm5,xmm0
+    vmulss xmm2,xmm2,dword ptr [rip+g_att_scale]
+    vmulss xmm3,xmm3,dword ptr [rip+g_att_scale]
+    vmulss xmm4,xmm4,dword ptr [rip+g_att_scale]
+    vmulss xmm5,xmm5,dword ptr [rip+g_att_scale]
+    mov rax,[rip+g_scores]
+    vmovss dword ptr [rax+rbp*4],xmm2
+    vmovss dword ptr [rax+rbp*4+4],xmm3
+    vmovss dword ptr [rax+rbp*4+8],xmm4
+    vmovss dword ptr [rax+rbp*4+12],xmm5
+    add rbp,4
+    jmp .al_score_loop
+
+.al_score_single:
     mov rax,r12
     imul rax,[rip+g_max_seq]
     add rax,rbp
@@ -1450,9 +3716,9 @@ attention_layer:
     mov rdi,r10
     mov rdx,r14
     call vec_dot
-    mulss xmm0,dword ptr [rip+g_att_scale]
+    vmulss xmm0,xmm0,dword ptr [rip+g_att_scale]
     mov rax,[rip+g_scores]
-    movss dword ptr [rax+rbp*4],xmm0
+    vmovss dword ptr [rax+rbp*4],xmm0
     inc rbp
     jmp .al_score_loop
 .al_scores_done:
@@ -1484,6 +3750,21 @@ attention_layer:
     mov rsi,[rip+g_vcache]
     add rsi,rax
     mov rdx,[rip+g_scores]
+    cmp dword ptr [rip+g_use_avx512], 0
+    je .al_v_score_avx2
+    vbroadcastss zmm7,dword ptr [rdx+rbp*4]
+    xor ecx,ecx
+.al_v_dim512:
+    lea rax,[rcx+16]
+    cmp rax,r14
+    ja .al_v_tail
+    vmovups zmm0,zmmword ptr [r9+rcx*4]
+    vmovups zmm1,zmmword ptr [rsi+rcx*4]
+    vfmadd231ps zmm0,zmm1,zmm7
+    vmovups zmmword ptr [r9+rcx*4],zmm0
+    add rcx,16
+    jmp .al_v_dim512
+.al_v_score_avx2:
     vbroadcastss ymm7,dword ptr [rdx+rbp*4]
     xor ecx,ecx
 .al_v_dim:
@@ -2081,7 +4362,10 @@ _start:
     jmp exit_now
 
 .main_args:
+    call detect_avx512
+    mov dword ptr [rip+g_use_avx512], eax
     call detect_workers
+    call tune_auto_workers
     cmp rax,128
     jbe .main_auto_workers_ok
     mov rax,128
@@ -2097,6 +4381,13 @@ _start:
     jbe .main_workers_ok
     mov rax,128
 .main_workers_ok:
+    mov rcx, [rip+g_allowed_workers]
+    test rcx, rcx
+    jz .main_workers_store
+    cmp rax, rcx
+    jbe .main_workers_store
+    mov rax, rcx
+.main_workers_store:
     mov [rip+g_workers],rax
 .main_port:
     mov qword ptr [rip+g_port],8080

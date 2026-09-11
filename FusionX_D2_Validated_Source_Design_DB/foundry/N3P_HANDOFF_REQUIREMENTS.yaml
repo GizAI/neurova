@@ -1,0 +1,28 @@
+release: FusionX-D2
+foundry_release_allowed: false
+front_end_status: source_tests_pass_hdl_tools_blocked
+required_proprietary_inputs:
+  process:
+    - N3P PDK release and tapeout checklist
+    - standard-cell, I/O and level-shifter Liberty/LEF/GDS/CDL views
+    - MMMC PVT, LVF, AOCV/POCV and aging views
+    - extraction, DRC, LVS, ERC, antenna, fill and EMIR decks
+  memory:
+    - SRAM compiler macros with ECC, repair, MBIST and BISR collateral
+    - HBM4 controller and PHY netlists, timing, physical and test views
+  interfaces:
+    - PCIe 6.0/CXL controller and PHY
+    - UCIe 3.0 controller and PHY
+    - SerDes, PLL/DLL, OTP/eFuse, sensors and root of trust
+  package:
+    - CoWoS/interposer/substrate design rules and bump maps
+    - HBM channel models, SI/PI, PDN, CFD, warpage and mechanical models
+required_release_outputs:
+  - frozen RTL and firmware/software tag
+  - lint, CDC, RDC, formal, UVM and coverage closure
+  - synthesis and formal-equivalence reports
+  - scan/ATPG/MBIST/BISR/JTAG and ATE collateral
+  - floorplan, placed/routed DEF, final netlists, SDC/UPF, SPEF and SDF
+  - STA, SI/noise, power, EMIR and thermal reports
+  - DRC/LVS/ERC/antenna clean reports
+  - final GDS/OASIS and foundry acceptance receipt

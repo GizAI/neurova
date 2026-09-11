@@ -1,0 +1,27 @@
+{
+  "abi_version": 2,
+  "descriptor_bytes": 64,
+  "completion_bytes": 32,
+  "registers": {
+    "ID": 0,
+    "VERSION": 4,
+    "CONTROL": 8,
+    "STATUS": 12,
+    "IRQ_STATUS": 16,
+    "IRQ_MASK": 20,
+    "SQ_BASE_LO": 32,
+    "SQ_BASE_HI": 36,
+    "SQ_SIZE": 40,
+    "SQ_HEAD": 44,
+    "SQ_TAIL": 48,
+    "SQ_DOORBELL": 52,
+    "CQ_BASE_LO": 64,
+    "CQ_BASE_HI": 68,
+    "CQ_SIZE": 72,
+    "CQ_HEAD": 76,
+    "CQ_TAIL": 80,
+    "CQ_DOORBELL": 84,
+    "RAS_STATUS": 96,
+    "THERMAL_STATUS": 100
+  }
+}

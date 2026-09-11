@@ -1,0 +1,2 @@
+PASS structural tokens files=26 definitions=26
+NOTE: structural check is not HDL compile/elaboration

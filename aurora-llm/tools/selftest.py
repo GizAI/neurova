@@ -33,13 +33,16 @@ def run(workers,port,model):
 def main():
     subprocess.check_call(['make'],cwd=ROOT)
     with tempfile.TemporaryDirectory() as td:
-        model=Path(td)/'test.ali'
+        model=Path(td)/'test-v1.ali'
+        model_v2=Path(td)/'test-v2.ali'
         subprocess.check_call([sys.executable,str(ROOT/'tools/make_test_model.py'),str(model)])
-        a=run(1,19081,model)
-        b=run(2,19082,model)
-        c=run(4,19084,model)
-        assert a==b==c,(a,b,c)
-        print('PASS deterministic 1/2/4-worker output:',a)
+        subprocess.check_call([sys.executable,str(ROOT/'tools/repack_ali_v2.py'),str(model),str(model_v2)])
+        v1=[run(1,19081,model),run(2,19082,model),run(4,19084,model)]
+        v2=[run(1,19181,model_v2),run(2,19182,model_v2),run(4,19184,model_v2)]
+        assert v1[0]==v1[1]==v1[2],v1
+        assert v2[0]==v2[1]==v2[2],v2
+        assert v1[0]==v2[0],(v1[0],v2[0])
+        print('PASS deterministic ALI v1/v2 1/2/4-worker output:',v1[0])
         out=subprocess.check_output(['file',str(ROOT/'aurora-llm')],text=True)
         assert 'statically linked' in out,out
         print('PASS static ELF:',out.strip())
